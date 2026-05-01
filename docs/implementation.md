@@ -136,7 +136,7 @@ DFN3 のみ独立した Rust 実装を使う（公式の `deep_filter` crate）�
 
 ## ベンチマーク方針
 
-ベンチマーク用データセット選定、評価シナリオ、ミニマル評価セット構成、評価指標一覧の詳細は [benchmarks.md](benchmarks.md) を参照。
+ベンチマーク用データセット選定、評価シナリオ、ミニマル評価セット構成、評価指標一覧の詳細は [benchmarks.md](benchmarks.md) を参照。評価プロトコル、合否基準、結果記録・管理方針の詳細は [evaluation.md](evaluation.md) を参照。
 
 各 Phase での評価実行方針：
 

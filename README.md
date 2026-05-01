@@ -39,6 +39,7 @@
 | [docs/implementation.md](docs/implementation.md) | 技術スタック、プラットフォーム展開、実装ロードマップ |
 | [docs/decisions.md](docs/decisions.md) | 検討した代替案と却下理由、設計判断の記録 |
 | [docs/benchmarks.md](docs/benchmarks.md) | 評価データセット、シナリオ、ミニマル評価セット構成 |
+| [docs/evaluation.md](docs/evaluation.md) | 評価プロトコル、合否基準、結果記録・管理方針 |
 | [docs/references.md](docs/references.md) | 参考研究・公開モデル・関連リポジトリ |
 
 ## ステータス
