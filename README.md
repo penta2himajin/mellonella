@@ -1,2 +1,49 @@
 # mellonella
-Real-time single-target speaker voice filter using hard-gating (VAD + SV + NS). Inspired by the acute hearing of Galleria mellonella.
+
+特定単一話者をターゲットにしたリアルタイム音声フィルタの設計仕様書。
+登録音声の声紋に一致するフレームのみをノイズ抑制しつつ通過させる、軽量なハードゲーティング型システム。
+
+## 命名の由来
+
+[*Galleria mellonella*](https://en.wikipedia.org/wiki/Galleria_mellonella)（ハチノスツヅリガ）。約 300 kHz まで聴取可能とされ、現在知られている陸生動物の中で最も広い聴覚帯域を持つ蛾の学名から。
+
+## プロジェクト目標
+
+- **リアルタイム動作**: アルゴリズム遅延 100 ms 以下を目標
+- **追加訓練不要**: 既存の事前学習済みモデルのみで構成、登録音声埋め込みのみで動作
+- **商用利用可**: 全コンポーネントが Apache 2.0 / MIT などの商用フリーライセンス
+- **デスクトップ・モバイル両対応**: Rust + ONNX Runtime ベースの単一バイナリ
+
+## 採用アプローチ
+
+連続的な話者分離（真の Target Speaker Extraction）ではなく、**ハードゲーティング型**。
+
+```
+入力 → DFN3 (NS) → [VAD + SV + F0] による判定 → ゲート → 出力
+```
+
+「特定単一話者ターゲット」という本質要件を踏まえると、ハードゲーティング型は以下の利点を持つ：
+
+- 対象話者音声への副作用が最小（マスク方式の人工感や GAN 生成系のスペクトル変質なし）
+- 全コンポーネントが既存事前学習モデルで完結（追加訓練不要）
+- 計算量が圧倒的に少なく、モバイル展開が容易
+
+トレードオフ：同時発話シーンで完全な分離はできない。これに対しては FP（False Positive）許容方針を採用し、対象話者の声紋成分があれば pass する。
+
+## ドキュメント構成
+
+| Doc | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 処理パイプライン、データフロー、各ステージの役割 |
+| [docs/gating.md](docs/gating.md) | 判定ロジック、登録、自動学習、drift 対策 |
+| [docs/implementation.md](docs/implementation.md) | 技術スタック、プラットフォーム展開、実装ロードマップ |
+| [docs/decisions.md](docs/decisions.md) | 検討した代替案と却下理由、設計判断の記録 |
+| [docs/references.md](docs/references.md) | 参考研究・公開モデル・関連リポジトリ |
+
+## ステータス
+
+設計フェーズ完了。次フェーズは PoC 実装（Python + PyTorch、デスクトップ環境）。
+
+## ライセンス
+
+TBD（プロジェクト本体は private、構成コンポーネントは各ライセンスに従う）。
