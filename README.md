@@ -38,6 +38,7 @@
 | [docs/gating.md](docs/gating.md) | 判定ロジック、登録、自動学習、drift 対策 |
 | [docs/implementation.md](docs/implementation.md) | 技術スタック、プラットフォーム展開、実装ロードマップ |
 | [docs/decisions.md](docs/decisions.md) | 検討した代替案と却下理由、設計判断の記録 |
+| [docs/benchmarks.md](docs/benchmarks.md) | 評価データセット、シナリオ、ミニマル評価セット構成 |
 | [docs/references.md](docs/references.md) | 参考研究・公開モデル・関連リポジトリ |
 
 ## ステータス
