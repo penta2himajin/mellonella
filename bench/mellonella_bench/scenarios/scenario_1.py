@@ -24,20 +24,33 @@ from ..metrics.ns_quality import (
     si_sdr,
     stoi_score,
 )
-from .base import ScenarioResult, SnrSweep, SnrSweepEntry, mix_at_snr
+from .base import (
+    PipelineProvider,
+    ScenarioResult,
+    SnrSweep,
+    SnrSweepEntry,
+    StubPipelineProvider,
+    mix_at_snr,
+)
 
 DEFAULT_SNRS_DB: tuple[float, ...] = (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0)
 
 
 @dataclass
 class Scenario1Item:
-    """One target × noise pair to evaluate."""
+    """One target × noise pair to evaluate.
+
+    ``enrollment_path`` is consumed by the real pipeline provider to build
+    a per-item :class:`EmbeddingPool`. It can be left as ``None`` when
+    running with the deterministic stub.
+    """
 
     sample_id: str
     target_path: Path
     noise_path: Path
     voiced_mask: np.ndarray
     """Frame-level ground-truth voicing (True == speech) at the SV frame rate."""
+    enrollment_path: Path | None = None
 
 
 def _load_mono(path: Path) -> tuple[np.ndarray, int]:
@@ -49,21 +62,28 @@ def _load_mono(path: Path) -> tuple[np.ndarray, int]:
     return np.asarray(audio, dtype=np.float32), int(sr)
 
 
+def _truncate_to_match(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+    """Trim or right-pad ``candidate`` so it lines up with ``reference``."""
+    if candidate.size >= reference.size:
+        return candidate[: reference.size]
+    pad = np.zeros(reference.size - candidate.size, dtype=candidate.dtype)
+    return np.concatenate([candidate, pad])
+
+
 def evaluate_one(
     item: Scenario1Item,
-    pipeline_callable,
+    provider: PipelineProvider,
     sample_rate: int,
     snrs_db: tuple[float, ...] = DEFAULT_SNRS_DB,
     *,
     pesq_mode: str | None = "wb",
     rng: np.random.Generator | None = None,
 ) -> list[SnrSweepEntry]:
-    """Run ``pipeline_callable`` over each SNR for one item.
+    """Run the per-item pipeline over each SNR.
 
-    ``pipeline_callable(mixture: np.ndarray, sr: int) -> (output: np.ndarray,
-    gate_decisions: np.ndarray[bool])`` is the integration point with
-    :func:`mellonella_poc.pipeline.process_offline`. Tests substitute a
-    deterministic stub.
+    The ``provider`` builds a :data:`PipelineCallable` for this item; the
+    callable returns ``(output_audio, gate_per_frame_bool)`` aligned with
+    ``item.voiced_mask``.
     """
     target, target_sr = _load_mono(item.target_path)
     noise, noise_sr = _load_mono(item.noise_path)
@@ -72,25 +92,29 @@ def evaluate_one(
             f"sample-rate mismatch (target={target_sr}, noise={noise_sr}, expected={sample_rate})"
         )
 
+    pipeline = provider.for_item(item)
+
     rows: list[SnrSweepEntry] = []
     for snr in snrs_db:
         mixture = mix_at_snr(target, noise, snr, rng=rng)
         t0 = time.perf_counter()
-        out, gate_decisions = pipeline_callable(mixture, sample_rate)
+        output_audio, gate_per_frame = pipeline(mixture, sample_rate)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        confusion = confusion_from_frames(item.voiced_mask, gate_decisions)
-        sisdr = si_sdr(target, out[: target.size])
+        gate_aligned = _truncate_to_match(item.voiced_mask, gate_per_frame.astype(bool))
+        confusion = confusion_from_frames(item.voiced_mask, gate_aligned)
+        out_aligned = _truncate_to_match(target, output_audio)
+        sisdr = si_sdr(target, out_aligned)
 
         pesq_val: float | None = None
         if pesq_mode is not None:
             try:
-                pesq_val = pesq_score(target, out[: target.size], sample_rate, mode=pesq_mode)
+                pesq_val = pesq_score(target, out_aligned, sample_rate, mode=pesq_mode)
             except (MissingDependencyError, ValueError):
                 pesq_val = None
 
         try:
-            stoi_val: float | None = stoi_score(target, out[: target.size], sample_rate)
+            stoi_val: float | None = stoi_score(target, out_aligned, sample_rate)
         except (MissingDependencyError, ValueError):
             stoi_val = None
 
@@ -113,21 +137,28 @@ def evaluate_one(
 
 def run(
     items: list[Scenario1Item],
-    pipeline_callable,
-    sample_rate: int,
+    provider: PipelineProvider | None = None,
+    sample_rate: int = 16_000,
     output_csv: Path | None = None,
     snrs_db: tuple[float, ...] = DEFAULT_SNRS_DB,
     *,
     pesq_mode: str | None = "wb",
     seed: int = 0,
 ) -> ScenarioResult:
-    """Evaluate every item and return aggregated metrics."""
+    """Evaluate every item and return aggregated metrics.
+
+    ``provider`` defaults to :class:`StubPipelineProvider` — useful for
+    smoke tests and to verify the harness layout end-to-end without
+    pulling in heavy ML dependencies.
+    """
+    if provider is None:
+        provider = StubPipelineProvider()
+
     sweep = SnrSweep(scenario="scenario_1")
     rng = np.random.default_rng(seed)
     for item in items:
-        for row in evaluate_one(
-            item, pipeline_callable, sample_rate, snrs_db, pesq_mode=pesq_mode, rng=rng
-        ):
+        rows = evaluate_one(item, provider, sample_rate, snrs_db, pesq_mode=pesq_mode, rng=rng)
+        for row in rows:
             sweep.append(row)
 
     if output_csv is not None:

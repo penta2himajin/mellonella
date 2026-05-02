@@ -1,9 +1,15 @@
 """Top-level evaluation orchestrator.
 
-Phase 1 supports only Scenario 1 (solo target + noise) with a stub pipeline
-fallback so the harness can exercise its CSV / JSON wiring without the
-heavy ML dependencies installed. Other scenarios will be wired in here as
-they land.
+Phase 1 supports only Scenario 1 (solo target + noise). Items have to be
+discovered locally (the dataset downloaders write under
+``$MELLONELLA_DATA_DIR``); until that discovery code lands, the runner
+emits well-formed empty CSVs / a summary so the harness wiring stays
+exercised in CI.
+
+A real evaluation can already be assembled programmatically by importing
+:mod:`mellonella_bench.scenarios.scenario_1` directly and passing a list
+of :class:`Scenario1Item` into ``run`` — this module just wraps that
+behind the ``mellonella-bench`` CLI.
 """
 
 from __future__ import annotations
@@ -17,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..scenarios.base import PipelineProvider, StubPipelineProvider
+
 SCENARIOS = ("scenario_1",)
 
 
@@ -27,9 +35,9 @@ class RunnerConfig:
     output_dir: Path
     scenarios: tuple[str, ...] = SCENARIOS
     quick: bool = False
-    use_real_pipeline: bool = True
-    """When False, scenarios run with a deterministic identity-pipeline stub.
-    Used by tests and dry-runs."""
+    use_real_pipeline: bool = False
+    """When False, scenarios run with :class:`StubPipelineProvider`. The real
+    provider depends on torch/speechbrain via ``mellonella_poc``."""
 
 
 @dataclass
@@ -65,25 +73,17 @@ def _build_eval_id() -> str:
     return time.strftime("eval_%Y%m%d_%H%M%S")
 
 
-def _identity_pipeline(mixture, sr):  # type: ignore[no-untyped-def]
-    """Stub pipeline: returns the mixture unchanged with a 'pass everything' gate.
+def _resolve_provider(use_real: bool) -> PipelineProvider:
+    """Pick a :class:`PipelineProvider` based on the CLI flag.
 
-    Useful for harness tests and as a baseline number ('do nothing' floor).
+    The real provider is only imported when explicitly requested so that
+    the lightweight CI path stays free of torch/speechbrain.
     """
-    import numpy as np
+    if not use_real:
+        return StubPipelineProvider()
+    from ..scenarios.pipeline_provider import RealPipelineProvider
 
-    return mixture, np.ones(mixture.size, dtype=bool)
-
-
-def _resolve_pipeline(use_real: bool):  # type: ignore[no-untyped-def]
-    """Return the callable used by scenarios to filter a mixture.
-
-    The real pipeline path is left as a TODO until the per-item enrollment
-    plumbing lands. For now we always return the identity stub so the
-    harness produces well-formed CSVs/JSON even on a fresh checkout.
-    """
-    del use_real
-    return _identity_pipeline
+    return RealPipelineProvider()
 
 
 def run(config: RunnerConfig) -> RunSummary:
@@ -95,17 +95,18 @@ def run(config: RunnerConfig) -> RunSummary:
         system_info=_system_info(),
     )
 
-    pipeline = _resolve_pipeline(config.use_real_pipeline)
+    provider = _resolve_provider(config.use_real_pipeline)
 
     if "scenario_1" in config.scenarios:
         from ..scenarios.scenario_1 import run as run_scenario_1
 
-        # Phase 1 PoC: no items wired up yet (datasets only fetched locally).
-        # The runner still emits an empty CSV + zero-sample summary so the
-        # output directory layout is exercised end-to-end.
+        # Phase 1 PoC: items are not yet discovered automatically (the
+        # dataset prep script runs locally only). The harness still emits
+        # an empty CSV + zero-sample summary so the output directory layout
+        # is exercised end-to-end.
         result = run_scenario_1(
             items=[],
-            pipeline_callable=pipeline,
+            provider=provider,
             sample_rate=16_000,
             output_csv=config.output_dir / "scenario_1.csv",
         )
@@ -149,9 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="use the minimal evaluation set (Phase 1 PoC default)",
     )
     parser.add_argument(
-        "--stub-pipeline",
+        "--real-pipeline",
         action="store_true",
-        help="force the identity-pipeline stub (used by tests and dry runs)",
+        help="use the real mellonella-poc pipeline (requires `pip install -e poc[models]`)",
     )
     return parser
 
@@ -162,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output,
         scenarios=args.scenarios,
         quick=args.quick,
-        use_real_pipeline=not args.stub_pipeline,
+        use_real_pipeline=args.real_pipeline,
     )
     summary = run(config)
     print(json.dumps({"eval_id": summary.eval_id, "output": str(config.output_dir)}, indent=2))

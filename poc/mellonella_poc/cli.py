@@ -61,10 +61,15 @@ def cmd_process(args: argparse.Namespace) -> int:
     components = PipelineComponents.build_default(config)
     pool = EmbeddingPool.load(args.enrollment, config.gating)
     audio, sr = _read_audio(args.input)
-    out = process_offline(audio, sr, pool, config, components)
-    _write_audio(args.output, out, config.audio.output_sr)
+    result = process_offline(audio, sr, pool, config, components)
+    _write_audio(args.output, result.audio, config.audio.output_sr)
+    on_frames = int(result.gate_per_frame.sum())
+    total_frames = int(result.gate_per_frame.size)
+    duty = on_frames / total_frames if total_frames else 0.0
     print(
-        f"Wrote {args.output} ({out.size / config.audio.output_sr:.2f}s @ {config.audio.output_sr}Hz)"
+        f"Wrote {args.output} "
+        f"({result.audio.size / config.audio.output_sr:.2f}s @ {config.audio.output_sr}Hz, "
+        f"gate duty cycle {duty:.0%})"
     )
     return 0
 
