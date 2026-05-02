@@ -28,14 +28,28 @@ pip install -e poc[dev] -e bench[dev]
 ## Running
 
 ```bash
-# fast subset (Scenario 1 only)
-mellonella-bench --quick --output benchmark_results/$(date +%Y%m%d_%H%M%S)
+# all wired-up scenarios (currently scenario_1, scenario_3)
+mellonella-bench --output benchmark_results/$(date +%Y%m%d_%H%M%S)
 
 # specific scenarios
-mellonella-bench --scenarios scenario_1 --output benchmark_results/...
+mellonella-bench --scenarios scenario_1,scenario_3 --output benchmark_results/...
+
+# real pipeline (requires `pip install -e poc[models]`)
+mellonella-bench --real-pipeline --output benchmark_results/...
 ```
 
 `mellonella-bench --help` lists the supported scenarios and flags.
+
+## Scenarios
+
+| ID | What it measures | Status |
+|---|---|---|
+| scenario_1 | Solo target + noise; SNR sweep with PESQ/STOI/SI-SDR/TPR | wired |
+| scenario_2 | Solo other speaker + noise; TNR / FPR | TODO |
+| scenario_3 | Alternating target ⇄ other; frame accuracy + onset/offset latency | wired |
+| scenario_4 | Simultaneous target + other; FP-tolerant behaviour | TODO |
+| scenario_5 | Multilingual robustness | TODO |
+| scenario_6 | Long-running drift verification (auto-learn) | TODO |
 
 ## Datasets
 

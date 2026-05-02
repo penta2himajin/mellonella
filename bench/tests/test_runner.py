@@ -34,9 +34,20 @@ def test_scenario_1_csv_is_present_even_when_empty(tmp_path):
     assert (tmp_path / "eval" / "scenario_1.csv").exists()
 
 
+def test_scenario_3_csv_is_present_even_when_empty(tmp_path):
+    config = RunnerConfig(
+        output_dir=tmp_path / "eval",
+        scenarios=("scenario_3",),
+        use_real_pipeline=False,
+    )
+    summary = run(config)
+    assert (tmp_path / "eval" / "scenario_3.csv").exists()
+    assert summary.scenarios["scenario_3"]["n_samples"] == 0
+
+
 def test_parser_defaults():
     args = build_parser().parse_args(["--output", "/tmp/out"])
-    assert args.scenarios == ("scenario_1",)
+    assert args.scenarios == ("scenario_1", "scenario_3")
     assert not args.quick
     assert not args.real_pipeline
 
