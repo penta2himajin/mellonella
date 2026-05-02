@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: poc/pyproject.toml
+      - name: Install ruff
+        run: pip install ruff==0.5.7
+      - name: ruff check
+        working-directory: poc
+        run: ruff check .
+      - name: ruff format --check
+        working-directory: poc
+        run: ruff format --check .
+
+  typecheck:
+    name: typecheck (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: poc/pyproject.toml
+      - name: Install lightweight deps
+        working-directory: poc
+        run: pip install -e ".[dev]"
+      - name: mypy
+        working-directory: poc
+        run: mypy mellonella_poc
+
+  test:
+    name: test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: poc/pyproject.toml
+      - name: Install lightweight deps
+        working-directory: poc
+        run: pip install -e ".[dev]"
+      - name: pytest
+        working-directory: poc
+        run: pytest --cov=mellonella_poc --cov-report=term-missing -m "not models"
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh
