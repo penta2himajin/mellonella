@@ -1,0 +1,85 @@
+"""Default thresholds and tunable parameters.
+
+Initial values follow `docs/gating.md` and `docs/architecture.md`. They are
+subject to revision after Phase 1 measurements; treat any number here as a
+starting point, not a contract.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class GatingConfig:
+    """Thresholds and weights for the integrated speaker gate."""
+
+    alpha: float = 0.8
+    """Weight applied to cosine similarity in the integrated score."""
+
+    beta: float = 0.2
+    """Weight applied to F0 match in the integrated score. alpha + beta == 1.0."""
+
+    theta_pass: float = 0.50
+    """Output gate threshold. Below this, frames are muted."""
+
+    theta_learn: float = 0.80
+    """Auto-learning threshold. Strictly greater than theta_pass."""
+
+    theta_f0: float = 0.7
+    """Minimum f0_match required before an embedding can join auto-learn."""
+
+    hangover_ms: float = 300.0
+    """How long the gate stays ON after target_score drops below theta_pass."""
+
+    attack_ms: float = 15.0
+    """Envelope attack time in milliseconds (fast, avoids click)."""
+
+    release_ms: float = 100.0
+    """Envelope release time in milliseconds (slow, avoids cutoff)."""
+
+    anchor_distance_threshold: float = 0.4
+    """Maximum 1 - max_cos(anchors) allowed before a candidate is rejected."""
+
+    anchor_reset_threshold: float = 0.5
+    """Median anchor distance over auto-learn pool that triggers reset."""
+
+    auto_learn_max_size: int = 20
+    """FIFO bound on auto-learning embeddings."""
+
+    min_continuous_speech_sec: float = 1.0
+    """Minimum speech run length before auto-learn admission."""
+
+    def __post_init__(self) -> None:
+        if self.theta_pass >= self.theta_learn:
+            raise ValueError("theta_pass must be strictly less than theta_learn")
+        if not 0.99 <= self.alpha + self.beta <= 1.01:
+            raise ValueError("alpha + beta must equal 1.0")
+
+
+@dataclass(frozen=True)
+class AudioConfig:
+    """Sampling-rate plumbing matching `docs/architecture.md`."""
+
+    output_sr: int = 48_000
+    """DFN3 native rate; also the final pipeline output rate."""
+
+    sv_sr: int = 16_000
+    """ECAPA-TDNN native rate; used for VAD/SV/F0 stages."""
+
+    frame_ms: float = 20.0
+    """Streaming frame size at output_sr."""
+
+    sv_window_sec: float = 1.0
+    """Window length used to compute speaker embeddings."""
+
+    sv_update_ms: float = 250.0
+    """How often a new embedding is computed during continuous speech."""
+
+
+@dataclass(frozen=True)
+class Config:
+    """Top-level configuration container."""
+
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    gating: GatingConfig = field(default_factory=GatingConfig)
