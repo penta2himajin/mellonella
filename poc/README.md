@@ -66,6 +66,12 @@ pytest                     # lightweight tests only
 pytest -m models           # also run model-backed integration tests
 ```
 
+## Notebooks
+
+Threshold validation and ad-hoc analysis live under
+[`notebooks/`](notebooks/) as jupytext-style `.py` files. See
+[`notebooks/README.md`](notebooks/README.md) for setup and conventions.
+
 ## Smoke test (end-to-end)
 
 A real-pipeline smoke that exercises every model wrapper:
