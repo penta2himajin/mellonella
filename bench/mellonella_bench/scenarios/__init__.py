@@ -21,3 +21,5 @@ __all__ = [
     "StubPipelineProvider",
     "mix_at_snr",
 ]
+# Scenario modules are imported on demand; keep the registry here for discovery.
+SCENARIOS = ("scenario_1", "scenario_3")

@@ -33,10 +33,13 @@ class PipelineProvider(Protocol):
 
 @dataclass
 class SnrSweepEntry:
-    """One row's worth of metrics for a single SNR condition."""
+    """One row's worth of metrics. Used by Scenario 1 (per-SNR) and other
+    scenarios that emit one or many rows per item; non-applicable fields
+    stay ``None`` and the CSV writer renders them as empty cells.
+    """
 
     sample_id: str
-    snr_db: float
+    snr_db: float | None = None
     target_speaker: str = ""
     other_speaker: str = ""
     language: str = ""
@@ -47,6 +50,9 @@ class SnrSweepEntry:
     gate_tnr: float | None = None
     gate_fpr: float | None = None
     gate_fnr: float | None = None
+    frame_accuracy: float | None = None
+    onset_latency_ms: float | None = None
+    offset_latency_ms: float | None = None
     attack_ms: float | None = None
     release_ms: float | None = None
     processing_time_ms: float | None = None
@@ -82,6 +88,9 @@ class SnrSweep:
             "pesq",
             "stoi",
             "si_sdr",
+            "frame_accuracy",
+            "onset_latency_ms",
+            "offset_latency_ms",
             "attack_ms",
             "release_ms",
             "processing_time_ms",
@@ -106,6 +115,9 @@ class SnrSweep:
                         "pesq": e.pesq,
                         "stoi": e.stoi,
                         "si_sdr": e.si_sdr,
+                        "frame_accuracy": e.frame_accuracy,
+                        "onset_latency_ms": e.onset_latency_ms,
+                        "offset_latency_ms": e.offset_latency_ms,
                         "attack_ms": e.attack_ms,
                         "release_ms": e.release_ms,
                         "processing_time_ms": e.processing_time_ms,
