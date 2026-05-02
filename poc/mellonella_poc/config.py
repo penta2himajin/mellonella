@@ -68,13 +68,27 @@ class AudioConfig:
     """ECAPA-TDNN native rate; used for VAD/SV/F0 stages."""
 
     frame_ms: float = 20.0
-    """Streaming frame size at output_sr."""
+    """Streaming frame size at output_sr (envelope / chunking cadence)."""
+
+    vad_frame_samples: int = 512
+    """Number of samples per silero-vad call.
+
+    silero-vad >= 6.0 enforces a hard 512-sample chunk at 16 kHz (32 ms)
+    and 256 samples at 8 kHz; older versions accepted arbitrary lengths.
+    The pipeline's gate / hangover / envelope cadence is driven by this
+    same step, so any change here also changes ``dt_ms`` for the gate.
+    """
 
     sv_window_sec: float = 1.0
     """Window length used to compute speaker embeddings."""
 
     sv_update_ms: float = 250.0
     """How often a new embedding is computed during continuous speech."""
+
+    @property
+    def vad_frame_ms(self) -> float:
+        """Convenience: VAD frame duration in milliseconds (read-only)."""
+        return 1000.0 * self.vad_frame_samples / self.sv_sr
 
 
 @dataclass(frozen=True)

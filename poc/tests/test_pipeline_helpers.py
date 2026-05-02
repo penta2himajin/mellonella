@@ -55,3 +55,13 @@ def test_process_result_defaults_are_isolated():
     a.gate_per_frame = np.array([True, False])
     assert b.gate_decisions == []
     assert b.gate_per_frame.size == 0
+
+
+def test_audio_config_vad_frame_defaults_match_silero_v6():
+    """silero-vad >= 6.0 only accepts 512-sample chunks at 16 kHz."""
+    from mellonella_poc.config import AudioConfig
+
+    cfg = AudioConfig()
+    assert cfg.vad_frame_samples == 512
+    assert cfg.sv_sr == 16_000
+    assert cfg.vad_frame_ms == pytest.approx(32.0)
