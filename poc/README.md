@@ -65,3 +65,16 @@ cd poc
 pytest                     # lightweight tests only
 pytest -m models           # also run model-backed integration tests
 ```
+
+## Smoke test (end-to-end)
+
+A real-pipeline smoke that exercises every model wrapper:
+
+```bash
+pip install -e poc[models]
+scripts/smoke.py /tmp/smoke
+```
+
+CI runs the same script in `.github/workflows/smoke.yml` so regressions
+in torch / speechbrain / silero-vad / deepfilternet integration are
+caught on every PR.

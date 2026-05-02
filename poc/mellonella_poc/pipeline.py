@@ -154,7 +154,8 @@ def process_offline(
     enhanced48 = components.dfn3.process(out48)
     sv16 = resample(enhanced48, out_sr, sv_sr)
 
-    frame_size_sv = int(config.audio.frame_ms * sv_sr / 1000)
+    vad_frame = config.audio.vad_frame_samples
+    vad_dt_ms = config.audio.vad_frame_ms
     sv_window = int(config.audio.sv_window_sec * sv_sr)
     sv_update = int(config.audio.sv_update_ms * sv_sr / 1000)
     speech_buffer: list[np.ndarray] = []
@@ -167,9 +168,9 @@ def process_offline(
     current_decision: bool | None = None
     per_frame: list[bool] = []
 
-    for start_sv, end_sv in _frame_chunks(sv16.size, frame_size_sv):
+    for start_sv, end_sv in _frame_chunks(sv16.size, vad_frame):
         frame = sv16[start_sv:end_sv]
-        if frame.size < frame_size_sv:
+        if frame.size < vad_frame:
             break
 
         speech_prob = components.vad.score(frame)
@@ -197,7 +198,7 @@ def process_offline(
                 config=config.gating,
             )
 
-        is_on = gate_state.update(last_score, dt_ms=config.audio.frame_ms)
+        is_on = gate_state.update(last_score, dt_ms=vad_dt_ms)
         per_frame.append(is_on)
 
         out_start = int(start_sv * out_sr / sv_sr)
