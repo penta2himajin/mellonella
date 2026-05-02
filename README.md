@@ -44,7 +44,7 @@
 
 ## ステータス
 
-Phase 1 PoC 着手中。Python 実装は [`poc/`](poc/) 配下、開発・モデルセットアップ補助は [`scripts/`](scripts/)、CI は [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+Phase 1 PoC 着手中。Python 実装は [`poc/`](poc/)、評価ハーネスは [`bench/`](bench/)、開発・モデルセットアップ補助は [`scripts/`](scripts/)、CI は [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## ライセンス
 

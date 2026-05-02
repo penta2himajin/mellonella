@@ -13,45 +13,63 @@ jobs:
   lint:
     name: lint (ruff)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - poc
+          - bench
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: poc/pyproject.toml
+          cache-dependency-path: ${{ matrix.package }}/pyproject.toml
       - name: Install ruff
         run: pip install ruff==0.5.7
       - name: ruff check
-        working-directory: poc
+        working-directory: ${{ matrix.package }}
         run: ruff check .
       - name: ruff format --check
-        working-directory: poc
+        working-directory: ${{ matrix.package }}
         run: ruff format --check .
 
   typecheck:
-    name: typecheck (mypy)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: poc/pyproject.toml
-      - name: Install lightweight deps
-        working-directory: poc
-        run: pip install -e ".[dev]"
-      - name: mypy
-        working-directory: poc
-        run: mypy mellonella_poc
-
-  test:
-    name: test (py${{ matrix.python }})
+    name: typecheck (mypy, ${{ matrix.package }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        package:
+          - poc
+          - bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+      - name: Install poc + bench (lightweight)
+        run: |
+          pip install -e poc[dev]
+          pip install -e bench[dev]
+      - name: mypy
+        working-directory: ${{ matrix.package }}
+        run: mypy
+
+  test:
+    name: test (${{ matrix.package }}, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - poc
+          - bench
         python: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -59,13 +77,16 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: poc/pyproject.toml
-      - name: Install lightweight deps
-        working-directory: poc
-        run: pip install -e ".[dev]"
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+      - name: Install poc + bench (lightweight)
+        run: |
+          pip install -e poc[dev]
+          pip install -e bench[dev]
       - name: pytest
-        working-directory: poc
-        run: pytest --cov=mellonella_poc --cov-report=term-missing -m "not models"
+        working-directory: ${{ matrix.package }}
+        run: pytest -m "not models and not metrics and not datasets"
 
   shellcheck:
     name: shellcheck
