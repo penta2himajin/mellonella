@@ -3,10 +3,32 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
+
+PipelineCallable = Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"]
+"""``(mixture, sample_rate) -> (output_audio, gate_per_frame_bool)``.
+
+``gate_per_frame_bool`` is the boolean gate decision per SV frame
+(``Config.audio.frame_ms`` cadence at ``Config.audio.sv_sr``); it is what
+:class:`mellonella_bench.metrics.gating.confusion_from_frames` consumes.
+"""
+
+
+class PipelineProvider(Protocol):
+    """Returns a per-item :data:`PipelineCallable`.
+
+    Implementations either ignore the item entirely (the deterministic stub
+    used by tests) or build a fresh enrollment pool from the item's
+    enrollment recording (the real-pipeline path).
+    """
+
+    def for_item(self, item: object) -> PipelineCallable:  # pragma: no cover - protocol
+        ...
 
 
 @dataclass
@@ -100,6 +122,27 @@ class ScenarioResult:
     n_samples: int
     metrics: dict[str, float] = field(default_factory=dict)
     sweep: SnrSweep | None = None
+
+
+def _identity_pipeline(mixture: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """Pass-through pipeline: returns the mixture unchanged with all-on gate.
+
+    The gate array length matches the SV frame cadence (50 Hz at 16 kHz),
+    so the output is shape-compatible with what real scenarios feed into
+    :class:`mellonella_bench.metrics.gating.confusion_from_frames`.
+    """
+    del sample_rate
+    n_frames = max(1, mixture.size // 320)  # 20 ms frames at 16 kHz
+    return mixture, np.ones(n_frames, dtype=bool)
+
+
+@dataclass
+class StubPipelineProvider:
+    """Deterministic identity provider. Ignores the item; used by tests / dry runs."""
+
+    def for_item(self, item: object) -> PipelineCallable:
+        del item
+        return _identity_pipeline
 
 
 def mix_at_snr(

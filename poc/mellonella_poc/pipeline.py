@@ -8,7 +8,7 @@ to demonstrate algorithmic correctness on pre-recorded audio.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -19,6 +19,43 @@ from .enrollment import EmbeddingPool
 from .f0 import estimate_f0_track, f0_statistics
 from .gating import GateState, apply_envelope, target_score
 from .vad import SileroVAD
+
+
+@dataclass
+class ProcessResult:
+    """Output of :func:`process_offline`.
+
+    - ``audio`` is the gated, NS-cleaned waveform at ``Config.audio.output_sr``.
+    - ``gate_decisions`` is the run-length list of ``(start_sample, is_on)``
+      tuples consumed by :func:`mellonella_poc.gating.apply_envelope`. The
+      first tuple's ``start_sample`` is always 0.
+    - ``gate_per_frame`` is the per-SV-frame boolean gate array (one entry
+      per ``Config.audio.frame_ms`` window), aligned with what bench's
+      ground-truth ``voiced_mask`` uses for confusion analysis.
+    """
+
+    audio: np.ndarray
+    gate_decisions: list[tuple[int, bool]] = field(default_factory=list)
+    gate_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+
+
+def expand_gate_decisions(
+    decisions: list[tuple[int, bool]],
+    n_samples: int,
+) -> np.ndarray:
+    """Expand run-length ``(start, is_on)`` decisions into a per-sample bool array."""
+    if n_samples < 0:
+        raise ValueError("n_samples must be non-negative")
+    out = np.zeros(n_samples, dtype=bool)
+    if not decisions:
+        return out
+    if decisions[0][0] != 0:
+        raise ValueError("decisions must start at sample 0")
+    boundaries = [start for start, _ in decisions] + [n_samples]
+    for (start, is_on), end in zip(decisions, boundaries[1:], strict=False):
+        if is_on:
+            out[start:end] = True
+    return out
 
 
 def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -101,10 +138,12 @@ def process_offline(
     pool: EmbeddingPool,
     config: Config,
     components: PipelineComponents,
-) -> np.ndarray:
+) -> ProcessResult:
     """Run the full pipeline end-to-end on a finite buffer.
 
-    Returns the gated, NS-cleaned waveform at `config.audio.output_sr`.
+    Returns a :class:`ProcessResult` containing the NS-cleaned, gated
+    waveform along with the gate-decision artefacts needed by bench
+    metrics.
     """
     if audio.ndim != 1:
         raise ValueError("audio must be a 1-D mono buffer")
@@ -126,6 +165,7 @@ def process_offline(
     gate_state = GateState(config=config.gating)
     decisions: list[tuple[int, bool]] = []
     current_decision: bool | None = None
+    per_frame: list[bool] = []
 
     for start_sv, end_sv in _frame_chunks(sv16.size, frame_size_sv):
         frame = sv16[start_sv:end_sv]
@@ -158,6 +198,7 @@ def process_offline(
             )
 
         is_on = gate_state.update(last_score, dt_ms=config.audio.frame_ms)
+        per_frame.append(is_on)
 
         out_start = int(start_sv * out_sr / sv_sr)
         if current_decision is None or current_decision != is_on:
@@ -169,4 +210,9 @@ def process_offline(
     elif decisions[0][0] != 0:
         decisions.insert(0, (0, decisions[0][1]))
 
-    return apply_envelope(enhanced48, decisions, sample_rate=out_sr, config=config.gating)
+    output = apply_envelope(enhanced48, decisions, sample_rate=out_sr, config=config.gating)
+    return ProcessResult(
+        audio=output,
+        gate_decisions=decisions,
+        gate_per_frame=np.asarray(per_frame, dtype=bool),
+    )

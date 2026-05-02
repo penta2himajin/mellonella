@@ -38,7 +38,7 @@ def test_parser_defaults():
     args = build_parser().parse_args(["--output", "/tmp/out"])
     assert args.scenarios == ("scenario_1",)
     assert not args.quick
-    assert not args.stub_pipeline
+    assert not args.real_pipeline
 
 
 def test_parser_scenarios_split():
