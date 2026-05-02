@@ -158,7 +158,7 @@ def process_offline(
     vad_dt_ms = config.audio.vad_frame_ms
     sv_window = int(config.audio.sv_window_sec * sv_sr)
     sv_update = int(config.audio.sv_update_ms * sv_sr / 1000)
-    speech_buffer: list[np.ndarray] = []
+    speech_buffer: np.ndarray = np.empty(0, dtype=np.float32)
     samples_since_update = 0
     last_score = 0.0
     last_f0 = 0.0
@@ -175,16 +175,14 @@ def process_offline(
 
         speech_prob = components.vad.score(frame)
         if speech_prob > 0.5:
-            speech_buffer.append(frame)
-            total = sum(b.size for b in speech_buffer)
-            while total > sv_window and speech_buffer:
-                drop = speech_buffer.pop(0)
-                total -= drop.size
+            speech_buffer = np.concatenate([speech_buffer, frame])
+            if speech_buffer.size > sv_window:
+                speech_buffer = speech_buffer[-sv_window:]
         samples_since_update += frame.size
 
-        if samples_since_update >= sv_update and sum(b.size for b in speech_buffer) >= sv_window:
+        if samples_since_update >= sv_update and speech_buffer.size >= sv_window:
             samples_since_update = 0
-            window = np.concatenate(speech_buffer)[-sv_window:]
+            window = speech_buffer[-sv_window:]
             embedding = components.ecapa.embed(window)
             f0_track = estimate_f0_track(window, sv_sr)
             f0_mean, _ = f0_statistics(f0_track)
