@@ -24,4 +24,4 @@ __all__ = [
     "mix_at_snr",
 ]
 # Scenario modules are imported on demand; keep the registry here for discovery.
-SCENARIOS = ("scenario_1", "scenario_3", "scenario_6")
+SCENARIOS = ("scenario_1", "scenario_2", "scenario_3", "scenario_6")

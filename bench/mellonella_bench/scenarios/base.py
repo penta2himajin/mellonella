@@ -75,6 +75,7 @@ class SnrSweepEntry:
     auto_learn_admissions: int | None = None
     auto_learn_resets: int | None = None
     anchor_distance_final: float | None = None
+    output_rms_db: float | None = None
     processing_time_ms: float | None = None
     notes: str = ""
 
@@ -116,6 +117,7 @@ class SnrSweep:
             "auto_learn_admissions",
             "auto_learn_resets",
             "anchor_distance_final",
+            "output_rms_db",
             "processing_time_ms",
             "notes",
         ]
@@ -146,6 +148,7 @@ class SnrSweep:
                         "auto_learn_admissions": e.auto_learn_admissions,
                         "auto_learn_resets": e.auto_learn_resets,
                         "anchor_distance_final": e.anchor_distance_final,
+                        "output_rms_db": e.output_rms_db,
                         "processing_time_ms": e.processing_time_ms,
                         "notes": e.notes,
                     }
