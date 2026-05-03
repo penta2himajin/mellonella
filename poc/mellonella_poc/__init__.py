@@ -2,10 +2,18 @@
 
 from .config import Config, GatingConfig
 from .enrollment import EmbeddingPool
-from .gating import EnvelopeState, GateState, apply_envelope, target_score, update_gate
-from .pipeline import ProcessResult, expand_gate_decisions
+from .gating import (
+    EnvelopeState,
+    GateState,
+    apply_envelope,
+    should_admit_auto_learn,
+    target_score,
+    update_gate,
+)
+from .pipeline import AutoLearnEvent, ProcessResult, expand_gate_decisions
 
 __all__ = [
+    "AutoLearnEvent",
     "Config",
     "EmbeddingPool",
     "EnvelopeState",
@@ -14,6 +22,7 @@ __all__ = [
     "ProcessResult",
     "apply_envelope",
     "expand_gate_decisions",
+    "should_admit_auto_learn",
     "target_score",
     "update_gate",
 ]

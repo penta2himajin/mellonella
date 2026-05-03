@@ -50,6 +50,14 @@ class GatingConfig:
     min_continuous_speech_sec: float = 1.0
     """Minimum speech run length before auto-learn admission."""
 
+    enable_auto_learn: bool = True
+    """Master switch for auto-learn admission inside `process_offline`.
+
+    When False, embeddings are never added to the auto-learn FIFO and the
+    pool's drift-reset hook is never invoked. Used for ablation runs and
+    tests that want a deterministic, time-invariant pool.
+    """
+
     def __post_init__(self) -> None:
         if self.theta_pass >= self.theta_learn:
             raise ValueError("theta_pass must be strictly less than theta_learn")

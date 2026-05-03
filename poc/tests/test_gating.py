@@ -150,3 +150,42 @@ def test_gating_config_validates_threshold_order():
 def test_gating_config_validates_weight_sum():
     with pytest.raises(ValueError):
         GatingConfig(alpha=0.5, beta=0.3)
+
+
+def test_should_admit_auto_learn_all_pass():
+    from mellonella_poc.gating import should_admit_auto_learn
+
+    cfg = GatingConfig(theta_learn=0.80, theta_f0=0.7, min_continuous_speech_sec=1.0)
+    assert should_admit_auto_learn(0.85, 0.75, 1500.0, cfg)
+
+
+def test_should_admit_auto_learn_low_score_blocked():
+    from mellonella_poc.gating import should_admit_auto_learn
+
+    cfg = GatingConfig()
+    assert not should_admit_auto_learn(0.79, 0.9, 2000.0, cfg)
+
+
+def test_should_admit_auto_learn_low_f0_match_blocked():
+    from mellonella_poc.gating import should_admit_auto_learn
+
+    cfg = GatingConfig(theta_learn=0.80, theta_f0=0.7)
+    assert not should_admit_auto_learn(0.85, 0.5, 2000.0, cfg)
+
+
+def test_should_admit_auto_learn_short_run_blocked():
+    from mellonella_poc.gating import should_admit_auto_learn
+
+    cfg = GatingConfig(min_continuous_speech_sec=1.0)
+    assert not should_admit_auto_learn(0.95, 0.9, 500.0, cfg)
+
+
+def test_should_admit_auto_learn_boundary_inclusive():
+    from mellonella_poc.gating import should_admit_auto_learn
+
+    cfg = GatingConfig(theta_learn=0.80, theta_f0=0.7, min_continuous_speech_sec=1.0)
+    # exactly-at-threshold passes
+    assert should_admit_auto_learn(0.80, 0.7, 1000.0, cfg)
+    assert not should_admit_auto_learn(0.799, 0.7, 1000.0, cfg)
+    assert not should_admit_auto_learn(0.80, 0.699, 1000.0, cfg)
+    assert not should_admit_auto_learn(0.80, 0.7, 999.0, cfg)

@@ -10,13 +10,30 @@ from typing import Protocol
 
 import numpy as np
 
-PipelineCallable = Callable[[np.ndarray, int], "tuple[np.ndarray, np.ndarray]"]
-"""``(mixture, sample_rate) -> (output_audio, gate_per_frame_bool)``.
 
-``gate_per_frame_bool`` is the boolean gate decision per SV frame
-(``Config.audio.frame_ms`` cadence at ``Config.audio.sv_sr``); it is what
-:class:`mellonella_bench.metrics.gating.confusion_from_frames` consumes.
-"""
+@dataclass
+class PipelineCallResult:
+    """Per-call output of a :data:`PipelineCallable`.
+
+    Always-present fields:
+
+    * ``audio``               processed mono waveform (same length as input)
+    * ``gate_per_frame``      boolean gate decision per SV frame at
+                              ``Config.audio.vad_frame_ms`` cadence
+
+    Auto-learn fields are only meaningful for the real pipeline; the stub
+    leaves them at default 0 / None.
+    """
+
+    audio: np.ndarray
+    gate_per_frame: np.ndarray
+    auto_learn_admissions: int = 0
+    auto_learn_resets: int = 0
+    anchor_distance_final: float | None = None
+
+
+PipelineCallable = Callable[[np.ndarray, int], PipelineCallResult]
+"""``(mixture, sample_rate) -> PipelineCallResult``."""
 
 
 class PipelineProvider(Protocol):
@@ -55,6 +72,9 @@ class SnrSweepEntry:
     offset_latency_ms: float | None = None
     attack_ms: float | None = None
     release_ms: float | None = None
+    auto_learn_admissions: int | None = None
+    auto_learn_resets: int | None = None
+    anchor_distance_final: float | None = None
     processing_time_ms: float | None = None
     notes: str = ""
 
@@ -93,6 +113,9 @@ class SnrSweep:
             "offset_latency_ms",
             "attack_ms",
             "release_ms",
+            "auto_learn_admissions",
+            "auto_learn_resets",
+            "anchor_distance_final",
             "processing_time_ms",
             "notes",
         ]
@@ -120,6 +143,9 @@ class SnrSweep:
                         "offset_latency_ms": e.offset_latency_ms,
                         "attack_ms": e.attack_ms,
                         "release_ms": e.release_ms,
+                        "auto_learn_admissions": e.auto_learn_admissions,
+                        "auto_learn_resets": e.auto_learn_resets,
+                        "anchor_distance_final": e.anchor_distance_final,
                         "processing_time_ms": e.processing_time_ms,
                         "notes": e.notes,
                     }
@@ -136,16 +162,17 @@ class ScenarioResult:
     sweep: SnrSweep | None = None
 
 
-def _identity_pipeline(mixture: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+def _identity_pipeline(mixture: np.ndarray, sample_rate: int) -> PipelineCallResult:
     """Pass-through pipeline: returns the mixture unchanged with all-on gate.
 
-    The gate array length matches the SV frame cadence (50 Hz at 16 kHz),
-    so the output is shape-compatible with what real scenarios feed into
+    The gate array length matches the SV frame cadence (~31 Hz at 16 kHz with
+    a 512-sample silero-vad chunk), so the output is shape-compatible with
+    what real scenarios feed into
     :class:`mellonella_bench.metrics.gating.confusion_from_frames`.
     """
     del sample_rate
-    n_frames = max(1, mixture.size // 320)  # 20 ms frames at 16 kHz
-    return mixture, np.ones(n_frames, dtype=bool)
+    n_frames = max(1, mixture.size // 512)  # 32 ms frames at 16 kHz
+    return PipelineCallResult(audio=mixture, gate_per_frame=np.ones(n_frames, dtype=bool))
 
 
 @dataclass

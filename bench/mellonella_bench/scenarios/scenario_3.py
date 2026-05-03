@@ -198,8 +198,9 @@ def evaluate_one(
 
     pipeline = provider.for_item(item)
     t0 = time.perf_counter()
-    _output_audio, gate_per_frame = pipeline(audio, sample_rate)
+    result = pipeline(audio, sample_rate)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    gate_per_frame = result.gate_per_frame
 
     # Trim/pad gate_per_frame to align with target_mask.
     if gate_per_frame.size >= target_mask.size:

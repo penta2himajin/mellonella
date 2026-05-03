@@ -17,8 +17,34 @@ from .dfn3 import DeepFilterNet3
 from .embedding import EcapaTdnn
 from .enrollment import EmbeddingPool
 from .f0 import estimate_f0_track, f0_statistics
-from .gating import GateState, apply_envelope, target_score
+from .gating import (
+    GateState,
+    apply_envelope,
+    cos_sim_max,
+    f0_match,
+    should_admit_auto_learn,
+)
 from .vad import SileroVAD
+
+
+@dataclass
+class AutoLearnEvent:
+    """Single auto-learn lifecycle event recorded during :func:`process_offline`.
+
+    ``kind`` is one of:
+
+    * ``"admit"``                 candidate cleared every gate AND was added
+                                  to ``EmbeddingPool.auto_learn``
+    * ``"reject_anchor_distance"`` candidate cleared rule-based gates but the
+                                  pool refused it via ``can_auto_learn``
+    * ``"reset"``                  ``EmbeddingPool.maybe_reset`` cleared the
+                                  auto-learn FIFO due to drift
+    """
+
+    frame_idx: int
+    kind: str
+    score: float
+    f0_match: float
 
 
 @dataclass
@@ -32,11 +58,14 @@ class ProcessResult:
     - ``gate_per_frame`` is the per-SV-frame boolean gate array (one entry
       per ``Config.audio.frame_ms`` window), aligned with what bench's
       ground-truth ``voiced_mask`` uses for confusion analysis.
+    - ``auto_learn_events`` is the chronological log of admission /
+      rejection / reset events on the supplied :class:`EmbeddingPool`.
     """
 
     audio: np.ndarray
     gate_decisions: list[tuple[int, bool]] = field(default_factory=list)
     gate_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    auto_learn_events: list[AutoLearnEvent] = field(default_factory=list)
 
 
 def expand_gate_decisions(
@@ -160,15 +189,16 @@ def process_offline(
     sv_update = int(config.audio.sv_update_ms * sv_sr / 1000)
     speech_buffer: np.ndarray = np.empty(0, dtype=np.float32)
     samples_since_update = 0
+    consecutive_speech_ms = 0.0
     last_score = 0.0
-    last_f0 = 0.0
 
     gate_state = GateState(config=config.gating)
     decisions: list[tuple[int, bool]] = []
     current_decision: bool | None = None
     per_frame: list[bool] = []
+    auto_learn_events: list[AutoLearnEvent] = []
 
-    for start_sv, end_sv in _frame_chunks(sv16.size, vad_frame):
+    for frame_idx, (start_sv, end_sv) in enumerate(_frame_chunks(sv16.size, vad_frame)):
         frame = sv16[start_sv:end_sv]
         if frame.size < vad_frame:
             break
@@ -178,6 +208,9 @@ def process_offline(
             speech_buffer = np.concatenate([speech_buffer, frame])
             if speech_buffer.size > sv_window:
                 speech_buffer = speech_buffer[-sv_window:]
+            consecutive_speech_ms += vad_dt_ms
+        else:
+            consecutive_speech_ms = 0.0
         samples_since_update += frame.size
 
         if samples_since_update >= sv_update and speech_buffer.size >= sv_window:
@@ -186,15 +219,24 @@ def process_offline(
             embedding = components.ecapa.embed(window)
             f0_track = estimate_f0_track(window, sv_sr)
             f0_mean, _ = f0_statistics(f0_track)
-            last_f0 = f0_mean
-            last_score = target_score(
-                embedding=embedding,
-                pool=pool,
-                f0_mean=last_f0,
-                f0_mu=pool.metadata.f0_mu,
-                f0_sigma=pool.metadata.f0_sigma,
-                config=config.gating,
-            )
+            cs = cos_sim_max(embedding, pool)
+            fm = f0_match(f0_mean, pool.metadata.f0_mu, pool.metadata.f0_sigma)
+            last_score = config.gating.alpha * cs + config.gating.beta * fm
+
+            if config.gating.enable_auto_learn and should_admit_auto_learn(
+                last_score, fm, consecutive_speech_ms, config.gating
+            ):
+                admitted = pool.add_auto_learn(embedding)
+                kind = "admit" if admitted else "reject_anchor_distance"
+                auto_learn_events.append(
+                    AutoLearnEvent(frame_idx=frame_idx, kind=kind, score=last_score, f0_match=fm)
+                )
+                if admitted and pool.maybe_reset():
+                    auto_learn_events.append(
+                        AutoLearnEvent(
+                            frame_idx=frame_idx, kind="reset", score=last_score, f0_match=fm
+                        )
+                    )
 
         is_on = gate_state.update(last_score, dt_ms=vad_dt_ms)
         per_frame.append(is_on)

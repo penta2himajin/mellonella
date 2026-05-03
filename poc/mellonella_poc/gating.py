@@ -158,3 +158,31 @@ def update_gate(
 ) -> bool:
     """Convenience wrapper around `GateState.update` for symmetry with `apply_envelope`."""
     return state.update(score, dt_ms)
+
+
+def should_admit_auto_learn(
+    score: float,
+    f0_match_value: float,
+    continuous_speech_ms: float,
+    config: GatingConfig,
+) -> bool:
+    """Check the auto-learn admission rule from `docs/gating.md` D-004.
+
+    Returns True iff every required guard is satisfied:
+
+    * ``score >= theta_learn``                     high cosine confidence
+    * ``f0_match_value >= theta_f0``               F0 inside the enrollment range
+    * ``continuous_speech_ms >= min_continuous_speech_sec * 1000``
+                                                   long enough run that the
+                                                   embedding represents stable
+                                                   speech, not a transient
+
+    This function is the gatekeeper *before* :meth:`EmbeddingPool.add_auto_learn`,
+    which then applies the anchor-distance check to decide whether the
+    candidate is actually a drift-safe addition.
+    """
+    return (
+        score >= config.theta_learn
+        and f0_match_value >= config.theta_f0
+        and continuous_speech_ms >= config.min_continuous_speech_sec * 1000.0
+    )

@@ -23,19 +23,23 @@ def _sine(freq: float, sr: int, duration: float) -> np.ndarray:
 def test_stub_provider_returns_callable():
     provider = StubPipelineProvider()
     callable_ = provider.for_item(object())
-    mixture = _sine(220.0, 16_000, 0.5)
-    out, gate = callable_(mixture, 16_000)
-    assert out.shape == mixture.shape
-    assert gate.dtype == bool
-    assert gate.all()
+    mixture = _sine(220.0, 16_000, 1.0)
+    result = callable_(mixture, 16_000)
+    assert result.audio.shape == mixture.shape
+    assert result.gate_per_frame.dtype == bool
+    assert result.gate_per_frame.all()
+    # Stub leaves auto-learn fields at defaults.
+    assert result.auto_learn_admissions == 0
+    assert result.auto_learn_resets == 0
+    assert result.anchor_distance_final is None
 
 
 def test_stub_provider_gate_is_frame_rate():
     provider = StubPipelineProvider()
     mixture = _sine(220.0, 16_000, 1.0)  # 1 s
-    _, gate = provider.for_item(None)(mixture, 16_000)
-    # 1 s at 16 kHz / 320 samples-per-frame = 50 frames
-    assert gate.size == 50
+    result = provider.for_item(None)(mixture, 16_000)
+    # 1 s at 16 kHz / 512 samples-per-frame = 31 frames
+    assert result.gate_per_frame.size == 31
 
 
 def test_run_with_synthetic_items(tmp_path):
@@ -47,7 +51,7 @@ def test_run_with_synthetic_items(tmp_path):
     sf.write(str(target_path), target, sr)
     sf.write(str(noise_path), noise, sr)
 
-    voiced_mask = np.ones(target.size // 320, dtype=bool)
+    voiced_mask = np.ones(target.size // 512, dtype=bool)
 
     item = Scenario1Item(
         sample_id="utt_synthetic_001",
@@ -84,7 +88,7 @@ def test_run_rejects_sample_rate_mismatch(tmp_path):
     sf.write(str(target_path), target, sr)
     sf.write(str(noise_path), noise, 8_000)
 
-    voiced_mask = np.ones(target.size // 320, dtype=bool)
+    voiced_mask = np.ones(target.size // 512, dtype=bool)
     item = Scenario1Item(
         sample_id="utt_x",
         target_path=target_path,
@@ -119,6 +123,6 @@ def test_real_provider_requires_enrollment_path():
 def test_pipeline_callable_alias():
     """The ``PipelineCallable`` alias is callable-shaped and re-exported."""
     cb: PipelineCallable = StubPipelineProvider().for_item(None)
-    out, gate = cb(np.zeros(320, dtype=np.float32), 16_000)
-    assert out.shape == (320,)
-    assert gate.dtype == bool
+    result = cb(np.zeros(512, dtype=np.float32), 16_000)
+    assert result.audio.shape == (512,)
+    assert result.gate_per_frame.dtype == bool

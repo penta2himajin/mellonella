@@ -98,12 +98,12 @@ def evaluate_one(
     for snr in snrs_db:
         mixture = mix_at_snr(target, noise, snr, rng=rng)
         t0 = time.perf_counter()
-        output_audio, gate_per_frame = pipeline(mixture, sample_rate)
+        result = pipeline(mixture, sample_rate)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        gate_aligned = _truncate_to_match(item.voiced_mask, gate_per_frame.astype(bool))
+        gate_aligned = _truncate_to_match(item.voiced_mask, result.gate_per_frame.astype(bool))
         confusion = confusion_from_frames(item.voiced_mask, gate_aligned)
-        out_aligned = _truncate_to_match(target, output_audio)
+        out_aligned = _truncate_to_match(target, result.audio)
         sisdr = si_sdr(target, out_aligned)
 
         pesq_val: float | None = None

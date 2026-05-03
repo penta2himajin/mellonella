@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from .base import PipelineCallable
+from .base import PipelineCallable, PipelineCallResult
 
 
 def _load_mono(path: Path) -> tuple[np.ndarray, int]:
@@ -61,8 +61,17 @@ class RealPipelineProvider:
         enrollment_audio, enrollment_sr = _load_mono(Path(enrollment_path))
         pool = enroll_from_recording(enrollment_audio, enrollment_sr, config, components)
 
-        def _call(mixture: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+        def _call(mixture: np.ndarray, sample_rate: int) -> PipelineCallResult:
             result = process_offline(mixture, sample_rate, pool, config, components)
-            return result.audio, result.gate_per_frame
+            admissions = sum(1 for ev in result.auto_learn_events if ev.kind == "admit")
+            resets = sum(1 for ev in result.auto_learn_events if ev.kind == "reset")
+            anchor_distance_final = pool.median_anchor_distance() if pool.auto_learn else None
+            return PipelineCallResult(
+                audio=result.audio,
+                gate_per_frame=result.gate_per_frame,
+                auto_learn_admissions=admissions,
+                auto_learn_resets=resets,
+                anchor_distance_final=anchor_distance_final,
+            )
 
         return _call
