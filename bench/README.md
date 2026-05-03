@@ -28,11 +28,11 @@ pip install -e poc[dev] -e bench[dev]
 ## Running
 
 ```bash
-# all wired-up scenarios (currently scenario_1, scenario_3)
+# all wired-up scenarios (currently scenario_1, scenario_3, scenario_6)
 mellonella-bench --output benchmark_results/$(date +%Y%m%d_%H%M%S)
 
 # specific scenarios
-mellonella-bench --scenarios scenario_1,scenario_3 --output benchmark_results/...
+mellonella-bench --scenarios scenario_1,scenario_6 --output benchmark_results/...
 
 # real pipeline (requires `pip install -e poc[models]`)
 mellonella-bench --real-pipeline --output benchmark_results/...
@@ -49,7 +49,7 @@ mellonella-bench --real-pipeline --output benchmark_results/...
 | scenario_3 | Alternating target ⇄ other; frame accuracy + onset/offset latency | wired |
 | scenario_4 | Simultaneous target + other; FP-tolerant behaviour | TODO |
 | scenario_5 | Multilingual robustness | TODO |
-| scenario_6 | Long-running drift verification (auto-learn) | TODO |
+| scenario_6 | Long-running drift verification (auto-learn) | wired |
 
 ## Datasets
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mellonella_poc.pipeline import ProcessResult, expand_gate_decisions
+from mellonella_poc.pipeline import AutoLearnEvent, ProcessResult, expand_gate_decisions
 
 
 def test_expand_gate_decisions_simple():
@@ -65,3 +65,22 @@ def test_audio_config_vad_frame_defaults_match_silero_v6():
     assert cfg.vad_frame_samples == 512
     assert cfg.sv_sr == 16_000
     assert cfg.vad_frame_ms == pytest.approx(32.0)
+
+
+def test_process_result_auto_learn_events_default_empty():
+    result = ProcessResult(audio=np.zeros(4, dtype=np.float32))
+    assert result.auto_learn_events == []
+
+
+def test_auto_learn_event_kinds():
+    event = AutoLearnEvent(frame_idx=42, kind="admit", score=0.91, f0_match=0.85)
+    assert event.kind == "admit"
+    assert event.frame_idx == 42
+    assert event.score == pytest.approx(0.91)
+
+
+def test_gating_config_enable_auto_learn_default_true():
+    from mellonella_poc.config import GatingConfig
+
+    assert GatingConfig().enable_auto_learn is True
+    assert GatingConfig(enable_auto_learn=False).enable_auto_learn is False
