@@ -60,12 +60,24 @@ class ProcessResult:
       ground-truth ``voiced_mask`` uses for confusion analysis.
     - ``auto_learn_events`` is the chronological log of admission /
       rejection / reset events on the supplied :class:`EmbeddingPool`.
+    - ``score_per_frame`` / ``cos_sim_max_per_frame`` /
+      ``f0_match_per_frame`` are the integrated target score and its two
+      components, sampled per VAD frame. They make post-hoc threshold
+      and α/β sweeps possible (one pipeline run, many calibration
+      configurations) — see ``scripts/calibrate.py``.
     """
 
     audio: np.ndarray
     gate_decisions: list[tuple[int, bool]] = field(default_factory=list)
     gate_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     auto_learn_events: list[AutoLearnEvent] = field(default_factory=list)
+    score_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    cos_sim_max_per_frame: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float32)
+    )
+    f0_match_per_frame: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float32)
+    )
 
 
 def expand_gate_decisions(
@@ -191,11 +203,16 @@ def process_offline(
     samples_since_update = 0
     consecutive_speech_ms = 0.0
     last_score = 0.0
+    last_cs = 0.0
+    last_fm = 1.0
 
     gate_state = GateState(config=config.gating)
     decisions: list[tuple[int, bool]] = []
     current_decision: bool | None = None
     per_frame: list[bool] = []
+    score_per_frame: list[float] = []
+    cs_per_frame: list[float] = []
+    fm_per_frame: list[float] = []
     auto_learn_events: list[AutoLearnEvent] = []
 
     for frame_idx, (start_sv, end_sv) in enumerate(_frame_chunks(sv16.size, vad_frame)):
@@ -221,6 +238,8 @@ def process_offline(
             f0_mean, _ = f0_statistics(f0_track)
             cs = cos_sim_max(embedding, pool)
             fm = f0_match(f0_mean, pool.metadata.f0_mu, pool.metadata.f0_sigma)
+            last_cs = cs
+            last_fm = fm
             last_score = config.gating.alpha * cs + config.gating.beta * fm
 
             if config.gating.enable_auto_learn and should_admit_auto_learn(
@@ -240,6 +259,9 @@ def process_offline(
 
         is_on = gate_state.update(last_score, dt_ms=vad_dt_ms)
         per_frame.append(is_on)
+        score_per_frame.append(last_score)
+        cs_per_frame.append(last_cs)
+        fm_per_frame.append(last_fm)
 
         out_start = int(start_sv * out_sr / sv_sr)
         if current_decision is None or current_decision != is_on:
@@ -256,4 +278,8 @@ def process_offline(
         audio=output,
         gate_decisions=decisions,
         gate_per_frame=np.asarray(per_frame, dtype=bool),
+        auto_learn_events=auto_learn_events,
+        score_per_frame=np.asarray(score_per_frame, dtype=np.float32),
+        cos_sim_max_per_frame=np.asarray(cs_per_frame, dtype=np.float32),
+        f0_match_per_frame=np.asarray(fm_per_frame, dtype=np.float32),
     )
