@@ -15,16 +15,21 @@ Inputs
 
 Per SNR we record::
 
-    tpr        — gate-on rate while the *target* speaker is the input
-    fpr        — gate-on rate while the *other* speaker is the input
-    si_sdr_db  — SI-SDR of the gated output vs the clean target reference
+    tpr             — gate-on rate while the *target* speaker is the input
+    fpr             — gate-on rate while the *other* speaker is the input
+    si_sdr_db       — SI-SDR of the gated output vs the clean target reference
+    other_rms_db    — overall RMS (dBFS) of the gated output when the input is
+                      the other speaker; lower = better attenuation. This is
+                      the case-C extension that catches "gate stays open"
+                      regressions even when FPR happens to land at 0.
 
 Tolerances (worse-side only; improvements are ignored):
 
-    TPR     :  current >= baseline * 0.95     (relative -5%)
-    FPR     :  current <= baseline * 1.05     (relative +5%)
-                — when baseline is 0, allow current up to 0.05 absolute
-    SI-SDR  :  current >= baseline - 1.0 dB   (absolute, dB is not relative)
+    TPR           :  current >= baseline * 0.95           (relative -5%)
+    FPR           :  current <= baseline * 1.05           (relative +5%)
+                      — when baseline is 0, allow current up to 0.05 absolute
+    SI-SDR        :  current >= baseline - 1.0 dB         (absolute, dB)
+    other_rms_db  :  current <= baseline + 3.0 dB         (absolute, dB up = worse)
 
 Usage
 -----
@@ -45,15 +50,15 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from mellonella_bench.metrics.ns_quality import si_sdr
-from scipy.signal import resample_poly
-
 from mellonella_poc.config import Config
 from mellonella_poc.pipeline import (
     PipelineComponents,
     enroll_from_recording,
     process_offline,
 )
+from scipy.signal import resample_poly
+
+from mellonella_bench.metrics.ns_quality import si_sdr
 
 SAMPLE_RATE = 16_000
 SNRS_DB: tuple[float, ...] = (5.0, 10.0, 15.0)
@@ -62,6 +67,7 @@ TPR_REL_TOL = 0.05
 FPR_REL_TOL = 0.05
 FPR_ABS_FLOOR = 0.05  # used when baseline FPR is exactly 0
 SI_SDR_ABS_TOL_DB = 1.0
+OTHER_RMS_ABS_TOL_DB = 3.0  # output_rms_db growing by > 3 dB = mute weakening
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline.json"
@@ -95,6 +101,15 @@ def _gate_on_rate(gate_per_frame: np.ndarray) -> float:
     if gate_per_frame.size == 0:
         return 0.0
     return float(gate_per_frame.mean())
+
+
+def _rms_db(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    if rms <= 0.0:
+        return -120.0
+    return 20.0 * float(np.log10(rms + 1e-12))
 
 
 def measure() -> dict[str, dict[str, float]]:
@@ -138,11 +153,13 @@ def measure() -> dict[str, dict[str, float]]:
         other_mix = _mix_at_snr(other_audio, other_noise, snr)
         other_result = process_offline(other_mix, SAMPLE_RATE, pool, config, components)
         fpr = _gate_on_rate(other_result.gate_per_frame)
+        other_rms_db = _rms_db(other_result.audio)
 
         metrics[f"snr_{int(snr)}_db"] = {
             "tpr": round(tpr, 4),
             "fpr": round(fpr, 4),
             "si_sdr_db": round(sisdr, 2),
+            "other_rms_db": round(other_rms_db, 2),
         }
     return metrics
 
@@ -181,6 +198,16 @@ def _check_against_baseline(
                 f"{snr_key} SI-SDR regressed: {cur['si_sdr_db']:.2f} dB < "
                 f"{base['si_sdr_db']:.2f} dB - {SI_SDR_ABS_TOL_DB} dB"
             )
+
+        if (
+            "other_rms_db" in base
+            and "other_rms_db" in cur
+            and cur["other_rms_db"] > base["other_rms_db"] + OTHER_RMS_ABS_TOL_DB
+        ):
+            failures.append(
+                f"{snr_key} other_rms_db regressed: {cur['other_rms_db']:.2f} dB > "
+                f"{base['other_rms_db']:.2f} dB + {OTHER_RMS_ABS_TOL_DB} dB"
+            )
     return failures
 
 
@@ -215,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fpr_relative": FPR_REL_TOL,
                 "fpr_absolute_floor_when_zero": FPR_ABS_FLOOR,
                 "si_sdr_absolute_db": SI_SDR_ABS_TOL_DB,
+                "other_rms_absolute_db": OTHER_RMS_ABS_TOL_DB,
             },
             "metrics": metrics,
         }

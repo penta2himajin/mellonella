@@ -25,7 +25,7 @@ from pathlib import Path
 
 from ..scenarios.base import PipelineProvider, StubPipelineProvider
 
-SCENARIOS = ("scenario_1", "scenario_3", "scenario_6")
+SCENARIOS = ("scenario_1", "scenario_2", "scenario_3", "scenario_6")
 
 
 @dataclass
@@ -111,6 +111,20 @@ def run(config: RunnerConfig) -> RunSummary:
             output_csv=config.output_dir / "scenario_1.csv",
         )
         summary.scenarios["scenario_1"] = {
+            "n_samples": result.n_samples,
+            "metrics": result.metrics,
+        }
+
+    if "scenario_2" in config.scenarios:
+        from ..scenarios.scenario_2 import run as run_scenario_2
+
+        result = run_scenario_2(
+            items=[],
+            provider=provider,
+            sample_rate=16_000,
+            output_csv=config.output_dir / "scenario_2.csv",
+        )
+        summary.scenarios["scenario_2"] = {
             "n_samples": result.n_samples,
             "metrics": result.metrics,
         }
