@@ -35,13 +35,15 @@ FP 許容方針 + 自動学習併用のため、用途を分離した 2 つの�
 
 | 閾値 | 用途 | 推奨初期値 |
 |---|---|---|
-| `θ_pass` | 出力ゲート判定 | 0.50 |
+| `θ_pass` | 出力ゲート判定 | 0.30 |
 | `θ_learn` | 自動学習プールへの追加可否 | 0.80 |
 
 `θ_pass < θ_learn` という関係を厳守する。理由：
 
 - 出力ゲートは多少緩く（FP 許容 = 取りこぼし防止）
 - 自動学習は厳格に（drift 防止 = 確信度の高いソロ発話のみ採用）
+
+> **`θ_pass` の calibration 履歴**: 当初は clean-vs-clean の cos 類似度直感から `0.50` を仮置きしていたが、`scripts/calibrate.py` で librosa libri1/2/3 × white/pink ノイズ × SNR -5..20 dB の 108 セルを sweep した結果 `0.50` ではノイズ下で gate が完全閉になることが判明。FP 許容方針 (mean FPR ≤ 0.05) を満たす最小 θ_pass として `0.30` を選択（median TPR ≈ 0.84, mean FPR ≈ 4.6 %）。詳細は [`benchmarks/calibration_summary.json`](benchmarks/calibration_summary.json) 参照。
 
 この分離により、自動学習による drift リスクを抑制しつつ FP 許容を実現する。
 

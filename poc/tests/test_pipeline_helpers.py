@@ -84,3 +84,20 @@ def test_gating_config_enable_auto_learn_default_true():
 
     assert GatingConfig().enable_auto_learn is True
     assert GatingConfig(enable_auto_learn=False).enable_auto_learn is False
+
+
+def test_process_result_per_frame_arrays_default_empty_float32():
+    result = ProcessResult(audio=np.zeros(4, dtype=np.float32))
+    assert result.score_per_frame.dtype == np.float32
+    assert result.cos_sim_max_per_frame.dtype == np.float32
+    assert result.f0_match_per_frame.dtype == np.float32
+    assert result.score_per_frame.size == 0
+    assert result.cos_sim_max_per_frame.size == 0
+    assert result.f0_match_per_frame.size == 0
+
+
+def test_process_result_per_frame_arrays_are_isolated_per_instance():
+    a = ProcessResult(audio=np.zeros(4, dtype=np.float32))
+    b = ProcessResult(audio=np.zeros(4, dtype=np.float32))
+    a.score_per_frame = np.array([0.5, 0.6], dtype=np.float32)
+    assert b.score_per_frame.size == 0
