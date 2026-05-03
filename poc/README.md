@@ -84,3 +84,21 @@ scripts/smoke.py /tmp/smoke
 CI runs the same script in `.github/workflows/smoke.yml` so regressions
 in torch / speechbrain / silero-vad / deepfilternet integration are
 caught on every PR.
+
+## Accuracy regression check
+
+`.github/workflows/accuracy.yml` runs `scripts/ci_accuracy.py` on every
+PR. It drives the real pipeline through a deterministic mini
+scenario_1 (librosa libri1 / libri2 + seeded white noise, SNRs 5/10/15
+dB, `θ_pass=0.30`) and compares TPR / FPR / SI-SDR against the
+committed baseline at [`docs/benchmarks/ci_baseline.json`](../docs/benchmarks/ci_baseline.json).
+Tolerances are worse-side only — improvements are silently accepted;
+regressions beyond `-5%` (TPR / FPR relative) or `-1 dB` (SI-SDR) hard-fail.
+
+To refresh the baseline after an intentional change:
+
+```bash
+python scripts/ci_accuracy.py --update-baseline
+```
+
+Commit the resulting JSON together with the change that caused it.
