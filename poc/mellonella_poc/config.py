@@ -14,10 +14,20 @@ from dataclasses import dataclass, field
 class GatingConfig:
     """Thresholds and weights for the integrated speaker gate."""
 
-    alpha: float = 0.8
-    """Weight applied to cosine similarity in the integrated score."""
+    alpha: float = 0.9
+    """Weight applied to cosine similarity in the integrated score.
 
-    beta: float = 0.2
+    Recalibrated from the docs/decisions.md D-005 initial value of 0.8
+    via the joint α / θ_pass sweep in
+    ``docs/benchmarks/calibration_alpha_beta_summary.json``. On the
+    librosa libri1/2/3 + white/pink noise grid, α=0.9 reaches the same
+    TPR_median (~0.84) as α=0.8 at θ_pass=0.30 with FPR_mean reduced
+    from 0.046 to 0.017. Caveat: the calibration speakers all share an
+    English LibriSpeech distribution; a wider F0 spread across speakers
+    will likely raise the optimal β again.
+    """
+
+    beta: float = 0.1
     """Weight applied to F0 match in the integrated score. alpha + beta == 1.0."""
 
     theta_pass: float = 0.30
