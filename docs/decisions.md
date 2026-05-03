@@ -114,10 +114,22 @@ C. ECAPA-TDNN + F0 + Harmonic 構造解析
 
 ### 設計詳細
 
-- F0 はハードフィルタではなく統合スコアに重み β=0.2 で加味
+- F0 はハードフィルタではなく統合スコアに重み β を以って加味
 - ガウシアン当てはまりで連続値化（厳密なレンジチェックを避ける）
 - 登録時と推論時で発話状態が異なっても誤検出を最小化する設計
 - 実装は YIN（DSP ベース、軽量）を第一候補、CREPE（ONNX）を高精度オプションとする
+
+### 重み (α, β) の calibration 履歴
+
+当初は直感で `α=0.8, β=0.2` を仮置き。`scripts/calibrate_alpha_beta.py` で librosa libri1/2/3 × white/pink ノイズ × SNR -5..20 dB に対し α ∈ [0.0, 1.0]、θ ∈ [0.20, 0.55] の joint sweep を実施した結果、**`α=0.9, β=0.1, θ_pass=0.30`** が FP 許容方針 (mean FPR ≤ 0.05) を満たしつつ TPR_median を最大化する操作点だった (α=0.8 と同じ TPR_median=0.84 で FPR_mean が 0.046 → 0.017 に低減)。
+
+参考:
+- α=1.0 (cosine 単独, F0 不使用) は TPR_median=0.81 / FPR_mean=0.008 — F0 を全く使わないと TPR が ~3 ポイント下がる
+- α=0.9 はその間で「F0 を控えめに使う」スイートスポット
+
+詳細は [`benchmarks/calibration_alpha_beta_summary.json`](benchmarks/calibration_alpha_beta_summary.json) と [`../poc/notebooks/02_alpha_beta_sweep.py`](../poc/notebooks/02_alpha_beta_sweep.py)。
+
+> **Caveat**: calibration の話者は全て英語 LibriSpeech で F0 分布が近い。男女混合や母語横断では β の最適値が上がる可能性が高い。CI baseline (libri1 specific) では α=0.9 で低 SNR の TPR がやや下がる (例: SNR 5 dB で 0.46 → 0.32) — 集計平均で α=0.9 が勝つが特定話者の頑健性とのトレードオフがある。本格的な再 calibration は CommonVoice / VCTK + 話者多様性込みで Phase 2 に行う想定。
 
 ## D-006: VoiceFilter-Lite を採用しない
 

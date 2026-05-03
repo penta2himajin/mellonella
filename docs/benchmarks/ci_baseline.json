@@ -20,15 +20,15 @@
   },
   "metrics": {
     "snr_5_db": {
-      "tpr": 0.4632,
+      "tpr": 0.3247,
       "fpr": 0.0,
-      "si_sdr_db": 0.24,
+      "si_sdr_db": -2.24,
       "other_rms_db": -120.0
     },
     "snr_10_db": {
-      "tpr": 0.5887,
+      "tpr": 0.4329,
       "fpr": 0.0,
-      "si_sdr_db": 1.63,
+      "si_sdr_db": 0.82,
       "other_rms_db": -120.0
     },
     "snr_15_db": {
