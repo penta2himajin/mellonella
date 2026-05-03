@@ -20,8 +20,17 @@ class GatingConfig:
     beta: float = 0.2
     """Weight applied to F0 match in the integrated score. alpha + beta == 1.0."""
 
-    theta_pass: float = 0.50
-    """Output gate threshold. Below this, frames are muted."""
+    theta_pass: float = 0.30
+    """Output gate threshold. Below this, frames are muted.
+
+    Recalibrated from the docs/gating.md initial value of 0.50 against
+    real recordings + noise (white + pink, SNRs -5..20 dB, librosa
+    libri1/2/3) — see ``docs/benchmarks/calibration_summary.json`` and
+    ``scripts/calibrate.py``. The 0.50 default closed the gate
+    completely under any realistic noise; 0.30 yields a median TPR of
+    ~0.84 with mean FPR ~4.6 % across the calibration grid, in line
+    with the FP-tolerant policy in D-004.
+    """
 
     theta_learn: float = 0.80
     """Auto-learning threshold. Strictly greater than theta_pass."""

@@ -72,12 +72,8 @@ class ProcessResult:
     gate_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     auto_learn_events: list[AutoLearnEvent] = field(default_factory=list)
     score_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    cos_sim_max_per_frame: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.float32)
-    )
-    f0_match_per_frame: np.ndarray = field(
-        default_factory=lambda: np.empty(0, dtype=np.float32)
-    )
+    cos_sim_max_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    f0_match_per_frame: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
 
 
 def expand_gate_decisions(

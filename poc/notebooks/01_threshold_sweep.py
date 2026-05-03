@@ -16,8 +16,9 @@
 # %% [markdown]
 # # Phase 1 — θ_pass threshold sweep
 #
-# Validates the initial `θ_pass = 0.50` from `docs/gating.md` D-004 against real
-# speaker recordings.
+# Validates the calibrated `θ_pass = 0.30` from `docs/gating.md` D-004 against
+# real speaker recordings. (The notebook predates `scripts/calibrate.py`; the
+# multi-speaker / multi-noise sweep there is now the authoritative calibration.)
 #
 # **Procedure**
 # 1. Build an enrollment pool from the first half of speaker A.
@@ -153,7 +154,7 @@ ax.axvline(
     GatingConfig().theta_pass,
     color="gray",
     linestyle="--",
-    label=r"$\theta_{pass}$ = 0.50 (initial)",
+    label=r"$\theta_{pass}$ = 0.30 (calibrated default)",
 )
 ax.set_xlabel(r"$\theta_{pass}$")
 ax.set_ylabel("rate")

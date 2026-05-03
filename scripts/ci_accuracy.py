@@ -45,10 +45,10 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from mellonella_bench.metrics.ns_quality import si_sdr
 from scipy.signal import resample_poly
 
-from mellonella_bench.metrics.ns_quality import si_sdr
-from mellonella_poc.config import Config, GatingConfig
+from mellonella_poc.config import Config
 from mellonella_poc.pipeline import (
     PipelineComponents,
     enroll_from_recording,
@@ -58,13 +58,6 @@ from mellonella_poc.pipeline import (
 SAMPLE_RATE = 16_000
 SNRS_DB: tuple[float, ...] = (5.0, 10.0, 15.0)
 SEED = 0
-# CI baseline pins θ_pass=0.30 explicitly. The PoC default of 0.50 was
-# calibrated against clean-vs-clean enrollment pairs (see
-# poc/notebooks/01_threshold_sweep.py) and effectively closes the gate
-# under any realistic noise — a separate calibration PR will revisit
-# the project default once we have multi-speaker / multi-noise data.
-THETA_PASS = 0.30
-THETA_LEARN = 0.80
 TPR_REL_TOL = 0.05
 FPR_REL_TOL = 0.05
 FPR_ABS_FLOOR = 0.05  # used when baseline FPR is exactly 0
@@ -95,9 +88,7 @@ def _mix_at_snr(speech: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndar
         raise ValueError("zero-energy speech or noise; cannot mix at SNR")
     target_noise_power = speech_power / (10.0 ** (snr_db / 10.0))
     scale = float(np.sqrt(target_noise_power / noise_power))
-    return (speech.astype(np.float32) + scale * noise.astype(np.float32)).astype(
-        np.float32
-    )
+    return (speech.astype(np.float32) + scale * noise.astype(np.float32)).astype(np.float32)
 
 
 def _gate_on_rate(gate_per_frame: np.ndarray) -> float:
@@ -122,9 +113,8 @@ def measure() -> dict[str, dict[str, float]]:
     enrollment_audio = target_audio[:half]
     target_test = target_audio[half:]
 
-    config = Config(
-        gating=GatingConfig(theta_pass=THETA_PASS, theta_learn=THETA_LEARN),
-    )
+    # Project defaults (post-calibration); see scripts/calibrate.py.
+    config = Config()
     components = PipelineComponents.build_default(config)
     pool = enroll_from_recording(enrollment_audio, SAMPLE_RATE, config, components)
 
@@ -138,13 +128,9 @@ def measure() -> dict[str, dict[str, float]]:
 
         # Target speaker mix
         target_mix = _mix_at_snr(target_test, target_noise, snr)
-        target_result = process_offline(
-            target_mix, SAMPLE_RATE, pool, config, components
-        )
+        target_result = process_offline(target_mix, SAMPLE_RATE, pool, config, components)
         tpr = _gate_on_rate(target_result.gate_per_frame)
-        out_at_16k = _to_target_sr(
-            target_result.audio, config.audio.output_sr, SAMPLE_RATE
-        )
+        out_at_16k = _to_target_sr(target_result.audio, config.audio.output_sr, SAMPLE_RATE)
         n = min(target_test.size, out_at_16k.size)
         sisdr = si_sdr(target_test[:n], out_at_16k[:n])
 
@@ -207,23 +193,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    print(
-        f"[ci-accuracy] running mini scenario_1 at {SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB"
-    )
+    print(f"[ci-accuracy] running mini scenario_1 at {SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB")
     metrics = measure()
     print("[ci-accuracy] measurements:")
     print(json.dumps(metrics, indent=2))
 
     if args.update_baseline:
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        defaults = Config()
         payload = {
             "schema_version": 1,
             "config": {
                 "sample_rate": SAMPLE_RATE,
                 "snrs_db": list(SNRS_DB),
                 "seed": SEED,
-                "theta_pass": THETA_PASS,
-                "theta_learn": THETA_LEARN,
+                "theta_pass": defaults.gating.theta_pass,
+                "theta_learn": defaults.gating.theta_learn,
             },
             "tolerances": {
                 "tpr_relative": TPR_REL_TOL,

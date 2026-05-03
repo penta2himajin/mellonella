@@ -13,10 +13,11 @@ Outputs:
 * ``docs/benchmarks/calibration_summary.json`` — recommended θ_pass
 
 Recommendation policy (per ``docs/gating.md`` D-004 "FP 許容方針"):
-pick the largest ``θ_pass`` whose **median TPR across all (speaker pair,
-noise, SNR ≥ 5dB) cells is ≥ 0.70**. Among those, prefer the θ where
-median FPR is minimised. This gives us an FP-tolerant operating point
-that still keeps target speech audible on noisy inputs.
+the docs explicitly accept FP > FN for the single-target case, so we
+pick the **smallest θ_pass whose mean FPR across all (speaker pair,
+noise, SNR ≥ 5dB) cells stays at or below ``MAX_MEAN_FPR``**. This
+maximises target-pass rate (TPR) under the FP budget rather than the
+other way around. A minimum TPR floor is applied as a sanity check.
 """
 
 from __future__ import annotations
@@ -49,7 +50,8 @@ SNRS_DB: tuple[float, ...] = (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0)
 THETA_GRID: tuple[float, ...] = tuple(round(0.20 + 0.025 * i, 3) for i in range(15))
 SEED = 0
 MIN_REPRESENTATIVE_SNR_DB = 5.0
-TPR_TARGET = 0.70
+MAX_MEAN_FPR = 0.05
+MIN_TPR_FLOOR = 0.50
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_CSV = REPO_ROOT / "docs" / "benchmarks" / "calibration_results.csv"
@@ -236,14 +238,28 @@ def aggregate(rows: list[dict[str, float | str]]) -> dict[float, dict[str, float
 
 
 def recommend_theta(per_theta: dict[float, dict[str, float]]) -> float:
-    """Pick the largest θ where median TPR meets the TPR_TARGET; tiebreak on FPR."""
-    candidates = [t for t, m in per_theta.items() if m["tpr_median"] >= TPR_TARGET]
-    if not candidates:
-        # No θ satisfies the bar — fall back to the one with the best TPR.
-        return max(per_theta.items(), key=lambda kv: kv[1]["tpr_median"])[0]
-    # Largest θ that meets TPR target == strictest gate that still passes target speech.
-    best = max(candidates)
-    return best
+    """Pick the smallest θ that keeps mean FPR within ``MAX_MEAN_FPR``.
+
+    FP-tolerant by design: the docs explicitly accept FP > FN for the
+    single-target case, so we maximise TPR (= pick the loosest gate)
+    under an FPR budget rather than the other way around. Among the
+    qualifying θ values we additionally require ``TPR_median`` to clear
+    ``MIN_TPR_FLOOR`` as a sanity check; if that fails we relax to
+    "smallest θ overall" with a warning printed by the caller.
+    """
+    qualifying = [
+        t
+        for t, m in per_theta.items()
+        if m["fpr_mean"] <= MAX_MEAN_FPR and m["tpr_median"] >= MIN_TPR_FLOOR
+    ]
+    if qualifying:
+        return min(qualifying)
+    # Fallback: smallest θ among those meeting the FPR budget alone.
+    fpr_only = [t for t, m in per_theta.items() if m["fpr_mean"] <= MAX_MEAN_FPR]
+    if fpr_only:
+        return min(fpr_only)
+    # Nothing qualifies — every θ exceeds the FPR budget. Pick the largest.
+    return max(per_theta)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,11 +276,38 @@ def main(argv: list[str] | None = None) -> int:
         default=SUMMARY_JSON,
         help=f"output summary path (default: {SUMMARY_JSON.relative_to(REPO_ROOT)})",
     )
+    parser.add_argument(
+        "--from-csv",
+        action="store_true",
+        help="skip the pipeline sweep; re-aggregate the existing results CSV",
+    )
     args = parser.parse_args(argv)
 
-    rows = measure_cells()
-    write_results_csv(rows, args.results_csv)
-    print(f"\n[calibrate] wrote {len(rows)} rows to {args.results_csv}")
+    if args.from_csv:
+        if not args.results_csv.exists():
+            print(
+                f"[calibrate] {args.results_csv} not found; cannot --from-csv",
+                file=sys.stderr,
+            )
+            return 1
+        with args.results_csv.open() as fh:
+            rows = [
+                {
+                    "enroll": r["enroll"],
+                    "test": r["test"],
+                    "noise": r["noise"],
+                    "snr_db": float(r["snr_db"]),
+                    "theta_pass": float(r["theta_pass"]),
+                    "kind": r["kind"],
+                    "rate": float(r["rate"]),
+                }
+                for r in csv.DictReader(fh)
+            ]
+        print(f"[calibrate] re-aggregating {len(rows)} rows from {args.results_csv}")
+    else:
+        rows = measure_cells()
+        write_results_csv(rows, args.results_csv)
+        print(f"\n[calibrate] wrote {len(rows)} rows to {args.results_csv}")
 
     per_theta = aggregate(rows)
     recommended = recommend_theta(per_theta)
@@ -291,7 +334,8 @@ def main(argv: list[str] | None = None) -> int:
             "snrs_db": list(SNRS_DB),
             "theta_grid": list(THETA_GRID),
             "min_representative_snr_db": MIN_REPRESENTATIVE_SNR_DB,
-            "tpr_target": TPR_TARGET,
+            "max_mean_fpr": MAX_MEAN_FPR,
+            "min_tpr_floor": MIN_TPR_FLOOR,
             "seed": SEED,
         },
         "recommended_theta_pass": recommended,

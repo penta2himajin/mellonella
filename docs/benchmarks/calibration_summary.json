@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "config": {
+    "speakers": [
+      "libri1",
+      "libri2",
+      "libri3"
+    ],
+    "noise_types": [
+      "white",
+      "pink"
+    ],
+    "snrs_db": [
+      -5.0,
+      0.0,
+      5.0,
+      10.0,
+      15.0,
+      20.0
+    ],
+    "theta_grid": [
+      0.2,
+      0.225,
+      0.25,
+      0.275,
+      0.3,
+      0.325,
+      0.35,
+      0.375,
+      0.4,
+      0.425,
+      0.45,
+      0.475,
+      0.5,
+      0.525,
+      0.55
+    ],
+    "min_representative_snr_db": 5.0,
+    "max_mean_fpr": 0.05,
+    "min_tpr_floor": 0.5,
+    "seed": 0
+  },
+  "recommended_theta_pass": 0.3,
+  "per_theta": {
+    "0.200": {
+      "tpr_median": 0.8571,
+      "tpr_mean": 0.8265,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.1918
+    },
+    "0.225": {
+      "tpr_median": 0.8571,
+      "tpr_mean": 0.8211,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.154
+    },
+    "0.250": {
+      "tpr_median": 0.8571,
+      "tpr_mean": 0.8155,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.1059
+    },
+    "0.275": {
+      "tpr_median": 0.8571,
+      "tpr_mean": 0.801,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0685
+    },
+    "0.300": {
+      "tpr_median": 0.841,
+      "tpr_mean": 0.7664,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0458
+    },
+    "0.325": {
+      "tpr_median": 0.8249,
+      "tpr_mean": 0.7341,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0349
+    },
+    "0.350": {
+      "tpr_median": 0.7186,
+      "tpr_mean": 0.6698,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0169
+    },
+    "0.375": {
+      "tpr_median": 0.6774,
+      "tpr_mean": 0.6216,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0042
+    },
+    "0.400": {
+      "tpr_median": 0.5668,
+      "tpr_mean": 0.5445,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0016
+    },
+    "0.425": {
+      "tpr_median": 0.4723,
+      "tpr_mean": 0.4971,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    },
+    "0.450": {
+      "tpr_median": 0.3677,
+      "tpr_mean": 0.4299,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    },
+    "0.475": {
+      "tpr_median": 0.3041,
+      "tpr_mean": 0.3759,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    },
+    "0.500": {
+      "tpr_median": 0.1325,
+      "tpr_mean": 0.3233,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    },
+    "0.525": {
+      "tpr_median": 0.0783,
+      "tpr_mean": 0.269,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    },
+    "0.550": {
+      "tpr_median": 0.0783,
+      "tpr_mean": 0.2264,
+      "fpr_median": 0.0,
+      "fpr_mean": 0.0
+    }
+  }
+}
