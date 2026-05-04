@@ -33,17 +33,31 @@ class RealPipelineProvider:
     attribute pointing at a clean recording of the target speaker; that
     recording is fed through :func:`enroll_from_recording` to populate the
     :class:`EmbeddingPool` used during evaluation.
+
+    ``as_norm_cohort_path``, when set, switches the underlying
+    :class:`mellonella_poc.config.GatingConfig` into AS-Norm mode and
+    loads the impostor cohort once so every item shares the same matrix.
     """
 
     config: Any = None  # Config; left untyped to keep the bench import lightweight.
     components: Any = None  # PipelineComponents; lazy-built on first use.
+    as_norm_cohort_path: Path | None = None
 
     def _ensure_runtime(self) -> tuple[Any, Any]:
-        from mellonella_poc.config import Config
+        from mellonella_poc.config import AudioConfig, Config, GatingConfig
         from mellonella_poc.pipeline import PipelineComponents
 
         if self.config is None:
-            self.config = Config()
+            if self.as_norm_cohort_path is not None:
+                self.config = Config(
+                    audio=AudioConfig(),
+                    gating=GatingConfig(
+                        use_as_norm=True,
+                        as_norm_cohort_path=str(self.as_norm_cohort_path),
+                    ),
+                )
+            else:
+                self.config = Config()
         if self.components is None:
             self.components = PipelineComponents.build_default(self.config)
         return self.config, self.components
