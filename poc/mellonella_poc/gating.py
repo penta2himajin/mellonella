@@ -9,10 +9,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from .config import GatingConfig
+
+EPS = 1e-12
 
 
 def cos_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -64,6 +67,88 @@ def target_score(
     return config.alpha * cs + config.beta * fm
 
 
+def load_cohort(path: str | Path) -> np.ndarray:
+    """Load an impostor cohort (.npz) and return the L2-normalised matrix.
+
+    The file format matches what ``scripts/build_impostor_cohort.py``
+    writes: an ``embeddings`` key holding a ``(N, 192) float32`` array.
+    Vectors are re-normalised on load so that downstream cosine-vs-cohort
+    work reduces to a plain dot product.
+    """
+    with np.load(path, allow_pickle=True) as data:
+        raw = np.asarray(data["embeddings"], dtype=np.float32)
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    norms = np.where(norms < EPS, 1.0, norms)
+    return (raw / norms).astype(np.float32)
+
+
+def as_norm_score(
+    embedding: np.ndarray,
+    raw_score: float,
+    cohort: np.ndarray,
+    top_k: int,
+) -> float:
+    """Apply Adaptive S-Norm to ``raw_score``.
+
+        z = (raw_score - μ_topK(impostor_scores)) / σ_topK(impostor_scores)
+
+    where ``impostor_scores`` is the cosine similarity between the L2-
+    normalised query ``embedding`` and each row of ``cohort`` (also
+    L2-normalised — see :func:`load_cohort`). The top-K largest scores
+    define the "tough impostor" baseline so the normalisation target
+    matches what the pool is actually competing against.
+
+    Empty / degenerate inputs fall back gracefully:
+
+    * empty ``cohort`` → return ``raw_score`` unchanged
+    * zero-length ``embedding`` → return ``raw_score`` unchanged
+    * ``σ`` close to zero → return ``raw_score - μ`` (skip the divide)
+
+    Per :data:`docs/decisions.md` D-010 we accept that the resulting
+    score is on a different scale (typical z-score range: -3 to +3) than
+    the legacy ``α·cs + β·f0`` formula and pair it with the dedicated
+    :attr:`GatingConfig.theta_pass_as_norm` threshold.
+    """
+    if cohort.shape[0] == 0:
+        return float(raw_score)
+    norm = float(np.linalg.norm(embedding))
+    if norm < EPS:
+        return float(raw_score)
+    query = embedding.astype(np.float32) / norm
+    impostor_scores = cohort @ query
+    k = int(min(top_k, impostor_scores.shape[0]))
+    if k <= 0:
+        return float(raw_score)
+    if k == impostor_scores.shape[0]:
+        top = impostor_scores
+    else:
+        top = np.partition(impostor_scores, -k)[-k:]
+    mu = float(top.mean())
+    sigma = float(top.std())
+    if sigma < EPS:
+        return float(raw_score - mu)
+    return float((raw_score - mu) / sigma)
+
+
+def target_score_as_norm(
+    embedding: np.ndarray,
+    pool: Iterable[np.ndarray],
+    cohort: np.ndarray,
+    config: GatingConfig,
+) -> float:
+    """AS-Norm-only variant of :func:`target_score`.
+
+    Used by :func:`mellonella_poc.pipeline.process_offline` when
+    :attr:`GatingConfig.use_as_norm` is True. F0 is intentionally NOT
+    folded into the gate-decision score under AS-Norm — the cohort
+    cancels per-language drift in the embedding similarity directly,
+    and the F0 channel still gates auto-learn admission via
+    :func:`should_admit_auto_learn`.
+    """
+    cs = cos_sim_max(embedding, pool)
+    return as_norm_score(embedding, cs, cohort, config.as_norm_top_k)
+
+
 @dataclass
 class GateState:
     """Mutable hangover state for the binary gate.
@@ -76,8 +161,12 @@ class GateState:
     is_on: bool = False
     elapsed_off_ms: float = 0.0
 
+    @property
+    def _theta_pass(self) -> float:
+        return self.config.theta_pass_as_norm if self.config.use_as_norm else self.config.theta_pass
+
     def update(self, score: float, dt_ms: float) -> bool:
-        if score >= self.config.theta_pass:
+        if score >= self._theta_pass:
             self.is_on = True
             self.elapsed_off_ms = 0.0
             return True
@@ -181,8 +270,9 @@ def should_admit_auto_learn(
     which then applies the anchor-distance check to decide whether the
     candidate is actually a drift-safe addition.
     """
+    theta_learn = config.theta_learn_as_norm if config.use_as_norm else config.theta_learn
     return (
-        score >= config.theta_learn
+        score >= theta_learn
         and f0_match_value >= config.theta_f0
         and continuous_speech_ms >= config.min_continuous_speech_sec * 1000.0
     )

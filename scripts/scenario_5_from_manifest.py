@@ -253,12 +253,14 @@ def collect_failures(
     return failures
 
 
-def _resolve_provider(use_real: bool) -> PipelineProvider:
+def _resolve_provider(
+    use_real: bool, *, as_norm_cohort: Path | None = None
+) -> PipelineProvider:
     if not use_real:
         return StubPipelineProvider()
     from mellonella_bench.scenarios.pipeline_provider import RealPipelineProvider
 
-    return RealPipelineProvider()
+    return RealPipelineProvider(as_norm_cohort_path=as_norm_cohort)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -323,6 +325,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="use the real mellonella-poc pipeline (requires `pip install -e poc[models]`)",
     )
+    parser.add_argument(
+        "--as-norm-cohort",
+        type=Path,
+        default=None,
+        help=(
+            "path to an impostor cohort .npz "
+            "(see scripts/build_impostor_cohort.py); enables AS-Norm in the "
+            "real pipeline. Ignored when --real-pipeline is not set."
+        ),
+    )
     args = parser.parse_args(argv)
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -340,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: built zero scenario_5 items from manifests", file=sys.stderr)
         return 2
 
-    provider = _resolve_provider(args.real_pipeline)
+    provider = _resolve_provider(args.real_pipeline, as_norm_cohort=args.as_norm_cohort)
     result = run_scenario_5(
         items,
         provider=provider,

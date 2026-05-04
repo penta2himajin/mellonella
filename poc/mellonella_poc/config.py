@@ -77,11 +77,55 @@ class GatingConfig:
     tests that want a deterministic, time-invariant pool.
     """
 
+    use_as_norm: bool = False
+    """Adaptive S-Norm (`docs/decisions.md` D-010, `docs/gating.md`).
+
+    When True, the gating decision uses
+    ``z = (cos_sim_max - μ_topK(S_impostor)) / σ_topK(S_impostor)``
+    against :attr:`theta_pass_as_norm` instead of the
+    ``α · cs + β · f0_match`` mixture against :attr:`theta_pass`. F0 stops
+    contributing to the per-frame gate decision (it is still consulted
+    for auto-learn admission via :attr:`theta_f0`). Default False to keep
+    every existing PoC + bench test path bit-identical until a cohort and
+    fresh calibration are wired up.
+    """
+
+    as_norm_top_k: int = 10
+    """Number of top-scoring impostor cohort entries used in the AS-Norm
+    z-score numerator/denominator. Standard literature picks 10–50; we
+    default to 10 because the shipped cohort is small (50 speakers across
+    6 languages, see `bench/data/cohorts/`)."""
+
+    as_norm_cohort_path: str | None = None
+    """Filesystem path to the impostor cohort ``.npz`` produced by
+    :mod:`scripts/build_impostor_cohort`. Loaded once when
+    :class:`PipelineComponents` is built; ignored when
+    :attr:`use_as_norm` is False."""
+
+    theta_pass_as_norm: float = 1.5
+    """Output gate threshold when :attr:`use_as_norm` is True (z-score scale).
+
+    Initial value is heuristic — proper calibration with the real cohort
+    happens in AS-Norm Phase 3. ``1.5`` corresponds to "target embedding
+    is ~1.5 σ above the top-K impostor distribution", which is the
+    classic operating point in the AS-Norm literature.
+    """
+
+    theta_learn_as_norm: float = 2.5
+    """Auto-learn admission threshold under AS-Norm (z-score scale). Higher
+    than :attr:`theta_pass_as_norm` so only confidently-target frames feed
+    the pool, mirroring the ``theta_learn > theta_pass`` invariant from
+    the legacy mixed-score path."""
+
     def __post_init__(self) -> None:
         if self.theta_pass >= self.theta_learn:
             raise ValueError("theta_pass must be strictly less than theta_learn")
+        if self.theta_pass_as_norm >= self.theta_learn_as_norm:
+            raise ValueError("theta_pass_as_norm must be strictly less than theta_learn_as_norm")
         if not 0.99 <= self.alpha + self.beta <= 1.01:
             raise ValueError("alpha + beta must equal 1.0")
+        if self.as_norm_top_k <= 0:
+            raise ValueError("as_norm_top_k must be > 0")
 
 
 @dataclass(frozen=True)

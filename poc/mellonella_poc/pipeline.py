@@ -114,13 +114,27 @@ class PipelineComponents:
     dfn3: DeepFilterNet3
     vad: SileroVAD
     ecapa: EcapaTdnn
+    cohort: np.ndarray | None = None
+    """Optional impostor cohort for AS-Norm, loaded once at build time.
+
+    Shape ``(N, 192) float32`` (L2-normalised). When set and
+    :attr:`GatingConfig.use_as_norm` is True, :func:`process_offline`
+    routes per-frame scoring through :func:`gating.target_score_as_norm`
+    instead of the default ``α·cs + β·f0`` mixture.
+    """
 
     @classmethod
     def build_default(cls, config: Config) -> PipelineComponents:
+        cohort: np.ndarray | None = None
+        if config.gating.use_as_norm and config.gating.as_norm_cohort_path:
+            from .gating import load_cohort
+
+            cohort = load_cohort(config.gating.as_norm_cohort_path)
         return cls(
             dfn3=DeepFilterNet3(sample_rate=config.audio.output_sr),
             vad=SileroVAD(sample_rate=config.audio.sv_sr),
             ecapa=EcapaTdnn(sample_rate=config.audio.sv_sr),
+            cohort=cohort,
         )
 
 
@@ -236,7 +250,18 @@ def process_offline(
             fm = f0_match(f0_mean, pool.metadata.f0_mu, pool.metadata.f0_sigma)
             last_cs = cs
             last_fm = fm
-            last_score = config.gating.alpha * cs + config.gating.beta * fm
+            if config.gating.use_as_norm and components.cohort is not None:
+                # AS-Norm: replace the α·cs + β·f0 mixture with the
+                # cohort-normalised SV similarity. F0 still gates auto-learn
+                # admission below via theta_f0 (handled inside
+                # should_admit_auto_learn).
+                from .gating import as_norm_score
+
+                last_score = as_norm_score(
+                    embedding, cs, components.cohort, config.gating.as_norm_top_k
+                )
+            else:
+                last_score = config.gating.alpha * cs + config.gating.beta * fm
 
             if config.gating.enable_auto_learn and should_admit_auto_learn(
                 last_score, fm, consecutive_speech_ms, config.gating

@@ -254,7 +254,35 @@ python scripts/build_impostor_cohort.py \
 
 ### 段階的導入
 
-Phase 1 (本 PR): cohort build script + docs。
-Phase 2 (次 PR): `gating.py` に AS-Norm 実装、`GatingConfig.use_as_norm`
-フラグ追加、scenario_5 で再評価。
-Phase 3: 改善が確認できたら threshold 引き締め。
+Phase 1 ✅ (PR #18): cohort build script + docs。
+Phase 2 ✅ (本 PR): `gating.py` に AS-Norm 実装、`GatingConfig` 拡張、
+`pipeline.process_offline` 分岐、CI で cohort 自動 build → scenario_5 に反映。
+Phase 3: AS-Norm 有効状態で baseline 計測、`theta_pass_as_norm` 最終キャリブ、
+scenario_5 hard-fail 閾値引き締め。
+
+### 実装メモ (Phase 2)
+
+- 公開 API:
+  - `mellonella_poc.gating.load_cohort(path) -> np.ndarray`
+  - `mellonella_poc.gating.as_norm_score(emb, raw, cohort, top_k) -> float`
+  - `mellonella_poc.gating.target_score_as_norm(emb, pool, cohort, config) -> float`
+- `GatingConfig` 新フィールド:
+  - `use_as_norm: bool = False`
+  - `as_norm_cohort_path: str | None = None`
+  - `as_norm_top_k: int = 10`
+  - `theta_pass_as_norm: float = 1.5` (z-score scale)
+  - `theta_learn_as_norm: float = 2.5`
+- `PipelineComponents` が cohort を build 時に 1 度ロードし、`process_offline`
+  が per-frame で参照する (毎呼び出し再ロードはしない)。
+- AS-Norm 経路では per-frame の score formula が
+  `α·cs + β·f0_match` から `as_norm(cs vs cohort)` に切り替わる。F0 は
+  引き続き auto-learn 入口の `theta_f0` で使われる。
+- `use_as_norm = False` のとき既存パスは bit-identical (deault False)。
+
+### CLI / CI 統合
+
+- `scripts/scenario_5_from_manifest.py --as-norm-cohort PATH` で AS-Norm
+  経路に切り替え可能 (`--real-pipeline` 必須)。
+- `.github/workflows/scenario_5.yml` は MLS + Emilia 準備後に
+  `scripts/build_impostor_cohort.py` で cohort を auto-build し、
+  scenario_5 に渡す。第三者 cohort artifact 管理は不要。

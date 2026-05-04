@@ -255,14 +255,30 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 
 ### 実装フェーズ
 
-1. **Phase 1** (本決定で着手): cohort build script
+1. **Phase 1** ✅ (PR #18): cohort build script
    `scripts/build_impostor_cohort.py` で MLS+Emilia の manifest から
-   ECAPA embedding を抽出し `.npz` で同梱
-2. **Phase 2**: `gating.py` に AS-Norm 実装、`GatingConfig.use_as_norm: bool`
-   フラグ追加、`EmbeddingPool.score()` で cohort 比較
-3. **Phase 3**: scenario_5 を再走、ja/zh-CN 改善を data 駆動で確認、
-   threshold 引き締めの根拠データを取得
+   ECAPA embedding を抽出し `.npz` で出力
+2. **Phase 2** ✅ (本 PR): `gating.py` に `as_norm_score` / `load_cohort`
+   実装、`GatingConfig` に `use_as_norm` / `as_norm_cohort_path` /
+   `as_norm_top_k` / `theta_pass_as_norm` / `theta_learn_as_norm` 追加、
+   `pipeline.process_offline` の score 経路を分岐、CI で cohort
+   自動 build → scenario_5 に反映
+3. **Phase 3** (次 PR): AS-Norm 適用後の baseline 取得、ja/zh-CN
+   改善を data 駆動で確認、`theta_pass_as_norm` 等の最終キャリブ、
+   scenario_5 hard-fail 閾値引き締め
 4. **Phase 4** (任意): C/D/E への拡張
+
+### Phase 2 の設計ノート
+
+- AS-Norm 経路では F0 を per-frame gate decision から外し、cohort
+  正規化された SV 類似度のみで判定する (F0 は引き続き auto-learn 入口の
+  `theta_f0` で使用)。理由: AS-Norm の literature は SV 類似度に直接適用
+  するのが標準で、F0 と z-score を加算するとスケール不整合になる。
+- `theta_pass_as_norm = 1.5` / `theta_learn_as_norm = 2.5` はヒューリスティック
+  初期値。Phase 3 で `scripts/calibrate.py` を AS-Norm 経路で再走して
+  data 駆動で確定する。
+- `use_as_norm = False` を default に維持し、既存 PoC + bench テストが
+  bit-identical に通ることを担保 (`enable_auto_learn` と同じパターン)。
 
 ### 参考文献
 

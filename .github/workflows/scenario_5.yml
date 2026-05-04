@@ -95,9 +95,32 @@ jobs:
           python -m mellonella_bench.datasets.emilia prepare --language ko
           python -m mellonella_bench.datasets.emilia prepare --language zh-CN
 
+      # ---- AS-Norm impostor cohort (D-010 Phase 2) ----
+      # Reuse the same MLS + Emilia subsets we just prepared. The cohort is
+      # rebuilt every run; cached `data/` keeps the wav material warm so only
+      # the ECAPA forward passes are repeated (~30 calls, < 30 s).
+
+      - name: Build AS-Norm impostor cohort
+        run: |
+          set -euo pipefail
+          mkdir -p data/cohorts
+          ARGS=()
+          for lang in de fr; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
+          done
+          if [ "${{ steps.hf.outputs.have_token }}" = "true" ]; then
+            for lang in en ja ko zh-CN; do
+              ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
+            done
+          fi
+          python scripts/build_impostor_cohort.py \
+            "${ARGS[@]}" \
+            --per-language 5 \
+            --output data/cohorts/scenario5_cohort.npz
+
       # ---- Build the --manifest argument list dynamically and run scenario_5 ----
 
-      - name: Run scenario_5 against all available manifests
+      - name: Run scenario_5 against all available manifests (with AS-Norm)
         run: |
           set -euo pipefail
           ARGS=()
@@ -113,7 +136,8 @@ jobs:
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
             --tpr-min 0.3 --fpr-max 0.7 \
-            --real-pipeline
+            --real-pipeline \
+            --as-norm-cohort data/cohorts/scenario5_cohort.npz
 
       - name: Upload scenario_5 outputs (always)
         if: always()
