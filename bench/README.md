@@ -57,6 +57,24 @@ The downloaders live in `mellonella_bench/datasets/`. They write under
 `$MELLONELLA_DATA_DIR` (default `./data/`). Each downloader is idempotent;
 warm caches are reused. See the per-script docstring for licence terms.
 
+### CommonVoice (multi-lingual)
+
+Mozilla CommonVoice (`CC0-1.0`) is the canonical multi-language source for
+Phase 2 / Scenario 5 work. URLs are signed and the corpus is multi-GB, so
+the script does not auto-download — fetch the per-language tarball
+manually from <https://commonvoice.mozilla.org/> and pass its path:
+
+```bash
+python -m mellonella_bench.datasets.commonvoice prepare \
+    --language ja \
+    --archive ~/Downloads/cv-corpus-19.0-2024-09-13-ja.tar.gz
+```
+
+This extracts under `$MELLONELLA_DATA_DIR/commonvoice/<lang>/`, picks the
+top-K most-clipped speakers (default 10) with N clips each (default 20),
+and writes a flat `subset/manifest.csv` for downstream calibration. The
+calibrate scripts will be extended to read this manifest in a follow-up.
+
 ## Metrics
 
 | Module | Indicator | Implementation |
