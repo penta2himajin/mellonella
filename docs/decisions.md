@@ -343,10 +343,10 @@ PR #21 で cohort summary を artifact 化した後、PR #19 と PR #21 の coho
    段階で「streaming で見つかった順」にラベルを振っていたため、HF datasets
    の並行 IO 由来の順序揺れがそのまま cohort 内訳に伝播していた。
 
-### Phase 4: cohort-disjoint fix (進行中)
+### Phase 4: cohort-disjoint fix ✅ (PR #22) + cohort cache stability ✅ (PR #23)
 
 Phase 3 (calibrate.py 拡張) の前に、**まず構造的バグを潰す必要がある** ため
-Phase 4 として優先実施:
+Phase 4 として優先実施した:
 
 - `mls.prepare` / `emilia.prepare` の default `top_speakers` を 3 → 10 に
   引き上げ。各 manifest に 10 話者用意。
@@ -356,7 +356,22 @@ Phase 4 として優先実施:
   渡す。結果: 各言語 8 cohort 話者 = 48 embeddings、top-K=10 = 21%
   (literature 範囲)、test と完全分離。
 
-これを終えてから Phase 3 の calibrate.py 拡張に着手する。Phase 4 の修正前に
+PR #22 マージ後、disjoint な cohort で 2 回連続 CI を回したところ
+zh-CN FPR が 0.76 → 0.85 と run-to-run で揺れた。HF datasets streaming の
+非決定的順序で manifest 自体が再生成されるたびに変わるのが原因。**Phase 4
+追加対応** として cohort を `actions/cache@v4` で **永続化 + skip-if-exists
+guard** を追加 (PR #23):
+
+- cache key に `scripts/build_impostor_cohort.py` のハッシュを追加 →
+  selection ロジックが変わったら自動 invalidate。
+- cache key を v1 → v2 に bump して既存の broken-cohort cache を強制廃棄。
+- workflow の cohort build step に "if exists, skip" guard。1 度生成された
+  `.npz` は cache hit が続く限りそのまま使い回される → 完全決定的。
+- 新言語追加 / `top_speakers` 変更などで再生成したい場合は cache key を
+  bump (v2 → v3) すれば良い。repo に commit する必要なし (~38 KB だが
+  毎回 git に乗せるよりキャッシュの方が運用が軽い)。
+
+これで Phase 3 の calibrate.py 拡張に進める前提が整った。Phase 4 の修正前に
 キャリブレーションしても "壊れた cohort" の上で fitting するだけになる。
 
 ### 参考文献

@@ -56,13 +56,19 @@ jobs:
           restore-keys: |
             scenario5-models-v1-${{ runner.os }}-
 
-      - name: Cache MLS + Emilia subset materials
+      # Cache covers MLS/Emilia manifests + audio AND the AS-Norm cohort .npz.
+      # The key includes the cohort builder script so changes to selection
+      # logic (e.g. --skip-top-n behaviour) invalidate the cache and force
+      # a rebuild. The dataset modules are hashed for the same reason on the
+      # manifest side. Bumping the version (v2) wipes pre-D-010-Phase-4
+      # caches that still hold the broken-cohort manifests.
+      - name: Cache MLS + Emilia subset materials + AS-Norm cohort
         uses: actions/cache@v4
         with:
           path: data
-          key: scenario5-data-v1-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py') }}
+          key: scenario5-data-v2-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
           restore-keys: |
-            scenario5-data-v1-${{ runner.os }}-
+            scenario5-data-v2-${{ runner.os }}-
 
       # ---- Prepare per-language subsets ----
       # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
@@ -96,9 +102,15 @@ jobs:
           python -m mellonella_bench.datasets.emilia prepare --language zh-CN
 
       # ---- AS-Norm impostor cohort (D-010 Phase 2 + Phase 4 cohort-disjoint fix) ----
-      # Reuse the same MLS + Emilia subsets we just prepared. The cohort is
-      # rebuilt every run; cached `data/` keeps the wav material warm so only
-      # the ECAPA forward passes are repeated.
+      # The cohort is part of the cached `data/` tree. We only rebuild it
+      # when the cache miss already cost us the manifests as well — once the
+      # cache is warm, scenario_5 sees the exact same cohort across runs,
+      # which is what makes per-language deltas comparable.
+      #
+      # The cache key (above) hashes scripts/build_impostor_cohort.py so
+      # changes to selection logic auto-invalidate. Adding/removing
+      # languages or changing top-K can be forced by bumping the cache key
+      # version (v2 → v3).
       #
       # `--skip-top-n 2` matches scenario_5_from_manifest.py's default
       # `--top-speakers 2` so the speakers used as test target / other are
@@ -106,9 +118,17 @@ jobs:
       # → 6 langs × 8 spk = 48 cohort embeddings, top-K=10 = 21% of cohort
       # (literature-recommended range).
 
-      - name: Build AS-Norm impostor cohort
+      - name: Build AS-Norm impostor cohort (skip if cached)
         run: |
           set -euo pipefail
+          if [ -f data/cohorts/scenario5_cohort.npz ]; then
+            echo "cohort cached at data/cohorts/scenario5_cohort.npz; skipping rebuild"
+            if [ -f data/cohorts/scenario5_cohort.json ]; then
+              echo "--- cached cohort summary ---"
+              cat data/cohorts/scenario5_cohort.json
+            fi
+            exit 0
+          fi
           mkdir -p data/cohorts
           ARGS=()
           for lang in de fr; do
