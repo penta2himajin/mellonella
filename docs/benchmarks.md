@@ -220,6 +220,23 @@ JSUT/JVS は東京大学 TLO 経由の個別契約が必要。本プロジェク
 - 言語別 gating accuracy
 - 言語間ばらつきの統計（標準偏差）
 
+#### 初回 baseline（PR #17, real pipeline, MLS+Emilia-YODAS, 6 言語）
+
+| Lang | TPR mean | FPR mean | 備考 |
+|---|---|---|---|
+| de | 0.77 | 0.02 | ◎ |
+| en | 0.78 | 0.00 | ◎ |
+| fr | 0.80 | 0.00 | ◎ |
+| ko | 0.80 | 0.00 | ◎ |
+| ja | 0.67 | 0.07 | △ 低 SNR で TPR が落ちる (FN 偏り) |
+| zh-CN | 0.86 | 0.23 | △ 低 SNR で FPR 上昇 (FP 偏り) |
+
+aggregate: TPR mean 0.78、cross-lang stddev 0.058 / FPR mean 0.05、stddev 0.084。
+
+ja/zh-CN の対称的失敗は **global θ_pass=0.30 では同時最適化不能** であることを示す。
+対応として `docs/decisions.md` D-010 で **AS-Norm** 採用を決定。
+`docs/gating.md`「AS-Norm（Adaptive S-Norm）によるスコア正規化」節も参照。
+
 ### シナリオ 6: 経時変化への対応（自動学習効果）
 
 ```

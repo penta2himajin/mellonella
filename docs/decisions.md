@@ -207,3 +207,72 @@ DFN3、silero-vad、ECAPA-TDNN いずれも言語非依存。日本語特化の�
 ### 将来的な再検討タイミング
 
 日本語話者で実機検証して EER が悪化した場合のみ、日本語データでのファインチューンを検討。
+
+## D-010: AS-Norm（Adaptive S-Norm）でスコア正規化を導入
+
+### 背景
+
+PR #17 で導入した Scenario 5 (多言語ロバスト性) の初回 baseline 計測 (real
+pipeline, MLS+Emilia-YODAS, 6 言語 × 4 SNR) で、global θ_pass=0.30 では
+言語間で score 分布が偏ることが定量的に確認された:
+
+| Lang | TPR | FPR |
+|---|---|---|
+| de | 0.77 | 0.02 |
+| en | 0.78 | 0.00 |
+| fr | 0.80 | 0.00 |
+| ko | 0.80 | 0.00 |
+| **ja** | **0.67** | 0.07 |
+| **zh-CN** | 0.86 | **0.23** |
+
+ja は SNR≤5dB で TPR=0.59 に落ち (FN 偏り)、zh-CN は同 SNR 帯で FPR=0.33
+に上がる (FP 偏り)。**1 つの global θ_pass では同時最適化不能**。
+
+### 検討した代替案
+
+| 案 | 採否 | 理由 |
+|---|---|---|
+| A. per-language θ_pass オーバーライド | 不採用 | 言語ごと手動チューニング、保守困難 |
+| B. **AS-Norm (Adaptive S-Norm)** | **採用** | 業界標準 (>20年)、推論時オーバーヘッド軽量 (cohort K=30 で +30 cosine sim/call)、global threshold 1 つで済む |
+| C. Language-Dependent AS-Norm (Thienpondt 2020) | 将来検討 | LID head 必要、B より複雑度↑ |
+| D. TAS-Norm (2025 trainable) | 将来検討 | 学習データ必要、PoC scope を超える |
+| E. Discriminative condition-aware backend (Ferrer 2019) | 将来検討 | 大量の calibration data + 学習が必要 |
+
+### 採用: B（AS-Norm）
+
+仕組み:
+
+```
+S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
+```
+
+- 推論時に target embedding と enrollment との cosine sim を求めるのに加え、
+  事前構築した **impostor cohort** (多言語の非ターゲット話者 30-50 名分の
+  embedding) との cosine sim も計算
+- top-K (K=10 程度) impostor score の平均と標準偏差で z-score 正規化
+- 言語/ノイズ/録音条件に依存する score 分布の系統バイアスが消え、
+  global θ_pass で複数言語をカバー可能
+
+### 実装フェーズ
+
+1. **Phase 1** (本決定で着手): cohort build script
+   `scripts/build_impostor_cohort.py` で MLS+Emilia の manifest から
+   ECAPA embedding を抽出し `.npz` で同梱
+2. **Phase 2**: `gating.py` に AS-Norm 実装、`GatingConfig.use_as_norm: bool`
+   フラグ追加、`EmbeddingPool.score()` で cohort 比較
+3. **Phase 3**: scenario_5 を再走、ja/zh-CN 改善を data 駆動で確認、
+   threshold 引き締めの根拠データを取得
+4. **Phase 4** (任意): C/D/E への拡張
+
+### 参考文献
+
+- Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with
+  Domain-Balanced Hard Prototype Mining and Language-Dependent Score
+  Normalization", https://arxiv.org/abs/2007.07689
+- Park et al. (2025) "Trainable Adaptive Score Normalization for
+  Automatic Speaker Verification", https://arxiv.org/abs/2504.04512
+- Ferrer et al. (2019) "A Discriminative Condition-Aware Backend for
+  Speaker Verification", https://arxiv.org/abs/1911.11622
+- Klusáček et al. (2025) "On the influence of language similarity in
+  non-target speaker verification trials",
+  https://arxiv.org/abs/2506.02777

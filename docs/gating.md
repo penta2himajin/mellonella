@@ -205,3 +205,56 @@ F0 マッチ以外にも、信号処理ベースの補強候補がある（優�
 - **Spectral envelope matching**: 登録音声の MFCC/LPC エンベロープと推論時を比較
 
 初期実装ではスキップ。F0 マッチで判定精度が不足する場合に追加検討。
+
+## AS-Norm（Adaptive S-Norm）によるスコア正規化
+
+詳細は `docs/decisions.md` D-010 参照。
+
+### 動機
+
+`target_score(emb, pool) = α·max_cos_sim + β·f0_match` の生 score は、
+言語/ノイズ/録音条件によって絶対値分布がシフトする。Scenario 5 (PR #17)
+の baseline 計測では、単一 global θ_pass=0.30 で:
+
+- ja TPR=0.59 (低 SNR、target を取りこぼす方向)
+- zh-CN FPR=0.33 (低 SNR、other を通す方向)
+
+という対称的な失敗が出た。**1 つの threshold で複数言語を同時最適化できない**。
+
+### 仕組み
+
+事前構築した「impostor cohort」(多言語の非ターゲット話者 30-50 名分の
+ECAPA embedding) と test 時 embedding の cosine sim を計算し、その top-K
+スコアの平均/標準偏差で target score を z-score 正規化する:
+
+```
+S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
+```
+
+これにより score の絶対値分布シフト (言語別 bias) が消え、global
+θ_pass で複数言語をカバーできる。
+
+### コホート構築
+
+`scripts/build_impostor_cohort.py` が manifest (CommonVoice / MLS /
+Emilia-YODAS いずれの形式も可) から ECAPA embedding を抽出し
+`.npz` で保存する。
+
+```bash
+python scripts/build_impostor_cohort.py \
+    --manifest en=$MELLONELLA_DATA_DIR/emilia_yodas/en/manifest.csv \
+    --manifest de=$MELLONELLA_DATA_DIR/mls/de/manifest.csv \
+    --manifest ja=$MELLONELLA_DATA_DIR/emilia_yodas/ja/manifest.csv \
+    --per-language 5 \
+    --output bench/data/cohorts/impostor_cohort_v1.npz
+```
+
+各言語 5 話者程度で十分 (cohort size は EER に対し対数的に効く)。
+出力ファイルは ~38 KB (50 話者 × 192 dim × 4B)、package 同梱可。
+
+### 段階的導入
+
+Phase 1 (本 PR): cohort build script + docs。
+Phase 2 (次 PR): `gating.py` に AS-Norm 実装、`GatingConfig.use_as_norm`
+フラグ追加、scenario_5 で再評価。
+Phase 3: 改善が確認できたら threshold 引き締め。
