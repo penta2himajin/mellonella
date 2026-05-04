@@ -268,8 +268,15 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
    CI 観測値で baseline を文書化。`scenario_5.yml --fpr-max` の引き締めは
    後述の理由により **見送り** (cohort 規模に起因する run-to-run variance が
    CI hard-fail を不安定にするため)。
-4. **Phase 4** (任意): C/D/E への拡張、または cohort 拡大 (per-language
-   5 → 10、top-K 10 → 20) — Phase 3 の結果次第で要否判断
+4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + actions/cache 化
+5. **Phase 5** ✅ (本 PR): cohort 決定化 — `mls.prepare` / `emilia.prepare`
+   の streaming-arrival 依存ラベル割当を撤廃し、speaker は upstream id
+   lex 順、clip は audio sha1 順で選択。同じ split に対して常に
+   bit-identical な manifest を出力し、Phase 4 cache の "miss 時に別 cohort"
+   弱点を塞ぐ。
+6. **Phase 6** (任意): cohort 拡大 (per-language 8 → 50-100、top-K 10 → 20-30)、
+   `--fpr-max` 引き締め、別 scenario への AS-Norm 横展開 — 規模拡大が
+   実現してから再開
 
 ### Phase 2 の設計ノート
 
@@ -474,6 +481,64 @@ recommended θ (= 3.0) は production 値として採用しない**:
 
 ローカル sweep の役割は **「コードが落ちずに end-to-end 動く」** の確認に
 留め、production 値の決定は Phase 3 後段 (上記表) で行った。
+
+### Phase 5: cohort 決定化 (cohort-determinism fix)
+
+Phase 3 後段で観測した zh-CN per-row FPR の 0.6-0.85 揺れは、Phase 4 で
+`actions/cache` を導入してもなお **cache miss のたびに manifest が異なる
+upstream 話者で再生成される** ことが根本原因だった。これは
+`mls.prepare` / `emilia.prepare` の構造的バグ:
+
+1. HF datasets streaming は同じ split に対して同じ sample 集合を返すが
+   **順序は保証されない** (parallel IO、retry、shard interleave)。
+2. 旧実装は「streaming で出会った順に `speaker01..N` ラベル」「同 speaker
+   から最初に来た K clips」「top-N 揃ったら early-break」だったため、
+   順序揺れがそのまま manifest 内訳の揺れになっていた。
+
+**修正** (`bench/mellonella_bench/datasets/mls.py` /
+`bench/mellonella_bench/datasets/emilia.py`):
+
+- early-break 撤廃。streaming window (`max_stream=5000`) を最後まで scan。
+- per-speaker bucket cap を `clips_per_speaker × 4` に引き上げ、後段で選別。
+- 後処理で deterministic に選択:
+  - speaker 選択: `(clips_count desc, speaker_id lex asc)` の sort で top-N。
+    数 tied でも lex tiebreak で順序確定。
+  - ラベル割当: 選択集合を **upstream speaker_id 昇順** に並べ替え、
+    `speaker01..N` を順に振る。同じ upstream 話者は常に同じスロット。
+  - clip 選択: `(-len(audio), sha1(audio.tobytes()))` で sort し先頭 K を
+    採用。長い clip = ECAPA に渡す concat が情報量豊かで TPR 安定化に
+    寄与。tiebreak は content-hash で arrival 順非依存。**初版 (sha1
+    のみ) では Emilia-YODAS の 1-2 秒 snippet を引いて ko/fr で per-row
+    TPR が 0.3 を切る事例が出たため length-first に修正。**
+- `scripts/build_impostor_cohort.py` の `select_speakers_for_language` も
+  `(-audio_size, speaker_id)` の lex tiebreak を追加。同 size 話者間の
+  選択が dict-iteration 順に依存していた残りの leak を塞ぐ。
+
+**契約テスト** (`bench/tests/test_datasets_{mls,emilia}.py` に
+`test_prepare_is_deterministic_under_streaming_reorder` を追加):
+
+- 同じ fixture を `random.Random(seed)` で 2 種の異なる順序に shuffle し、
+  prepare を 2 回実行
+- manifest.csv を bytes 比較、各 wav を `filecmp.cmp(shallow=False)` で
+  binary 比較。すべて bit-identical を要求。
+
+加えて build_impostor_cohort 側にも
+`test_select_speakers_uses_lex_tiebreak_for_equal_audio_lengths` を追加し、
+audio 長が tied な 4 話者から lex 上位 2 が選ばれることを assert。
+
+**cache 影響**: 旧 manifest は CSV としては valid だが speaker01..N が
+別の upstream 話者を指しているため、cache hit でそのまま使うと AS-Norm の
+μ/σ が無音で壊れる。`scenario_5.yml` の cache key を v2 → v3 に bump し、
+旧 cache を破棄して新 prep で再生成する。
+
+**期待する効果**:
+
+- HF streaming の順序揺れに対して manifest が完全に invariant になり、
+  cache miss → 再 prep → 再 cohort build の chain が full deterministic に
+  なる。Phase 4 で `actions/cache` 導入時に残っていた "cache miss = 別
+  cohort" の弱点が消える。
+- これで cohort 規模拡大 (Phase 4 当初目標) や `--fpr-max` 引き締め
+  (Phase 3 後段で見送り) を、再現可能な baseline の上で再開できる。
 
 ### 参考文献
 

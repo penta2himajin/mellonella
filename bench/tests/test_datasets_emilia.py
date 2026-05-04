@@ -171,6 +171,47 @@ def test_extract_audio_handles_raw_bytes(tmp_path, monkeypatch):
     assert {r.sentence for r in rows} == {"raw-bytes", "decoded"}
 
 
+def test_prepare_is_deterministic_under_streaming_reorder(tmp_path, monkeypatch):
+    """Mirror of the MLS counterpart — Emilia-YODAS prep must produce
+    bit-identical manifest + wav bytes when the upstream streaming order
+    is permuted. See D-010 cohort-determinism note for rationale."""
+    import filecmp
+    import random
+
+    monkeypatch.setenv("HF_TOKEN", "fake-token")
+
+    base_samples = []
+    for spk in ("JA_001", "JA_017", "JA_303"):
+        for clip_idx in range(4):
+            base_samples.append(
+                _make_emilia_sample(
+                    speaker=spk,
+                    language="ja",
+                    freq=120.0 + clip_idx + sum(ord(c) for c in spk) % 7,
+                    text=f"{spk}-c{clip_idx}",
+                )
+            )
+
+    def _run(seed, out_root):
+        permuted = list(base_samples)
+        random.Random(seed).shuffle(permuted)
+        _install_fake_datasets(monkeypatch, permuted)
+        from mellonella_bench.datasets.emilia import prepare
+
+        out = out_root / f"ja_{seed}"
+        prepare("ja", out, top_speakers=2, clips_per_speaker=2)
+        return out
+
+    out_a = _run(1, tmp_path)
+    out_b = _run(2, tmp_path)
+
+    assert (out_a / "manifest.csv").read_bytes() == (out_b / "manifest.csv").read_bytes()
+    for spk_dir in ("speaker01", "speaker02"):
+        for clip in (out_a / spk_dir).iterdir():
+            if clip.suffix == ".wav":
+                assert filecmp.cmp(clip, out_b / spk_dir / clip.name, shallow=False)
+
+
 def test_prepare_accepts_explicit_token_param(tmp_path, monkeypatch):
     """``hf_token`` arg overrides the env var (and unblocks the gate)."""
     monkeypatch.delenv("HF_TOKEN", raising=False)

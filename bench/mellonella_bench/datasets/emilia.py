@@ -32,10 +32,10 @@ module survives minor upstream layout drift.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import os
 import shutil
-from collections import Counter
 from math import gcd
 from pathlib import Path
 from typing import Any
@@ -49,6 +49,10 @@ from .commonvoice import CommonVoiceClip, write_manifest
 SAMPLE_RATE = 16_000
 DEFAULT_TOP_SPEAKERS = 10
 DEFAULT_CLIPS_PER_SPEAKER = 4
+# Mirror MLS: over-collect per speaker so the post-stream deterministic
+# clip sort actually has material to choose from instead of rubber-stamping
+# whatever streaming surfaced first.
+OVERSAMPLE_FACTOR = 4
 
 LANGUAGE_TO_EMILIA_DIR: dict[str, str] = {
     "en": "EN",
@@ -100,6 +104,24 @@ def _extract_metadata(sample: dict[str, Any]) -> dict[str, Any]:
     return sample
 
 
+def _clip_sort_key(clip: dict) -> tuple[int, str]:
+    """Deterministic per-clip sort key: longer clips first, content hash tiebreak.
+
+    Mirror of mls._clip_sort_key. Length-first matters more here than in
+    MLS because Emilia-YODAS is YouTube-extracted with very uneven clip
+    lengths — sha1-only ordering happily picks 1-2 s snippets that don't
+    give ECAPA enough material, dragging the per-row TPR below the
+    scenario_5 floor.
+    """
+    audio = np.ascontiguousarray(clip["audio"], dtype=np.float32)
+    return (-int(audio.size), hashlib.sha1(audio.tobytes()).hexdigest())
+
+
+def _stable_pick_clips(clips: list[dict], k: int) -> list[dict]:
+    """Pick the first ``k`` clips after sorting by content hash."""
+    return sorted(clips, key=_clip_sort_key)[:k]
+
+
 def prepare(
     language: str,
     output_dir: Path,
@@ -147,6 +169,10 @@ def prepare(
         token=token,
     )
 
+    # See mls.prepare: over-collect per speaker, scan the full window,
+    # then deterministically select. The early-break-on-arrival pattern
+    # was the source of the cohort drift documented in D-010 Phase 4.
+    per_speaker_cap = clips_per_speaker * OVERSAMPLE_FACTOR
     by_speaker: dict[str, list[dict]] = {}
     n_seen = 0
     for sample in ds:
@@ -159,7 +185,7 @@ def prepare(
             continue
         spk = str(speaker)
         bucket = by_speaker.setdefault(spk, [])
-        if len(bucket) >= clips_per_speaker:
+        if len(bucket) >= per_speaker_cap:
             continue
         try:
             audio_array, sr = _extract_audio(sample)
@@ -172,18 +198,20 @@ def prepare(
                 "text": str(meta.get("text") or ""),
             }
         )
-        full = sum(1 for b in by_speaker.values() if len(b) >= clips_per_speaker)
-        if full >= top_speakers:
-            break
 
-    counts = Counter({spk: len(clips) for spk, clips in by_speaker.items()})
-    chosen_ids = [spk for spk, _ in counts.most_common(top_speakers)]
-    chosen = [(spk, by_speaker[spk]) for spk in chosen_ids if by_speaker[spk]]
-    if len(chosen) < top_speakers:
+    ranked = sorted(
+        ((spk, clips) for spk, clips in by_speaker.items() if clips),
+        key=lambda kv: (-len(kv[1]), kv[0]),
+    )
+    selected = ranked[:top_speakers]
+    if len(selected) < top_speakers:
         raise RuntimeError(
-            f"Emilia-YODAS({language}) yielded only {len(chosen)} speaker(s) "
+            f"Emilia-YODAS({language}) yielded only {len(selected)} speaker(s) "
             f"after {n_seen} samples; need {top_speakers}"
         )
+
+    chosen = sorted(selected, key=lambda kv: kv[0])
+    chosen = [(spk, _stable_pick_clips(clips, clips_per_speaker)) for spk, clips in chosen]
 
     if output_dir.exists():
         shutil.rmtree(output_dir)

@@ -18,8 +18,8 @@ consumes both interchangeably.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
-from collections import Counter
 from math import gcd
 from pathlib import Path
 
@@ -33,6 +33,11 @@ SAMPLE_RATE = 16_000
 DEFAULT_TOP_SPEAKERS = 10
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
+# We over-collect per speaker (up to OVERSAMPLE_FACTOR × clips_per_speaker)
+# so the post-stream deterministic clip sort has real material to choose
+# from. 4× is enough to absorb streaming-order shuffle for most MLS test
+# splits without blowing memory on 5 000-sample windows.
+OVERSAMPLE_FACTOR = 4
 
 # MLS HF config names spell out the language. We expose short ISO codes
 # at the public API and resolve to the long names internally so the
@@ -71,6 +76,25 @@ def _extract_audio(sample: dict) -> tuple[np.ndarray, int]:
     """Pull the (array, sample_rate) pair from one MLS sample."""
     audio = sample["audio"]
     return np.asarray(audio["array"], dtype=np.float32), int(audio["sampling_rate"])
+
+
+def _clip_sort_key(clip: dict) -> tuple[int, str]:
+    """Deterministic per-clip sort key: longer clips first, content hash tiebreak.
+
+    Length-first beats hash-only because ECAPA embedding quality scales
+    with how much speech is in the K-clip concat — picking the longest
+    clips per speaker gives the SV stage more material to discriminate
+    on, which directly helps the per-row TPR floor scenario_5 enforces.
+    sha1 over the audio bytes still breaks ties so the choice is
+    invariant under HF streaming-arrival reordering.
+    """
+    audio = np.ascontiguousarray(clip["audio"], dtype=np.float32)
+    return (-int(audio.size), hashlib.sha1(audio.tobytes()).hexdigest())
+
+
+def _stable_pick_clips(clips: list[dict], k: int) -> list[dict]:
+    """Pick the first ``k`` clips after sorting by content hash."""
+    return sorted(clips, key=_clip_sort_key)[:k]
 
 
 def _extract_text(sample: dict) -> str:
@@ -126,7 +150,11 @@ def prepare(
         streaming=True,
     )
 
-    # First pass: scan for the most-clipped speakers (cheap — only metadata).
+    # Scan a fixed window and over-collect clips per speaker. We don't
+    # early-break on "first N speakers full" — that made the manifest
+    # depend on HF streaming-arrival order, which is the root cause of
+    # the cohort-drift observed in D-010 Phase 4.
+    per_speaker_cap = clips_per_speaker * OVERSAMPLE_FACTOR
     by_speaker: dict[str, list[dict]] = {}
     n_seen = 0
     for sample in ds:
@@ -138,7 +166,7 @@ def prepare(
             continue
         spk = str(speaker_raw)
         bucket = by_speaker.setdefault(spk, [])
-        if len(bucket) >= clips_per_speaker:
+        if len(bucket) >= per_speaker_cap:
             continue
         bucket.append(
             {
@@ -147,21 +175,28 @@ def prepare(
                 "text": _extract_text(sample),
             }
         )
-        # Stop once we have ``top_speakers`` candidates each with a full bucket.
-        full = sum(1 for b in by_speaker.values() if len(b) >= clips_per_speaker)
-        if full >= top_speakers:
-            break
 
-    # Pick the top-K speakers by clip count (most-clipped first), break ties
-    # by the iteration order via Counter.most_common.
-    counts = Counter({spk: len(clips) for spk, clips in by_speaker.items()})
-    chosen_ids = [spk for spk, _ in counts.most_common(top_speakers)]
-    chosen = [(spk, by_speaker[spk]) for spk in chosen_ids if by_speaker[spk]]
-    if len(chosen) < top_speakers:
+    # Speaker selection: most-clipped first with lex tiebreak so that two
+    # streaming runs that see the same set of speakers + per-speaker
+    # populations produce the same top-N selection.
+    ranked = sorted(
+        ((spk, clips) for spk, clips in by_speaker.items() if clips),
+        key=lambda kv: (-len(kv[1]), kv[0]),
+    )
+    selected = ranked[:top_speakers]
+    if len(selected) < top_speakers:
         raise RuntimeError(
-            f"MLS({config}, {split}) yielded only {len(chosen)} speaker(s) "
+            f"MLS({config}, {split}) yielded only {len(selected)} speaker(s) "
             f"after {n_seen} samples; need {top_speakers}"
         )
+
+    # Stable label assignment: re-sort the chosen speakers by upstream
+    # speaker_id so ``speaker01`` always maps to the same upstream id given
+    # the same selection set, regardless of clip-count tiebreaks.
+    chosen = sorted(selected, key=lambda kv: kv[0])
+    # Each speaker's clips are sorted by a content-addressed hash; this
+    # decouples the kept-K-of-N decision from streaming-arrival order.
+    chosen = [(spk, _stable_pick_clips(clips, clips_per_speaker)) for spk, clips in chosen]
 
     if output_dir.exists():
         shutil.rmtree(output_dir)
