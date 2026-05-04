@@ -112,11 +112,14 @@ def prepare(
 
     from datasets import load_dataset
 
+    # MLS uses a custom loading script; HF datasets >= 2.18 requires the
+    # explicit opt-in flag, otherwise load_dataset raises a security error.
     ds = load_dataset(
         "facebook/multilingual_librispeech",
         config,
         split=split,
         streaming=True,
+        trust_remote_code=True,
     )
 
     # First pass: scan for the most-clipped speakers (cheap — only metadata).
