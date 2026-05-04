@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "config": {
     "sample_rate": 16000,
     "snrs_db": [
@@ -7,9 +7,15 @@
       10.0,
       15.0
     ],
+    "sim4_ratios_db": [
+      9.0,
+      0.0
+    ],
     "seed": 0,
     "theta_pass": 0.3,
-    "theta_learn": 0.8
+    "theta_learn": 0.8,
+    "alpha": 0.9,
+    "beta": 0.1
   },
   "tolerances": {
     "tpr_relative": 0.05,
@@ -36,6 +42,14 @@
       "fpr": 0.0,
       "si_sdr_db": 3.66,
       "other_rms_db": -120.0
+    },
+    "sim4_9db": {
+      "tpr": 0.355,
+      "si_sdr_db": -6.01
+    },
+    "sim4_0db": {
+      "tpr": 0.0,
+      "si_sdr_db": 0.0
     }
   }
 }
