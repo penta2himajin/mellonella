@@ -163,6 +163,45 @@ def test_select_speakers_skips_top_n_to_keep_test_disjoint(tmp_path):
     assert "en_spk01" not in selected_ids
 
 
+def test_select_speakers_uses_lex_tiebreak_for_equal_audio_lengths(tmp_path):
+    """When two speakers have identical total audio length, the
+    selection must lex-sort by speaker_id and pick the smaller id first.
+
+    Without an explicit tiebreak the sort fell back to the upstream
+    dict iteration order, which leaked HF streaming non-determinism
+    into the cohort and is the bug D-010 cohort-determinism is closing.
+    """
+    mod = _import_script()
+    sr = 16_000
+    root = tmp_path / "en"
+    root.mkdir(parents=True, exist_ok=True)
+    n = int(4.0 * sr)
+    rng = np.random.default_rng(0)
+    clips: list[CommonVoiceClip] = []
+    # All four speakers ship two 4 s clips each — all tied on audio length,
+    # so the ordering must come from a deterministic tiebreak (lex on id).
+    # We deliberately write them out of lex order so dict-iteration order
+    # would surface a different ranking.
+    for sid in ("en_zzz", "en_aaa", "en_mmm", "en_bbb"):
+        d = root / sid
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(2):
+            audio = (
+                0.4 * np.sin(2 * np.pi * (220 + sum(ord(c) for c in sid)) * np.arange(n) / sr)
+                + 0.05 * rng.standard_normal(n)
+            ).astype(np.float32)
+            rel = Path(sid) / f"{i:03d}.wav"
+            sf.write(str(root / rel), audio, sr)
+            clips.append(CommonVoiceClip(language="en", speaker_id=sid, clip_path=rel, sentence=""))
+    manifest = root / "manifest.csv"
+    write_manifest(clips, manifest)
+
+    selections = mod.select_speakers_for_language(manifest, per_language=2, min_seconds=5.0)
+    selected_ids = [spk for spk, _ in selections]
+    # Lex-sorted top-2 from {en_aaa, en_bbb, en_mmm, en_zzz} is [en_aaa, en_bbb].
+    assert selected_ids == ["en_aaa", "en_bbb"]
+
+
 def test_select_speakers_rejects_negative_skip_top_n(tmp_path):
     mod = _import_script()
     manifest = _write_manifest(tmp_path / "en", language="en")

@@ -129,7 +129,12 @@ def select_speakers_for_language(
             f"after the {min_seconds}s filter"
         )
     items = [(spk, np.asarray(audio, dtype=np.float32)) for spk, audio in raw.items()]
-    items.sort(key=lambda kv: kv[1].size, reverse=True)
+    # Longest audio first; lex tiebreak on speaker_id so two speakers with
+    # the same audio length land in a stable order. Without the tiebreak,
+    # the upstream dict-iteration order leaks into the cohort selection
+    # and re-introduces the run-to-run variance D-010 Phase 4 was trying
+    # to kill.
+    items.sort(key=lambda kv: (-kv[1].size, kv[0]))
     return items[skip_top_n : skip_top_n + per_language]
 
 

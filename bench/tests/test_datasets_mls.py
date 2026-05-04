@@ -165,6 +165,53 @@ def test_supported_languages_match_currently_published_configs():
     assert set(SUPPORTED_LANGUAGES) == {"de", "fr", "es", "it", "nl", "pl", "pt"}
 
 
+def test_prepare_is_deterministic_under_streaming_reorder(tmp_path, monkeypatch):
+    """Same set of upstream samples in different orders must produce the
+    same manifest + same wav bytes per speaker.
+
+    This is the contract that backs the D-010 cohort-determinism fix:
+    HF datasets streaming yields the same set of samples per pull but
+    not in the same order, so any encounter-order-dependent labelling
+    would leak through into the AS-Norm cohort. We assert the prep step
+    is invariant by feeding the *same* fixture twice in different
+    permutations and binary-comparing the wav files + manifest.
+    """
+    import filecmp
+    import random
+
+    base_samples = []
+    for spk in (101, 207, 318):
+        for clip_idx in range(4):
+            base_samples.append(
+                _make_mls_sample(
+                    speaker_id=spk,
+                    freq=120.0 + spk + clip_idx,
+                    text=f"s{spk}-c{clip_idx}",
+                )
+            )
+
+    def _run(seed, out_root):
+        permuted = list(base_samples)
+        random.Random(seed).shuffle(permuted)
+        _install_fake_datasets(monkeypatch, permuted)
+        from mellonella_bench.datasets.mls import prepare
+
+        out = out_root / f"de_{seed}"
+        prepare("de", out, top_speakers=2, clips_per_speaker=2)
+        return out
+
+    out_a = _run(1, tmp_path)
+    out_b = _run(2, tmp_path)
+
+    # Manifest contents must match.
+    assert (out_a / "manifest.csv").read_bytes() == (out_b / "manifest.csv").read_bytes()
+    # And every wav file must be byte-identical between the two runs.
+    for spk_dir in ("speaker01", "speaker02"):
+        for clip in (out_a / spk_dir).iterdir():
+            if clip.suffix == ".wav":
+                assert filecmp.cmp(clip, out_b / spk_dir / clip.name, shallow=False)
+
+
 def test_extract_text_falls_back_across_field_names(tmp_path, monkeypatch):
     """``text``, ``transcript``, ``transcription`` are all handled."""
     samples = [
