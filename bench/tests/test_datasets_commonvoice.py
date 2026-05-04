@@ -13,7 +13,9 @@ import csv
 import tarfile
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from mellonella_bench.datasets.commonvoice import (
     DEFAULT_CLIPS_PER_SPEAKER,
@@ -21,6 +23,7 @@ from mellonella_bench.datasets.commonvoice import (
     CommonVoiceClip,
     build_subset,
     extract_archive,
+    load_speakers_from_manifest,
     prepare,
     read_manifest,
     select_top_speakers,
@@ -181,3 +184,114 @@ def test_default_clips_per_speaker_is_reasonable():
     # docs/benchmarks.md PoC subset suggests ~50 utt per language; default 20
     # leaves room for top-K speakers without bloating the bundle.
     assert 5 <= DEFAULT_CLIPS_PER_SPEAKER <= 100
+
+
+def _write_wav(path: Path, audio: np.ndarray, sr: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), audio.astype(np.float32), sr)
+
+
+def test_load_speakers_from_manifest_concatenates_per_speaker(tmp_path):
+    sr = 16_000
+    duration = 3.0  # per clip
+    n_samples = int(duration * sr)
+
+    # Materialise a fake subset directory layout matching what build_subset writes.
+    manifest_path = tmp_path / "subset" / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    clips: list[CommonVoiceClip] = []
+    for spk in ("speaker01", "speaker02"):
+        for idx in range(3):
+            rel = Path(spk) / f"{idx:03d}.wav"
+            _write_wav(
+                manifest_path.parent / rel,
+                np.full(n_samples, 0.1 if spk == "speaker01" else 0.2, dtype=np.float32),
+                sr,
+            )
+            clips.append(
+                CommonVoiceClip(
+                    language="en",
+                    speaker_id=spk,
+                    clip_path=rel,
+                    sentence="",
+                )
+            )
+    write_manifest(clips, manifest_path)
+
+    speakers = load_speakers_from_manifest(manifest_path, sample_rate=sr)
+    assert set(speakers) == {"speaker01", "speaker02"}
+    # 3 clips × 3s = 9s per speaker
+    assert speakers["speaker01"].size == 3 * n_samples
+    assert speakers["speaker02"].size == 3 * n_samples
+
+
+def test_load_speakers_from_manifest_resamples_to_target_rate(tmp_path):
+    src_sr = 8_000
+    target_sr = 16_000
+    n_src_samples = int(2.0 * src_sr)
+
+    manifest_path = tmp_path / "subset" / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    clips: list[CommonVoiceClip] = []
+    for idx in range(3):
+        rel = Path("speaker01") / f"{idx:03d}.wav"
+        _write_wav(
+            manifest_path.parent / rel,
+            np.full(n_src_samples, 0.1, dtype=np.float32),
+            src_sr,
+        )
+        clips.append(
+            CommonVoiceClip(language="en", speaker_id="speaker01", clip_path=rel, sentence="")
+        )
+    write_manifest(clips, manifest_path)
+
+    speakers = load_speakers_from_manifest(manifest_path, sample_rate=target_sr)
+    # 3 clips × 2s at 16 kHz = 96 000 samples (allow ±1 for resample rounding)
+    assert "speaker01" in speakers
+    assert abs(speakers["speaker01"].size - 3 * int(2.0 * target_sr)) <= 3
+
+
+def test_load_speakers_from_manifest_drops_short_speakers(tmp_path):
+    sr = 16_000
+    short_n = int(1.0 * sr)  # 1s — below the default 5s threshold
+    long_n = int(6.0 * sr)
+
+    manifest_path = tmp_path / "subset" / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    clips: list[CommonVoiceClip] = [
+        CommonVoiceClip(
+            language="en", speaker_id="short", clip_path=Path("short/000.wav"), sentence=""
+        ),
+        CommonVoiceClip(
+            language="en", speaker_id="long", clip_path=Path("long/000.wav"), sentence=""
+        ),
+    ]
+    _write_wav(
+        manifest_path.parent / "short" / "000.wav", np.zeros(short_n, dtype=np.float32) + 0.1, sr
+    )
+    _write_wav(
+        manifest_path.parent / "long" / "000.wav", np.zeros(long_n, dtype=np.float32) + 0.1, sr
+    )
+    write_manifest(clips, manifest_path)
+
+    speakers = load_speakers_from_manifest(manifest_path, sample_rate=sr, min_seconds=5.0)
+    assert set(speakers) == {"long"}
+
+
+def test_load_speakers_from_manifest_skips_missing_clip_files(tmp_path):
+    sr = 16_000
+    n = int(6.0 * sr)
+    manifest_path = tmp_path / "subset" / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    rel_present = Path("speaker01") / "000.wav"
+    rel_missing = Path("speaker01") / "001.wav"
+    _write_wav(manifest_path.parent / rel_present, np.full(n, 0.1, dtype=np.float32), sr)
+    # rel_missing is in the manifest but never materialised on disk.
+    clips = [
+        CommonVoiceClip(language="en", speaker_id="speaker01", clip_path=rel_present, sentence=""),
+        CommonVoiceClip(language="en", speaker_id="speaker01", clip_path=rel_missing, sentence=""),
+    ]
+    write_manifest(clips, manifest_path)
+    speakers = load_speakers_from_manifest(manifest_path, sample_rate=sr)
+    # Only the present clip contributes; the missing one is silently skipped.
+    assert speakers["speaker01"].size == n

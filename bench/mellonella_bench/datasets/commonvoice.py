@@ -203,6 +203,54 @@ def read_manifest(path: Path) -> list[CommonVoiceClip]:
         ]
 
 
+def load_speakers_from_manifest(
+    manifest_path: Path,
+    sample_rate: int,
+    *,
+    min_seconds: float = 5.0,
+) -> dict[str, object]:
+    """Group manifest clips by ``speaker_id`` and return one concatenated buffer
+    per speaker, resampled to ``sample_rate``.
+
+    Speakers whose total audio is shorter than ``min_seconds`` are dropped —
+    calibration needs at least an enrollment-half plus a test-half worth of
+    material per speaker.
+
+    Audio loading uses ``soundfile`` and ``scipy.signal.resample_poly``;
+    both are pulled in lazily so the test suite can import this module
+    without librosa / soundfile (only the heavy-dep code path imports them).
+    """
+    from math import gcd
+
+    import numpy as np
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    clips = read_manifest(manifest_path)
+    base = manifest_path.parent
+    by_speaker: dict[str, list] = {}
+    for clip in clips:
+        clip_path = base / clip.clip_path
+        if not clip_path.exists():
+            continue
+        audio, sr = sf.read(str(clip_path), dtype="float32", always_2d=False)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        audio = np.asarray(audio, dtype=np.float32)
+        if sr != sample_rate:
+            g = gcd(int(sr), int(sample_rate))
+            audio = resample_poly(audio, sample_rate // g, sr // g).astype(np.float32)
+        by_speaker.setdefault(clip.speaker_id, []).append(audio)
+
+    out: dict[str, object] = {}
+    min_samples = int(min_seconds * sample_rate)
+    for speaker, parts in by_speaker.items():
+        merged = np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
+        if merged.size >= min_samples:
+            out[speaker] = merged
+    return out
+
+
 def prepare(
     archive: Path,
     language: str,

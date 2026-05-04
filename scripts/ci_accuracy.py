@@ -103,14 +103,10 @@ def _mix_at_snr(speech: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndar
         raise ValueError("zero-energy speech or noise; cannot mix at SNR")
     target_noise_power = speech_power / (10.0 ** (snr_db / 10.0))
     scale = float(np.sqrt(target_noise_power / noise_power))
-    return (speech.astype(np.float32) + scale * noise.astype(np.float32)).astype(
-        np.float32
-    )
+    return (speech.astype(np.float32) + scale * noise.astype(np.float32)).astype(np.float32)
 
 
-def _mix_target_other(
-    target: np.ndarray, other: np.ndarray, ratio_db: float
-) -> np.ndarray:
+def _mix_target_other(target: np.ndarray, other: np.ndarray, ratio_db: float) -> np.ndarray:
     """Mix target + other at the requested target-to-other power ratio (dB).
 
     Lengths are aligned to ``target.size`` (truncate-or-pad ``other``).
@@ -127,9 +123,7 @@ def _mix_target_other(
         raise ValueError("zero-energy target or other; cannot mix at finite ratio")
     target_other_power = target_power / (10.0 ** (ratio_db / 10.0))
     scale = float(np.sqrt(target_other_power / other_power))
-    return (
-        target.astype(np.float32) + scale * other_aligned.astype(np.float32)
-    ).astype(np.float32)
+    return (target.astype(np.float32) + scale * other_aligned.astype(np.float32)).astype(np.float32)
 
 
 def _gate_on_rate(gate_per_frame: np.ndarray) -> float:
@@ -177,13 +171,9 @@ def measure() -> dict[str, dict[str, float]]:
         other_noise = rng.standard_normal(other_audio.size).astype(np.float32)
 
         target_mix = _mix_at_snr(target_test, target_noise, snr)
-        target_result = process_offline(
-            target_mix, SAMPLE_RATE, pool, config, components
-        )
+        target_result = process_offline(target_mix, SAMPLE_RATE, pool, config, components)
         tpr = _gate_on_rate(target_result.gate_per_frame)
-        out_at_16k = _to_target_sr(
-            target_result.audio, config.audio.output_sr, SAMPLE_RATE
-        )
+        out_at_16k = _to_target_sr(target_result.audio, config.audio.output_sr, SAMPLE_RATE)
         n = min(target_test.size, out_at_16k.size)
         sisdr = si_sdr(target_test[:n], out_at_16k[:n])
 
@@ -204,9 +194,7 @@ def measure() -> dict[str, dict[str, float]]:
         sim_mix = _mix_target_other(target_test, other_audio, ratio_db)
         sim_result = process_offline(sim_mix, SAMPLE_RATE, pool, config, components)
         sim_tpr = _gate_on_rate(sim_result.gate_per_frame)
-        sim_out_at_16k = _to_target_sr(
-            sim_result.audio, config.audio.output_sr, SAMPLE_RATE
-        )
+        sim_out_at_16k = _to_target_sr(sim_result.audio, config.audio.output_sr, SAMPLE_RATE)
         n_sim = min(target_test.size, sim_out_at_16k.size)
         sim_sisdr = si_sdr(target_test[:n_sim], sim_out_at_16k[:n_sim])
 
@@ -226,12 +214,10 @@ def _check_metric_pair(
 ) -> None:
     """Compare ``cur`` and ``base`` for one measurement key. Skip metrics that
     are absent in either side; fail per-metric on regression."""
-    if "tpr" in cur and "tpr" in base:
-        if cur["tpr"] < base["tpr"] * (1.0 - TPR_REL_TOL):
-            failures.append(
-                f"{key} TPR regressed: {cur['tpr']:.3f} < "
-                f"{base['tpr']:.3f} * (1 - {TPR_REL_TOL})"
-            )
+    if "tpr" in cur and "tpr" in base and cur["tpr"] < base["tpr"] * (1.0 - TPR_REL_TOL):
+        failures.append(
+            f"{key} TPR regressed: {cur['tpr']:.3f} < " f"{base['tpr']:.3f} * (1 - {TPR_REL_TOL})"
+        )
 
     if "fpr" in cur and "fpr" in base:
         if base["fpr"] == 0.0:
@@ -246,19 +232,25 @@ def _check_metric_pair(
                 f"{base['fpr']:.3f} * (1 + {FPR_REL_TOL})"
             )
 
-    if "si_sdr_db" in cur and "si_sdr_db" in base:
-        if cur["si_sdr_db"] < base["si_sdr_db"] - SI_SDR_ABS_TOL_DB:
-            failures.append(
-                f"{key} SI-SDR regressed: {cur['si_sdr_db']:.2f} dB < "
-                f"{base['si_sdr_db']:.2f} dB - {SI_SDR_ABS_TOL_DB} dB"
-            )
+    if (
+        "si_sdr_db" in cur
+        and "si_sdr_db" in base
+        and cur["si_sdr_db"] < base["si_sdr_db"] - SI_SDR_ABS_TOL_DB
+    ):
+        failures.append(
+            f"{key} SI-SDR regressed: {cur['si_sdr_db']:.2f} dB < "
+            f"{base['si_sdr_db']:.2f} dB - {SI_SDR_ABS_TOL_DB} dB"
+        )
 
-    if "other_rms_db" in cur and "other_rms_db" in base:
-        if cur["other_rms_db"] > base["other_rms_db"] + OTHER_RMS_ABS_TOL_DB:
-            failures.append(
-                f"{key} other_rms_db regressed: {cur['other_rms_db']:.2f} dB > "
-                f"{base['other_rms_db']:.2f} dB + {OTHER_RMS_ABS_TOL_DB} dB"
-            )
+    if (
+        "other_rms_db" in cur
+        and "other_rms_db" in base
+        and cur["other_rms_db"] > base["other_rms_db"] + OTHER_RMS_ABS_TOL_DB
+    ):
+        failures.append(
+            f"{key} other_rms_db regressed: {cur['other_rms_db']:.2f} dB > "
+            f"{base['other_rms_db']:.2f} dB + {OTHER_RMS_ABS_TOL_DB} dB"
+        )
 
 
 def _check_against_baseline(

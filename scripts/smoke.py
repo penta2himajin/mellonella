@@ -32,9 +32,7 @@ INPUT_DURATION_SEC = 3.0
 OUTPUT_SR = 48_000
 
 
-def _synth_voiced(
-    duration_sec: float, sr: int, *, fundamental_hz: float = 180.0
-) -> np.ndarray:
+def _synth_voiced(duration_sec: float, sr: int, *, fundamental_hz: float = 180.0) -> np.ndarray:
     """Sum of low-order harmonics with light AM — rough speech-like waveform."""
     t = np.arange(int(sr * duration_sec)) / sr
     wave = np.zeros_like(t, dtype=np.float32)
@@ -60,9 +58,7 @@ def _check_audio(path: Path, expected_sr: int, expected_min_duration: float) -> 
             f"{path}: expected ~{expected_min_duration:.2f}s, got {duration:.2f}s "
             f"({info.frames} frames)"
         )
-    print(
-        f"  {path.name}: {duration:.2f}s @ {info.samplerate} Hz, {info.frames} frames"
-    )
+    print(f"  {path.name}: {duration:.2f}s @ {info.samplerate} Hz, {info.frames} frames")
 
 
 def _check_enrollment(path: Path) -> None:
@@ -87,9 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     output_wav = work_dir / "filtered.wav"
 
     print(f"[smoke] generating synthetic recordings under {work_dir}")
-    sf.write(
-        str(enrollment_wav), _synth_voiced(ENROLL_DURATION_SEC, ENROLL_SR), ENROLL_SR
-    )
+    sf.write(str(enrollment_wav), _synth_voiced(ENROLL_DURATION_SEC, ENROLL_SR), ENROLL_SR)
     rng = np.random.default_rng(0)
     mixture = _synth_voiced(INPUT_DURATION_SEC, ENROLL_SR) + 0.02 * rng.standard_normal(
         int(INPUT_DURATION_SEC * ENROLL_SR)
@@ -122,9 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             str(output_wav),
         ]
     )
-    _check_audio(
-        output_wav, expected_sr=OUTPUT_SR, expected_min_duration=INPUT_DURATION_SEC
-    )
+    _check_audio(output_wav, expected_sr=OUTPUT_SR, expected_min_duration=INPUT_DURATION_SEC)
 
     print("[smoke] OK")
     return 0
