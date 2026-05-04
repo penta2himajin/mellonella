@@ -237,6 +237,23 @@ ja/zh-CN の対称的失敗は **global θ_pass=0.30 では同時最適化不能
 対応として `docs/decisions.md` D-010 で **AS-Norm** 採用を決定。
 `docs/gating.md`「AS-Norm（Adaptive S-Norm）によるスコア正規化」節も参照。
 
+#### Phase 2: AS-Norm 適用後の deltas（PR #19, default `theta_pass_as_norm=1.5`、cohort 30 embeddings）
+
+| Lang | Δ TPR | Δ FPR | 備考 |
+|---|---|---|---|
+| de | **−0.08** | +0.02 | SNR=0 で TPR 0.48 まで落ちる新規 regression |
+| en | +0.02 | 0 | わずかに改善 |
+| fr | +0.03 | +0.03 | TPR 微改善、FPR ほぼ据え置き |
+| ja | **+0.18** | +0.05 | ✅ 主目的の取りこぼし問題解消 |
+| ko | +0.06 | 0 | 改善 |
+| zh-CN | +0.01 | **+0.19** | ❌ FPR 大幅悪化、SNR=0 で 0.54 |
+
+aggregate: TPR mean **+0.04** / FPR mean **+0.05** / FPR cross-lang stddev **+0.06**。
+
+ja は劇的改善、zh-CN は悪化。default `theta_pass_as_norm=1.5` がヒューリスティック
+過ぎることを示している。`docs/decisions.md` D-010「Phase 2 実観測」と Phase 3 計画
+（calibrate.py 拡張で data 駆動キャリブ）参照。
+
 ### シナリオ 6: 経時変化への対応（自動学習効果）
 
 ```

@@ -258,15 +258,16 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 1. **Phase 1** ✅ (PR #18): cohort build script
    `scripts/build_impostor_cohort.py` で MLS+Emilia の manifest から
    ECAPA embedding を抽出し `.npz` で出力
-2. **Phase 2** ✅ (本 PR): `gating.py` に `as_norm_score` / `load_cohort`
+2. **Phase 2** ✅ (PR #19): `gating.py` に `as_norm_score` / `load_cohort`
    実装、`GatingConfig` に `use_as_norm` / `as_norm_cohort_path` /
    `as_norm_top_k` / `theta_pass_as_norm` / `theta_learn_as_norm` 追加、
    `pipeline.process_offline` の score 経路を分岐、CI で cohort
    自動 build → scenario_5 に反映
-3. **Phase 3** (次 PR): AS-Norm 適用後の baseline 取得、ja/zh-CN
-   改善を data 駆動で確認、`theta_pass_as_norm` 等の最終キャリブ、
+3. **Phase 3** (次 PR): `scripts/calibrate.py` に AS-Norm 拡張、
+   per-language sweep で `theta_pass_as_norm` を data 駆動で確定、
    scenario_5 hard-fail 閾値引き締め
-4. **Phase 4** (任意): C/D/E への拡張
+4. **Phase 4** (任意): C/D/E への拡張、または cohort 拡大 (per-language
+   5 → 10、top-K 10 → 20) — Phase 3 の結果次第で要否判断
 
 ### Phase 2 の設計ノート
 
@@ -279,6 +280,48 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
   data 駆動で確定する。
 - `use_as_norm = False` を default に維持し、既存 PoC + bench テストが
   bit-identical に通ることを担保 (`enable_auto_learn` と同じパターン)。
+
+### Phase 2 実観測 (PR #19 初回 CI run, real pipeline, MLS+Emilia-YODAS, 6 言語)
+
+PR #17 の legacy `α·cs + β·f0` ベースラインと、PR #19 の AS-Norm (default
+`theta_pass_as_norm=1.5`、cohort 30 embeddings × 6 言語) を per-language
+で比較した結果:
+
+| Lang | TPR (legacy) | TPR (AS-Norm) | Δ TPR | FPR (legacy) | FPR (AS-Norm) | Δ FPR |
+|---|---|---|---|---|---|---|
+| de | 0.77 | 0.69 | **−0.08** | 0.02 | 0.04 | +0.02 |
+| en | 0.78 | 0.80 | +0.02 | 0.00 | 0.00 | 0 |
+| fr | 0.80 | 0.83 | +0.03 | 0.00 | 0.03 | +0.03 |
+| ja | 0.67 | **0.85** | **+0.18** ✅ | 0.07 | 0.12 | +0.05 |
+| ko | 0.80 | 0.86 | +0.06 | 0.00 | 0.00 | 0 |
+| zh-CN | 0.86 | 0.87 | +0.01 | 0.23 | **0.42** | **+0.19** ❌ |
+| **mean** | 0.78 | **0.82** | **+0.04** | 0.05 | 0.10 | +0.05 |
+| **stddev** | 0.058 | 0.060 | +0.002 | 0.084 | 0.148 | +0.064 |
+
+**評価**:
+
+- **大成功**: ja TPR が 0.67 → 0.85 (+18pp)。低 SNR (0/5dB) で 0.59 → 0.85
+  に改善し、本決定の主目的だった日本語取りこぼし問題が解消。en/fr/ko も
+  微改善で aggregate TPR は +4pp。
+- **新規 regression (2 件)**:
+  - **zh-CN FPR**: 0.23 → 0.42 (+19pp)。SNR=0 で 0.54 まで上昇。tonal 言語の
+    impostor 区別が cohort 30 embeddings (per-language 5) では薄く、top-K=10
+    が cohort 全体の 33% を占めるため normalization が弱い可能性。
+  - **de TPR**: 0.77 → 0.69 (−8pp)。SNR=0 で 0.48 まで落ちる新規 regression。
+    AS-Norm が de の cohort 分布バイアスを意図せず作っている可能性。
+- aggregate FPR は 0.05 → 0.10 (+5pp 悪化、zh-CN 起因)、cross-lang stddev も
+  0.084 → 0.148 と拡大。
+
+**Phase 3 への示唆**:
+
+1. `theta_pass_as_norm = 1.5` のヒューリスティック値が言語ごと過剰/不足。
+   `calibrate.py` の AS-Norm 拡張で sweep してグローバル最適値を求めるのが
+   主軸。
+2. 上記で吸収できない場合のみ Phase 4 として cohort 拡大 (per-language
+   5 → 10) や top-K 引き上げを検討する。事前に決め打ちしない。
+3. 最終的に `theta_pass_as_norm` を更新した時点で scenario_5 hard-fail
+   閾値も引き締める (現在 `--tpr-min 0.3 --fpr-max 0.7` は legacy 観測値
+   からの 27pp バッファ — Phase 3 完了後に縮められる見込み)。
 
 ### 参考文献
 
