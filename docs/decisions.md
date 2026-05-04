@@ -505,8 +505,11 @@ upstream 話者で再生成される** ことが根本原因だった。これ�
     数 tied でも lex tiebreak で順序確定。
   - ラベル割当: 選択集合を **upstream speaker_id 昇順** に並べ替え、
     `speaker01..N` を順に振る。同じ upstream 話者は常に同じスロット。
-  - clip 選択: `sha1(audio.tobytes())` で sort し先頭 K を採用。content-
-    addressed なので arrival 順非依存。
+  - clip 選択: `(-len(audio), sha1(audio.tobytes()))` で sort し先頭 K を
+    採用。長い clip = ECAPA に渡す concat が情報量豊かで TPR 安定化に
+    寄与。tiebreak は content-hash で arrival 順非依存。**初版 (sha1
+    のみ) では Emilia-YODAS の 1-2 秒 snippet を引いて ko/fr で per-row
+    TPR が 0.3 を切る事例が出たため length-first に修正。**
 - `scripts/build_impostor_cohort.py` の `select_speakers_for_language` も
   `(-audio_size, speaker_id)` の lex tiebreak を追加。同 size 話者間の
   選択が dict-iteration 順に依存していた残りの leak を塞ぐ。

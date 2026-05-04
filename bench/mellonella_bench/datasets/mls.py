@@ -78,15 +78,23 @@ def _extract_audio(sample: dict) -> tuple[np.ndarray, int]:
     return np.asarray(audio["array"], dtype=np.float32), int(audio["sampling_rate"])
 
 
-def _clip_hash_key(clip: dict) -> str:
-    """Deterministic per-clip sort key based on the audio content itself."""
+def _clip_sort_key(clip: dict) -> tuple[int, str]:
+    """Deterministic per-clip sort key: longer clips first, content hash tiebreak.
+
+    Length-first beats hash-only because ECAPA embedding quality scales
+    with how much speech is in the K-clip concat — picking the longest
+    clips per speaker gives the SV stage more material to discriminate
+    on, which directly helps the per-row TPR floor scenario_5 enforces.
+    sha1 over the audio bytes still breaks ties so the choice is
+    invariant under HF streaming-arrival reordering.
+    """
     audio = np.ascontiguousarray(clip["audio"], dtype=np.float32)
-    return hashlib.sha1(audio.tobytes()).hexdigest()
+    return (-int(audio.size), hashlib.sha1(audio.tobytes()).hexdigest())
 
 
 def _stable_pick_clips(clips: list[dict], k: int) -> list[dict]:
     """Pick the first ``k`` clips after sorting by content hash."""
-    return sorted(clips, key=_clip_hash_key)[:k]
+    return sorted(clips, key=_clip_sort_key)[:k]
 
 
 def _extract_text(sample: dict) -> str:

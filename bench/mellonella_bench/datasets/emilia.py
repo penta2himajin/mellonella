@@ -104,15 +104,22 @@ def _extract_metadata(sample: dict[str, Any]) -> dict[str, Any]:
     return sample
 
 
-def _clip_hash_key(clip: dict) -> str:
-    """Deterministic per-clip sort key based on the audio content itself."""
+def _clip_sort_key(clip: dict) -> tuple[int, str]:
+    """Deterministic per-clip sort key: longer clips first, content hash tiebreak.
+
+    Mirror of mls._clip_sort_key. Length-first matters more here than in
+    MLS because Emilia-YODAS is YouTube-extracted with very uneven clip
+    lengths — sha1-only ordering happily picks 1-2 s snippets that don't
+    give ECAPA enough material, dragging the per-row TPR below the
+    scenario_5 floor.
+    """
     audio = np.ascontiguousarray(clip["audio"], dtype=np.float32)
-    return hashlib.sha1(audio.tobytes()).hexdigest()
+    return (-int(audio.size), hashlib.sha1(audio.tobytes()).hexdigest())
 
 
 def _stable_pick_clips(clips: list[dict], k: int) -> list[dict]:
     """Pick the first ``k`` clips after sorting by content hash."""
-    return sorted(clips, key=_clip_hash_key)[:k]
+    return sorted(clips, key=_clip_sort_key)[:k]
 
 
 def prepare(

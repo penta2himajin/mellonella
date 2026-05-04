@@ -65,15 +65,17 @@ jobs:
       # clips before slicing) — pre-fix manifests would still be valid CSV
       # but their speaker01..N labels point at different upstream speakers
       # than the new code expects, which would silently corrupt the AS-Norm
-      # μ/σ on cache hits. v2 wiped pre-D-010-Phase-4 caches, v3 wipes
-      # pre-determinism caches.
+      # μ/σ on cache hits. v2 wiped pre-D-010-Phase-4 caches; v3 wiped the
+      # initial determinism caches; v4 wipes the sha1-only clip-pick caches
+      # after switching to (-clip_length, sha1) sort to keep the SV concat
+      # informative.
       - name: Cache MLS + Emilia subset materials + AS-Norm cohort
         uses: actions/cache@v4
         with:
           path: data
-          key: scenario5-data-v3-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
+          key: scenario5-data-v4-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
           restore-keys: |
-            scenario5-data-v3-${{ runner.os }}-
+            scenario5-data-v4-${{ runner.os }}-
 
       # ---- Prepare per-language subsets ----
       # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
@@ -115,7 +117,7 @@ jobs:
       # The cache key (above) hashes scripts/build_impostor_cohort.py so
       # changes to selection logic auto-invalidate. Adding/removing
       # languages or changing top-K can be forced by bumping the cache key
-      # version (v3 → v4).
+      # version (v4 → v5).
       #
       # `--skip-top-n 2` matches scenario_5_from_manifest.py's default
       # `--top-speakers 2` so the speakers used as test target / other are
