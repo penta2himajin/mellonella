@@ -37,8 +37,12 @@ DEFAULT_SPLIT = "test"
 # MLS HF config names spell out the language. We expose short ISO codes
 # at the public API and resolve to the long names internally so the
 # manifest ``language`` column stays compact and stable.
+#
+# NOTE: English was DROPPED from facebook/multilingual_librispeech when the
+# repo migrated to parquet. The currently-published configs are exactly the
+# seven below — `english` is no longer accessible on HF. Use Emilia-YODAS
+# (datasets/emilia.py) for English instead.
 LANGUAGE_TO_MLS_CONFIG: dict[str, str] = {
-    "en": "english",
     "de": "german",
     "fr": "french",
     "es": "spanish",
@@ -112,14 +116,14 @@ def prepare(
 
     from datasets import load_dataset
 
-    # MLS uses a custom loading script; HF datasets >= 2.18 requires the
-    # explicit opt-in flag, otherwise load_dataset raises a security error.
+    # MLS on HF was migrated to parquet; the legacy ``trust_remote_code`` opt-in
+    # is no longer accepted (and not needed). The English config was also dropped
+    # in the migration — see LANGUAGE_TO_MLS_CONFIG below.
     ds = load_dataset(
         "facebook/multilingual_librispeech",
         config,
         split=split,
         streaming=True,
-        trust_remote_code=True,
     )
 
     # First pass: scan for the most-clipped speakers (cheap — only metadata).

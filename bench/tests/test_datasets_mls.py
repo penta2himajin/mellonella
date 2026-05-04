@@ -49,8 +49,8 @@ def test_prepare_writes_manifest_with_top_speakers(tmp_path, monkeypatch):
     _install_fake_datasets(monkeypatch, samples)
     from mellonella_bench.datasets.mls import prepare
 
-    out = tmp_path / "en"
-    prepare("en", out, top_speakers=2, clips_per_speaker=2)
+    out = tmp_path / "de"
+    prepare("de", out, top_speakers=2, clips_per_speaker=2)
     assert (out / "manifest.csv").exists()
     assert (out / "speaker01" / "000.wav").exists()
     assert (out / "speaker01" / "001.wav").exists()
@@ -67,12 +67,12 @@ def test_prepare_idempotent_on_warm_dir(tmp_path, monkeypatch):
     _install_fake_datasets(monkeypatch, samples)
     from mellonella_bench.datasets.mls import prepare
 
-    out = tmp_path / "en"
-    prepare("en", out, top_speakers=2, clips_per_speaker=1)
+    out = tmp_path / "de"
+    prepare("de", out, top_speakers=2, clips_per_speaker=1)
     sentinel = out / "warm.txt"
     sentinel.write_text("preserved")
 
-    prepare("en", out, top_speakers=2, clips_per_speaker=1)
+    prepare("de", out, top_speakers=2, clips_per_speaker=1)
     assert sentinel.exists()
     assert sentinel.read_text() == "preserved"
 
@@ -110,7 +110,7 @@ def test_prepare_rejects_zero_top_speakers(tmp_path, monkeypatch):
     from mellonella_bench.datasets.mls import prepare
 
     with pytest.raises(ValueError):
-        prepare("en", tmp_path / "out", top_speakers=0)
+        prepare("de", tmp_path / "out", top_speakers=0)
 
 
 def test_prepare_raises_when_not_enough_speakers(tmp_path, monkeypatch):
@@ -123,7 +123,7 @@ def test_prepare_raises_when_not_enough_speakers(tmp_path, monkeypatch):
     from mellonella_bench.datasets.mls import prepare
 
     with pytest.raises(RuntimeError):
-        prepare("en", tmp_path / "out", top_speakers=2, clips_per_speaker=1)
+        prepare("de", tmp_path / "out", top_speakers=2, clips_per_speaker=1)
 
 
 def test_prepare_caps_at_clips_per_speaker(tmp_path, monkeypatch):
@@ -132,8 +132,8 @@ def test_prepare_caps_at_clips_per_speaker(tmp_path, monkeypatch):
     _install_fake_datasets(monkeypatch, samples)
     from mellonella_bench.datasets.mls import prepare
 
-    out = tmp_path / "en"
-    prepare("en", out, top_speakers=2, clips_per_speaker=3)
+    out = tmp_path / "de"
+    prepare("de", out, top_speakers=2, clips_per_speaker=3)
     speaker1_wavs = sorted(p for p in (out / "speaker01").iterdir() if p.suffix == ".wav")
     assert len(speaker1_wavs) == 3
     speaker2_wavs = sorted(p for p in (out / "speaker02").iterdir() if p.suffix == ".wav")
@@ -157,10 +157,12 @@ def test_manifest_uses_iso_language_code(tmp_path, monkeypatch):
     assert {r.sentence for r in rows} == {"hello", "world"}
 
 
-def test_supported_languages_match_mls_eight():
+def test_supported_languages_match_currently_published_configs():
+    """English was dropped from the MLS HF repo at the parquet migration; the
+    other seven non-English configs remain."""
     from mellonella_bench.datasets.mls import SUPPORTED_LANGUAGES
 
-    assert set(SUPPORTED_LANGUAGES) == {"en", "de", "fr", "es", "it", "nl", "pl", "pt"}
+    assert set(SUPPORTED_LANGUAGES) == {"de", "fr", "es", "it", "nl", "pl", "pt"}
 
 
 def test_extract_text_falls_back_across_field_names(tmp_path, monkeypatch):
@@ -181,7 +183,7 @@ def test_extract_text_falls_back_across_field_names(tmp_path, monkeypatch):
     from mellonella_bench.datasets.commonvoice import read_manifest
     from mellonella_bench.datasets.mls import prepare
 
-    out = tmp_path / "en"
-    prepare("en", out, top_speakers=2, clips_per_speaker=1)
+    out = tmp_path / "de"
+    prepare("de", out, top_speakers=2, clips_per_speaker=1)
     rows = read_manifest(out / "manifest.csv")
     assert {r.sentence for r in rows} == {"fallback-1", "fallback-2"}

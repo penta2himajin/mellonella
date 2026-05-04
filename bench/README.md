@@ -57,16 +57,17 @@ The downloaders live in `mellonella_bench/datasets/`. They write under
 `$MELLONELLA_DATA_DIR` (default `./data/`). Each downloader is idempotent;
 warm caches are reused. See the per-script docstring for licence terms.
 
-### MLS — printout for European languages (CI-default)
+### MLS — non-English European languages (CI-default)
 
-`facebook/multilingual_librispeech` (`CC-BY 4.0`, ungated) covers eight
-European languages with real per-clip `speaker_id`. The
+`facebook/multilingual_librispeech` (`CC-BY 4.0`, ungated) covers seven
+European languages — de, fr, es, it, nl, pl, pt — with real per-clip
+`speaker_id`. **English was dropped from the HF repo at the parquet
+migration**, so `en` is routed through Emilia-YODAS instead. The
 `bench[hf]` extra adds `datasets` so the streaming-prep step works
 without a local download:
 
 ```bash
 pip install -e bench[hf]
-python -m mellonella_bench.datasets.mls prepare --language en
 python -m mellonella_bench.datasets.mls prepare --language de
 python -m mellonella_bench.datasets.mls prepare --language fr
 # also: es, it, nl, pl, pt
@@ -75,11 +76,13 @@ python -m mellonella_bench.datasets.mls prepare --language fr
 Output lands at `$MELLONELLA_DATA_DIR/mls/<lang>/manifest.csv` plus
 `speakerNN/*.wav` directories. The CI workflow caches this materially.
 
-### Emilia-YODAS — Asian languages (gated, requires `HF_TOKEN`)
+### Emilia-YODAS — Asian languages + English (gated, requires `HF_TOKEN`)
 
 `amphion/Emilia-Dataset` (`CC-BY 4.0` for the `Emilia-YODAS` shards;
 the parent dataset has a CC-BY-NC half — we explicitly load YODAS
-only) covers ja / ko / zh / en / de / fr with real `speaker` labels.
+only) covers en / ja / ko / zh-CN / de / fr with real `speaker` labels.
+This is also the source CI uses for **English** since MLS dropped its
+`english` config.
 The repo is HF-gated: agree to the dataset ToS once at
 <https://huggingface.co/datasets/amphion/Emilia-Dataset>, generate a
 read token, and export it:

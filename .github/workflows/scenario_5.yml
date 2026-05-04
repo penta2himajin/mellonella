@@ -68,9 +68,8 @@ jobs:
       # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
       # HF_TOKEN is configured. Either path's manifest is reused on warm cache.
 
-      - name: Prepare MLS subsets (en, de, fr)
+      - name: Prepare MLS subsets (de, fr — en was dropped from MLS at parquet migration)
         run: |
-          python -m mellonella_bench.datasets.mls prepare --language en
           python -m mellonella_bench.datasets.mls prepare --language de
           python -m mellonella_bench.datasets.mls prepare --language fr
 
@@ -86,11 +85,12 @@ jobs:
             echo "::warning::HF_TOKEN not set — skipping Emilia-YODAS (ja/ko/zh) prep"
           fi
 
-      - name: Prepare Emilia-YODAS subsets (ja, ko, zh-CN)
+      - name: Prepare Emilia-YODAS subsets (en, ja, ko, zh-CN)
         if: steps.hf.outputs.have_token == 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          python -m mellonella_bench.datasets.emilia prepare --language en
           python -m mellonella_bench.datasets.emilia prepare --language ja
           python -m mellonella_bench.datasets.emilia prepare --language ko
           python -m mellonella_bench.datasets.emilia prepare --language zh-CN
@@ -101,11 +101,11 @@ jobs:
         run: |
           set -euo pipefail
           ARGS=()
-          for lang in en de fr; do
+          for lang in de fr; do
             ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
           done
           if [ "${{ steps.hf.outputs.have_token }}" = "true" ]; then
-            for lang in ja ko zh-CN; do
+            for lang in en ja ko zh-CN; do
               ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
             done
           fi
