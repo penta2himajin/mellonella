@@ -105,10 +105,19 @@ class GatingConfig:
     theta_pass_as_norm: float = 1.5
     """Output gate threshold when :attr:`use_as_norm` is True (z-score scale).
 
-    Initial value is heuristic — proper calibration with the real cohort
-    happens in AS-Norm Phase 3. ``1.5`` corresponds to "target embedding
-    is ~1.5 σ above the top-K impostor distribution", which is the
-    classic operating point in the AS-Norm literature.
+    Initial value (1.5) was a heuristic from the AS-Norm literature ("target
+    embedding ~1.5 σ above the top-K impostor distribution"). Two
+    consecutive PR #23 / #24 CI runs against the cohort-disjoint, cache-
+    frozen Phase 4 setup produced a stable cross-language baseline at this
+    value:
+
+    * TPR mean 0.77-0.79 (worst language fr=0.65)
+    * FPR mean 0.13-0.15 (worst language zh-CN=0.31)
+
+    Both within the FP-tolerant policy (D-001) target. Treat 1.5 as a
+    CI-validated default rather than a heuristic until a future
+    data-driven sweep (``scripts/calibrate.py --use-as-norm``) recommends
+    otherwise.
     """
 
     theta_learn_as_norm: float = 2.5

@@ -416,6 +416,38 @@ python scripts/calibrate.py \
 `GatingConfig.theta_pass_as_norm` のデフォルトに反映する PR を別立てで
 出す (Phase 3 後段)。その後 `scenario_5.yml` の `--fpr-max` を引き締め。
 
+### Phase 3 後段: CI-validated baseline で threshold 引き締め (PR #25)
+
+local sweep を待たず、PR #23/#24 で取れた scenario_5 CI 数値そのものを
+キャリブレーション根拠として採用:
+
+**観測 baseline (cohort-disjoint + cache-frozen, 2 連続 run):**
+
+| Lang | TPR | FPR | Lang | TPR | FPR |
+|---|---|---|---|---|---|
+| de | 0.69-0.76 | 0.22-0.25 | ja | 0.75-0.76 | 0.00-0.03 |
+| en | 0.82-0.83 | 0.00-0.02 | ko | 0.84-0.85 | 0.10-0.32 |
+| fr | 0.65-0.67 | 0.03-0.08 | zh-CN | 0.85-0.87 | 0.31-0.31 |
+| **mean** | **0.77-0.79** | **0.13-0.15** | | | |
+
+判断:
+
+- `theta_pass_as_norm = 1.5` は文献値ヒューリスティックだったが、CI 観測で
+  全言語 TPR ≥ 0.65 / FPR ≤ 0.32 を達成。FP-tolerant 方針 (D-001) の
+  範囲内 → **CI 検証済みデフォルト** として確定。`config.py` の docstring
+  も更新済み。
+- `scenario_5.yml` の hard-fail 閾値を `--tpr-min 0.3 / --fpr-max 0.95`
+  (Phase 4 stopgap) → **`--tpr-min 0.4 / --fpr-max 0.6`** に引き締め。
+  - tpr_min: fr 最悪値 0.65 mean に対し +25pp 余裕
+  - fpr_max: zh-CN 最悪値 0.31 mean に対し +29pp (per-row 変動を吸収)
+- 将来 local sweep (`calibrate.py --use-as-norm`) で更に絞れる余地あり。
+  Phase 3 の calibrate.py 機構自体は既に存在するため (PR #24)、
+  必要になった時点で実行 → 結果を別 PR で反映、で十分。
+
+これで D-010 の現実的なクロージング点。Phase 5 以降の追加最適化
+(Language-Dependent AS-Norm, TAS-Norm, etc.) は **明確な regression が
+出てから** 検討する。
+
 ### 参考文献
 
 - Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with

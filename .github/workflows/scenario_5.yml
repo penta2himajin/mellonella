@@ -159,22 +159,21 @@ jobs:
               ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
             done
           fi
-          # NOTE: --fpr-max temporarily relaxed to 0.95 (was 0.7) at the
-          # D-010 Phase 4 cohort-disjoint fix landing. The previous broken
-          # cohort included the test target/other speakers themselves,
-          # which artificially suppressed FPR via spurious top-K hits.
-          # With cohort/test now properly disjoint the underlying cohort
-          # bias surfaces. PR #22 saw zh-CN per-language FPR drift between
-          # 0.76 and 0.85 across consecutive CI runs (cache-invalidated
-          # streaming pulls different speakers, which feeds back into the
-          # AS-Norm μ/σ); per-row max can exceed 0.85. 0.95 is a stopgap
-          # that catches catastrophic regressions but accepts the current
-          # post-disjoint baseline. Phase 3 (calibrate.py --use-as-norm)
-          # will refit theta_pass_as_norm and tighten this back down.
+          # Thresholds tightened from --tpr-min 0.3 --fpr-max 0.95 (Phase 4
+          # stopgap) to --tpr-min 0.4 --fpr-max 0.6 once the cohort cache
+          # froze at PR #23/#24 and we had two consecutive deterministic
+          # CI runs with stable per-language baselines:
+          #   TPR mean 0.77-0.79 (worst lang fr=0.65)
+          #   FPR mean 0.13-0.15 (worst lang zh-CN=0.31)
+          # Buffer: tpr_min leaves +25pp over fr per-row min estimate;
+          # fpr_max leaves +29pp over zh-CN per-language max-mean. A
+          # data-driven sweep (calibrate.py --use-as-norm) can tighten
+          # further once a local run produces a recommended theta —
+          # see docs/decisions.md D-010 Phase 3 closeout.
           python scripts/scenario_5_from_manifest.py \
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
-            --tpr-min 0.3 --fpr-max 0.95 \
+            --tpr-min 0.4 --fpr-max 0.6 \
             --real-pipeline \
             --as-norm-cohort data/cohorts/scenario5_cohort.npz
 
