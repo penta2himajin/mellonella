@@ -323,6 +323,42 @@ PR #17 の legacy `α·cs + β·f0` ベースラインと、PR #19 の AS-Norm (
    閾値も引き締める (現在 `--tpr-min 0.3 --fpr-max 0.7` は legacy 観測値
    からの 27pp バッファ — Phase 3 完了後に縮められる見込み)。
 
+### Phase 2 後の再観測 (PR #21 cohort 診断 + 構造的バグの発見)
+
+PR #21 で cohort summary を artifact 化した後、PR #19 と PR #21 の cohort
+を比較した結果、**variance はランダム noise ではなく構造的なバグ起因**
+だったことが判明:
+
+1. **cohort が test 話者を含んでいた** (致命的 algorithm 違反):
+   `scenario_5_from_manifest.py` は同じ manifest から target / other を選択し、
+   cohort も同じ manifest から構築されていた。各 manifest は 3 話者しか
+   含んでいなかったため、cohort = {speaker01, 02, 03}、test = 2 of those。
+   → AS-Norm の "impostor cohort" のはずが target/other 自身を含んでおり、
+   z-score 正規化の前提が崩れていた。
+2. **cohort が想定の半分** (18 vs 30): `mls.prepare` / `emilia.prepare` の
+   default `top_speakers=3` で manifests に 3 話者しか入っていなかった。
+   `--per-language 5` を渡しても 3 しか取れない。top-K=10 / 18 = 56% で
+   literature の上限 (10-30%) を大きく超過。
+3. **同名の "speaker01" が run 間で異なる upstream 話者だった**: prepare
+   段階で「streaming で見つかった順」にラベルを振っていたため、HF datasets
+   の並行 IO 由来の順序揺れがそのまま cohort 内訳に伝播していた。
+
+### Phase 4: cohort-disjoint fix (進行中)
+
+Phase 3 (calibrate.py 拡張) の前に、**まず構造的バグを潰す必要がある** ため
+Phase 4 として優先実施:
+
+- `mls.prepare` / `emilia.prepare` の default `top_speakers` を 3 → 10 に
+  引き上げ。各 manifest に 10 話者用意。
+- `scripts/build_impostor_cohort.py` に `--skip-top-n N` 追加。
+  scenario_5 が test に使う rank を cohort から carve out。
+- `.github/workflows/scenario_5.yml` で `--skip-top-n 2 --per-language 8` を
+  渡す。結果: 各言語 8 cohort 話者 = 48 embeddings、top-K=10 = 21%
+  (literature 範囲)、test と完全分離。
+
+これを終えてから Phase 3 の calibrate.py 拡張に着手する。Phase 4 の修正前に
+キャリブレーションしても "壊れた cohort" の上で fitting するだけになる。
+
 ### 参考文献
 
 - Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with

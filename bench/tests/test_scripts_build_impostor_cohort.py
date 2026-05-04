@@ -117,6 +117,59 @@ def test_select_speakers_picks_top_k_by_audio_length(tmp_path):
         assert audio.size == int(3 * 4.0 * 16_000)
 
 
+def test_select_speakers_skips_top_n_to_keep_test_disjoint(tmp_path):
+    """``skip_top_n`` carves out the top-N ranks before slicing.
+
+    When equal-length clips make audio sizes tie, Python's stable sort
+    preserves manifest order. We exploit that by varying ``clips_per_speaker``
+    per speaker (via per-speaker manifest hand-craft) so the ranks are
+    truly distinct and the skip-then-take semantics is testable.
+    """
+    mod = _import_script()
+    sr = 16_000
+    root = tmp_path / "en"
+    root.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(0)
+    clips: list[CommonVoiceClip] = []
+    # speaker count per index: spk0=4, spk1=3, spk2=2, spk3=2, spk4=2 — so the
+    # ranking by audio length is [spk0, spk1, spk2, spk3, spk4] (ties broken by
+    # iteration order).
+    counts = [4, 3, 2, 2, 2]
+    for spk_idx, n_clips in enumerate(counts):
+        sid = f"en_spk{spk_idx:02d}"
+        d = root / sid
+        d.mkdir(parents=True, exist_ok=True)
+        n = int(4.0 * sr)
+        for i in range(n_clips):
+            audio = (
+                0.4 * np.sin(2 * np.pi * (220 + 30 * spk_idx) * np.arange(n) / sr)
+                + 0.05 * rng.standard_normal(n)
+            ).astype(np.float32)
+            rel = Path(sid) / f"{i:03d}.wav"
+            sf.write(str(root / rel), audio, sr)
+            clips.append(CommonVoiceClip(language="en", speaker_id=sid, clip_path=rel, sentence=""))
+    manifest = root / "manifest.csv"
+    write_manifest(clips, manifest)
+
+    # skip_top_n=2 → the cohort should start at rank 2 (en_spk02).
+    selections = mod.select_speakers_for_language(
+        manifest, per_language=2, min_seconds=5.0, skip_top_n=2
+    )
+    assert len(selections) == 2
+    selected_ids = [spk for spk, _ in selections]
+    # spk00 and spk01 should NOT be in the cohort (they're the top-2 ranks
+    # that scenario_5_from_manifest.py would treat as test target / other).
+    assert "en_spk00" not in selected_ids
+    assert "en_spk01" not in selected_ids
+
+
+def test_select_speakers_rejects_negative_skip_top_n(tmp_path):
+    mod = _import_script()
+    manifest = _write_manifest(tmp_path / "en", language="en")
+    with pytest.raises(ValueError):
+        mod.select_speakers_for_language(manifest, per_language=2, min_seconds=5.0, skip_top_n=-1)
+
+
 def test_select_speakers_raises_on_empty_manifest(tmp_path):
     mod = _import_script()
     # 1-speaker manifest with too-short clips → load_speakers_from_manifest

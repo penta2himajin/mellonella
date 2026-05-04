@@ -101,13 +101,25 @@ def select_speakers_for_language(
     *,
     per_language: int,
     min_seconds: float,
+    skip_top_n: int = 0,
 ) -> list[tuple[str, np.ndarray]]:
     """Return up to ``per_language`` (speaker_id, audio) pairs for one manifest.
 
     Speakers are ranked by total concatenated audio length (longest
     first). ``load_speakers_from_manifest`` already drops speakers below
-    ``min_seconds``; the longest few are then taken from the survivors.
+    ``min_seconds``; the next chunk after ``skip_top_n`` ranks is taken
+    from the survivors.
+
+    The ``skip_top_n`` argument exists so an AS-Norm cohort can be built
+    from speakers that are guaranteed disjoint from those used as test
+    target / other in the same scenario_5 run — see
+    ``docs/decisions.md`` D-010 Phase 4 (cohort-disjoint fix). Pass
+    ``skip_top_n = top_speakers_used_by_scenario_5_from_manifest`` (i.e.
+    2 for default ``--top-speakers 2``) so the same rank that scenario_5
+    treats as test gets removed from the cohort.
     """
+    if skip_top_n < 0:
+        raise ValueError("skip_top_n must be >= 0")
     raw = load_speakers_from_manifest(
         manifest_path, SAMPLE_RATE, min_seconds=min_seconds
     )
@@ -118,7 +130,7 @@ def select_speakers_for_language(
         )
     items = [(spk, np.asarray(audio, dtype=np.float32)) for spk, audio in raw.items()]
     items.sort(key=lambda kv: kv[1].size, reverse=True)
-    return items[:per_language]
+    return items[skip_top_n : skip_top_n + per_language]
 
 
 def embed_speakers(
@@ -141,6 +153,7 @@ def build_cohort(
     *,
     per_language: int = DEFAULT_PER_LANGUAGE,
     min_seconds: float = DEFAULT_MIN_SECONDS,
+    skip_top_n: int = 0,
     embed_fn=None,
 ) -> tuple[np.ndarray, list[str], list[str]]:
     """Aggregate per-language selections + their embeddings into a flat cohort.
@@ -149,6 +162,11 @@ def build_cohort(
     is shape ``(N, EMBEDDING_DIM)`` and the metadata lists have length N.
     ``embed_fn`` defaults to a freshly-instantiated
     :class:`mellonella_poc.embedding.EcapaTdnn`; tests inject a mock.
+
+    ``skip_top_n`` is propagated to
+    :func:`select_speakers_for_language` so callers can carve out the
+    top-N ranks (used as scenario_5 test target / other) and route only
+    the lower ranks into the AS-Norm cohort.
     """
     if per_language <= 0:
         raise ValueError("per_language must be > 0")
@@ -166,6 +184,7 @@ def build_cohort(
             spec.manifest,
             per_language=per_language,
             min_seconds=min_seconds,
+            skip_top_n=skip_top_n,
         )
         embeddings = embed_speakers(selections, embed_fn=embed_fn)
         all_embeddings.append(embeddings)
@@ -252,6 +271,17 @@ def main(argv: list[str] | None = None) -> int:
         help=f"speakers to keep per language (default: {DEFAULT_PER_LANGUAGE})",
     )
     parser.add_argument(
+        "--skip-top-n",
+        type=int,
+        default=0,
+        help=(
+            "skip the top-N longest-audio speakers per language before "
+            "filling the cohort. Use this to keep cohort speakers disjoint "
+            "from those scenario_5_from_manifest.py picks as test target / "
+            "other (it sorts by the same audio-length key). Default 0."
+        ),
+    )
+    parser.add_argument(
         "--min-seconds-per-speaker",
         type=float,
         default=DEFAULT_MIN_SECONDS,
@@ -263,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         args.manifest,
         per_language=args.per_language,
         min_seconds=args.min_seconds_per_speaker,
+        skip_top_n=args.skip_top_n,
     )
     save_cohort(embeddings, languages, speaker_ids, args.output)
 

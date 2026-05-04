@@ -47,7 +47,7 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-DEFAULT_TOP_SPEAKERS = 3
+DEFAULT_TOP_SPEAKERS = 10
 DEFAULT_CLIPS_PER_SPEAKER = 4
 
 LANGUAGE_TO_EMILIA_DIR: dict[str, str] = {

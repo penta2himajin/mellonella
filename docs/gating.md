@@ -263,11 +263,16 @@ regression。`docs/decisions.md` D-010「Phase 2 実観測」/`docs/benchmarks.m
 シナリオ 5「Phase 2: AS-Norm 適用後の deltas」参照。default
 `theta_pass_as_norm=1.5` のヒューリスティック値が言語ごと過剰/不足。
 
-Phase 3 (進行中): `scripts/calibrate.py` に AS-Norm 拡張 + per-language sweep
-で `theta_pass_as_norm` を data 駆動で確定。完了後に scenario_5 hard-fail
-閾値も引き締める。
-Phase 4 (任意): C/D/E への拡張、または cohort 拡大 (per-language 5 → 10、
-top-K 10 → 20) — Phase 3 結果次第で要否判断。
+**Phase 4 (cohort-disjoint fix、進行中)**: PR #21 の cohort 診断で構造的
+バグが判明。cohort が test 話者を含んでおり、`mls.prepare`/`emilia.prepare`
+の default 3 話者では cohort も小さすぎた (18 embeddings、top-K=10 = 56%)。
+default を 10 話者に引き上げ、`build_impostor_cohort.py --skip-top-n 2` で
+test 話者を cohort から carve out して構造的に分離する。
+
+Phase 3 (calibrate.py 拡張): Phase 4 で正常な cohort が得られた後に着手。
+壊れた cohort の上でキャリブレーションしても意味がない。
+Phase 5 (任意): C/D/E (Language-Dependent AS-Norm 等) への拡張は Phase 3 後
+に再評価。
 
 ### 実装メモ (Phase 2)
 
