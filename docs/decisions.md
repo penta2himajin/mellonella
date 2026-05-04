@@ -374,6 +374,48 @@ guard** を追加 (PR #23):
 これで Phase 3 の calibrate.py 拡張に進める前提が整った。Phase 4 の修正前に
 キャリブレーションしても "壊れた cohort" の上で fitting するだけになる。
 
+### Phase 3: calibrate.py AS-Norm 拡張 (PR #24)
+
+PR #23 で cohort が CI cache 経由で完全決定的になった後、`scripts/calibrate.py`
+に AS-Norm 経路の sweep を追加した:
+
+- 新 CLI フラグ `--use-as-norm --cohort PATH`。両方必須。
+- 新 sweep 範囲 `THETA_GRID_AS_NORM = (0.5, 0.75, ..., 3.0)`。z-score scale
+  に合わせて 11 段階。legacy の `THETA_GRID` (0.20-0.55、cosine scale) は維持。
+- 出力ファイルが mode で分岐:
+  - legacy → `docs/benchmarks/calibration_{results.csv,summary.json}`
+  - as_norm → `docs/benchmarks/calibration_as_norm_{results.csv,summary.json}`
+- `recommend_theta()` を引数化 (`max_mean_fpr` / `min_tpr_floor`)。AS-Norm 用
+  default は `MAX_MEAN_FPR_AS_NORM = 0.10` (PR #23 の per-language FPR spread
+  が広いため legacy の 0.05 を緩めた)。
+- CSV/summary に `mode` 列を追加。schema_version 1 → 2。
+- ライトユニットテスト (10 件) を `bench/tests/test_scripts_calibrate.py` に追加:
+  theta grid 範囲、`_simulate_gate` の AS-Norm/legacy 分岐、`recommend_theta`
+  の各 fallback、`--use-as-norm` で `--cohort` 必須のチェック。
+
+実行手順 (user 手元):
+
+```bash
+# 1. cohort を build (まだなら)
+python scripts/build_impostor_cohort.py \
+    --manifest en=$MELLONELLA_DATA_DIR/emilia_yodas/en/manifest.csv \
+    --manifest ja=$MELLONELLA_DATA_DIR/emilia_yodas/ja/manifest.csv \
+    --manifest de=$MELLONELLA_DATA_DIR/mls/de/manifest.csv \
+    --skip-top-n 2 --per-language 8 \
+    --output bench/data/cohorts/scenario5_cohort_v1.npz
+
+# 2. AS-Norm calibration sweep (per language で繰り返し or 連結 manifest)
+python scripts/calibrate.py \
+    --use-as-norm \
+    --cohort bench/data/cohorts/scenario5_cohort_v1.npz \
+    --manifest ja=$MELLONELLA_DATA_DIR/emilia_yodas/ja/subset/manifest.csv \
+    --language ja
+```
+
+結果 (`calibration_as_norm_summary.json`) の `recommended_theta_pass` を
+`GatingConfig.theta_pass_as_norm` のデフォルトに反映する PR を別立てで
+出す (Phase 3 後段)。その後 `scenario_5.yml` の `--fpr-max` を引き締め。
+
 ### 参考文献
 
 - Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with
