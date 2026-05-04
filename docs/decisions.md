@@ -263,9 +263,11 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
    `as_norm_top_k` / `theta_pass_as_norm` / `theta_learn_as_norm` 追加、
    `pipeline.process_offline` の score 経路を分岐、CI で cohort
    自動 build → scenario_5 に反映
-3. **Phase 3** (次 PR): `scripts/calibrate.py` に AS-Norm 拡張、
+3. **Phase 3** ✅ (PR #24 + 後段 PR): `scripts/calibrate.py` に AS-Norm 拡張、
    per-language sweep で `theta_pass_as_norm` を data 駆動で確定、
-   scenario_5 hard-fail 閾値引き締め
+   CI 観測値で baseline を文書化。`scenario_5.yml --fpr-max` の引き締めは
+   後述の理由により **見送り** (cohort 規模に起因する run-to-run variance が
+   CI hard-fail を不安定にするため)。
 4. **Phase 4** (任意): C/D/E への拡張、または cohort 拡大 (per-language
    5 → 10、top-K 10 → 20) — Phase 3 の結果次第で要否判断
 
@@ -414,7 +416,64 @@ python scripts/calibrate.py \
 
 結果 (`calibration_as_norm_summary.json`) の `recommended_theta_pass` を
 `GatingConfig.theta_pass_as_norm` のデフォルトに反映する PR を別立てで
-出す (Phase 3 後段)。その後 `scenario_5.yml` の `--fpr-max` を引き締め。
+出す (Phase 3 後段)。その後 `scenario_5.yml` の `--fpr-max` を引き締め予定
+だったが、後述のとおり **CI 観測 variance により今回は見送り**。
+
+### Phase 3 後段: CI baseline 観測と threshold 据え置き判断
+
+PR #24 マージ後、cohort-disjoint + cache-frozen な状態 (PR #22 + #23) で
+複数回 scenario_5 を回し、`theta_pass_as_norm = 1.5` のままどの程度安定
+するかを観察した:
+
+| Run | TPR mean | FPR mean | zh-CN FPR mean | zh-CN per-row max |
+|---|---|---|---|---|
+| PR #23 直後 | 0.79 | 0.15 | 0.31 | 0.62 |
+| PR #24 マージ直後 | 0.77 | 0.13 | 0.31 | ~0.6 |
+| 続き run 1 | 0.74 | 0.11 | 0.34 | 0.71 |
+| 続き run 2 | 0.77 | 0.10 | 0.31 | ~0.6 |
+
+aggregate 値 (TPR mean ~0.77、FPR mean ~0.12) は run 間で ±2-3pp 程度に
+収束しているが、**zh-CN per-row max は 0.6-0.85 で大きく揺れる**。原因は
+Phase 4 で議論した HF datasets streaming の非決定性が cache miss のたびに
+再発し、cohort 構成 (どの 8 話者が ranks 2-9 に入るか) が変わるため、
+AS-Norm の μ/σ がずれて zh-CN の特定 row のみ突き抜ける。
+
+**判断**: `--fpr-max` を観測 baseline に合わせて引き締める (例 0.95 → 0.4)
+と PR #25 で実証されたとおり 1-2 run に 1 回 hard-fail し、CI が
+"AS-Norm の真の regression 検出" ではなく "cohort cache の世代差による
+ノイズ" を拾うようになる。Phase 3 完了の意味付けを **「閾値引き締め」**
+ではなく **「閾値の data 駆動候補値の特定 + CI 観測値の文書化」** に
+変更する:
+
+- `theta_pass_as_norm = 1.5` は CI baseline (PR #23-25 で TPR mean 0.77、
+  FPR mean 0.13 前後) を達成する spec として確定。
+- `scenario_5.yml --fpr-max 0.95` は据え置き。catastrophic regression
+  (例: cohort が壊れて FPR > 0.9) を catch する safety net としては
+  機能するが、この緩さは **conscious choice** で、Phase 4 で cohort 規模を
+  拡大して variance を抑えるまでは tightening しない。
+- 真の data 駆動 calibration (Phase 3 当初目標) は cohort 規模が
+  literature 推奨の 50-100 spk/lang に達してから再走する。現在の
+  per-language 8 spk = 48 cohort embeddings は足元の variance を切るには
+  小さすぎる。
+
+### Phase 3 補足: ローカル sweep による mechanism 検証
+
+ユーザー手元 (mvenv: torch 2.4.1+cpu, speechbrain 1.1.0, DeepFilterNet
+0.5.6) で `scripts/calibrate.py --use-as-norm --cohort cohort_v1.npz` を
+108 cells × 11 θ で 8.5 分かけて流し、`_simulate_gate` の AS-Norm 経路、
+`recommend_theta` の AS-Norm 専用 budget (0.10)、CSV/summary の
+`mode=as_norm` 出力を end-to-end で確認した。**ただしこの sweep の
+recommended θ (= 3.0) は production 値として採用しない**:
+
+- ローカル cohort = MLS de + fr (2 言語、16 話者)、test = librosa libri 英語。
+- cohort 言語と test 言語が disjoint な構図で、AS-Norm の μ がそもそも
+  低めに出るため全 θ で FPR ≫ 0.10 になり、`recommend_theta` の
+  fallback 経路 (= 最厳の θ) で 3.0 が選ばれている。
+- production の cohort は 6 言語 48 話者、test との overlap も含めた
+  実分布なので意味が違う。
+
+ローカル sweep の役割は **「コードが落ちずに end-to-end 動く」** の確認に
+留め、production 値の決定は Phase 3 後段 (上記表) で行った。
 
 ### 参考文献
 
