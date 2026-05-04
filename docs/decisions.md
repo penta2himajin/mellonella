@@ -444,6 +444,27 @@ local sweep を待たず、PR #23/#24 で取れた scenario_5 CI 数値そのも
   Phase 3 の calibrate.py 機構自体は既に存在するため (PR #24)、
   必要になった時点で実行 → 結果を別 PR で反映、で十分。
 
+#### Local sweep による機構検証 (参考)
+
+PR #25 までに `scripts/calibrate.py --use-as-norm` を local 環境で 1 度回し、
+end-to-end の動作確認を済ませた:
+
+- 実行時間: 108 cells (3 spk × 3 spk × 2 noise × 6 SNR) × 11 θ = 1188 rows、
+  ECAPA + DFN3 で約 8.5 分。
+- 設定: cohort=MLS de+fr (16 embeddings)、test=librosa libri1/2/3 (英語)。
+- 結果: 全 θ で `fpr_mean ≥ 0.19`、推奨 θ=3.0 (fallback、FPR budget を
+  満たす θ なし)。`tpr_med` は全 θ で 0.857 一定。
+
+ただしこの数値は **production 適用不可**: cohort と test の言語が不整合
+(cohort=de/fr の欧州語、test=英語) のため AS-Norm μ/σ の参照点が偏り、
+FPR が下がりきらない。production 用の sweep には CI と同じ multi-lingual
+cohort (en/de/fr/ja/ko/zh-CN) + 同言語の test ペアが必要 (Emilia 利用 →
+`HF_TOKEN` 必須)。
+
+この local 実走で確認できたのは「機構が end-to-end で動く」ことのみ。
+production の `theta_pass_as_norm` 確定は引き続き CI baseline (1.5) を
+採用する。
+
 これで D-010 の現実的なクロージング点。Phase 5 以降の追加最適化
 (Language-Dependent AS-Norm, TAS-Norm, etc.) は **明確な regression が
 出てから** 検討する。
