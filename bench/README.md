@@ -48,7 +48,7 @@ mellonella-bench --real-pipeline --output benchmark_results/...
 | scenario_2 | Solo other speaker + noise; TNR / FPR | wired |
 | scenario_3 | Alternating target ⇄ other; frame accuracy + onset/offset latency | wired |
 | scenario_4 | Simultaneous target + other; FP-tolerant behaviour (target-to-other ratio sweep) | wired |
-| scenario_5 | Multilingual robustness | TODO |
+| scenario_5 | Multilingual robustness; per-language TPR/FPR + cross-language stddev | wired |
 | scenario_6 | Long-running drift verification (auto-learn) | wired |
 
 ## Datasets
