@@ -53,9 +53,7 @@ def _make_item(tmp_path, *, sample_id: str, language: str, sr: int = 16_000) -> 
 def test_evaluate_one_emits_two_rows_per_snr(tmp_path):
     sr = 16_000
     item = _make_item(tmp_path, sample_id="utt_en_001", language="en", sr=sr)
-    rows = evaluate_one(
-        item, StubPipelineProvider(), sample_rate=sr, snrs_db=(0.0, 10.0)
-    )
+    rows = evaluate_one(item, StubPipelineProvider(), sample_rate=sr, snrs_db=(0.0, 10.0))
     assert len(rows) == 4
     modes = [r.notes for r in rows]
     assert modes == ["mode=target", "mode=other", "mode=target", "mode=other"]
