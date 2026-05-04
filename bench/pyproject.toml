@@ -21,6 +21,13 @@ metrics = [
     "pesq>=0.0.4",
     "pystoi>=0.4",
 ]
+hf = [
+    # datasets 4.x switched audio decoding to torchcodec, which requires
+    # torch >= 2.5 — incompatible with the DFN3 pin (poc requires torch<2.5).
+    # 3.x still uses soundfile/librosa, which is what we need.
+    "datasets>=2.14,<4.0",
+    "huggingface_hub>=0.20",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

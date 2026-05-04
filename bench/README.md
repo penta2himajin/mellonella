@@ -57,12 +57,56 @@ The downloaders live in `mellonella_bench/datasets/`. They write under
 `$MELLONELLA_DATA_DIR` (default `./data/`). Each downloader is idempotent;
 warm caches are reused. See the per-script docstring for licence terms.
 
-### CommonVoice (multi-lingual)
+### MLS — non-English European languages (CI-default)
 
-Mozilla CommonVoice (`CC0-1.0`) is the canonical multi-language source for
-Phase 2 / Scenario 5 work. URLs are signed and the corpus is multi-GB, so
-the script does not auto-download — fetch the per-language tarball
-manually from <https://commonvoice.mozilla.org/> and pass its path:
+`facebook/multilingual_librispeech` (`CC-BY 4.0`, ungated) covers seven
+European languages — de, fr, es, it, nl, pl, pt — with real per-clip
+`speaker_id`. **English was dropped from the HF repo at the parquet
+migration**, so `en` is routed through Emilia-YODAS instead. The
+`bench[hf]` extra adds `datasets` so the streaming-prep step works
+without a local download:
+
+```bash
+pip install -e bench[hf]
+python -m mellonella_bench.datasets.mls prepare --language de
+python -m mellonella_bench.datasets.mls prepare --language fr
+# also: es, it, nl, pl, pt
+```
+
+Output lands at `$MELLONELLA_DATA_DIR/mls/<lang>/manifest.csv` plus
+`speakerNN/*.wav` directories. The CI workflow caches this materially.
+
+### Emilia-YODAS — Asian languages + English (gated, requires `HF_TOKEN`)
+
+`amphion/Emilia-Dataset` (`CC-BY 4.0` for the `Emilia-YODAS` shards;
+the parent dataset has a CC-BY-NC half — we explicitly load YODAS
+only) covers en / ja / ko / zh-CN / de / fr with real `speaker` labels.
+This is also the source CI uses for **English** since MLS dropped its
+`english` config.
+The repo is HF-gated: agree to the dataset ToS once at
+<https://huggingface.co/datasets/amphion/Emilia-Dataset>, generate a
+read token, and export it:
+
+```bash
+export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python -m mellonella_bench.datasets.emilia prepare --language ja
+python -m mellonella_bench.datasets.emilia prepare --language ko
+python -m mellonella_bench.datasets.emilia prepare --language zh-CN
+```
+
+In CI the token is wired via the `HF_TOKEN` repository secret; the
+`scenario-5` workflow auto-skips Emilia prep on PRs from forks (where
+secrets aren't exposed) but still runs MLS for European coverage.
+
+### CommonVoice — local-only (Mozilla migrated to a paid platform Oct-2025)
+
+Mozilla CommonVoice was the original Scenario 5 source but is no longer
+freely re-distributable: as of October 2025 the corpus moved to the
+[Mozilla Data Collective](https://datacollective.mozillafoundation.org)
+behind a paid access model, and the HuggingFace mirrors were removed.
+The `mellonella_bench.datasets.commonvoice` module still works against a
+locally-downloaded archive (the user must obtain it themselves) and
+remains the recommended path for finer per-speaker calibration:
 
 ```bash
 python -m mellonella_bench.datasets.commonvoice prepare \
@@ -70,10 +114,8 @@ python -m mellonella_bench.datasets.commonvoice prepare \
     --archive ~/Downloads/cv-corpus-19.0-2024-09-13-ja.tar.gz
 ```
 
-This extracts under `$MELLONELLA_DATA_DIR/commonvoice/<lang>/`, picks the
-top-K most-clipped speakers (default 10) with N clips each (default 20),
-and writes a flat `subset/manifest.csv` for downstream calibration. The
-calibrate scripts will be extended to read this manifest in a follow-up.
+Output is written under `$MELLONELLA_DATA_DIR/commonvoice/<lang>/` with
+the same per-speaker manifest schema as MLS / Emilia-YODAS.
 
 #### Running scenario_5 against the manifests
 
@@ -87,15 +129,20 @@ for hard-fail CI gates.
 
 ```bash
 python scripts/scenario_5_from_manifest.py \
-    --manifest ja=$MELLONELLA_DATA_DIR/commonvoice/ja/subset/manifest.csv \
-    --manifest en=$MELLONELLA_DATA_DIR/commonvoice/en/subset/manifest.csv \
+    --manifest en=$MELLONELLA_DATA_DIR/mls/en/manifest.csv \
+    --manifest de=$MELLONELLA_DATA_DIR/mls/de/manifest.csv \
+    --manifest ja=$MELLONELLA_DATA_DIR/emilia_yodas/ja/manifest.csv \
     --output benchmark_results/scenario_5/$(date +%Y%m%d_%H%M%S) \
     --tpr-min 0.5 --fpr-max 0.5 \
     --real-pipeline
 ```
 
 Drop `--real-pipeline` to exercise the wiring with the deterministic stub
-(useful for CI smoke tests when CommonVoice data is not available).
+(useful for CI smoke tests when no real data is available).
+
+The `.github/workflows/scenario_5.yml` GitHub Action runs this end-to-end
+on every push / PR (uses MLS for European coverage; auto-includes
+Emilia-YODAS ja/ko/zh-CN when `HF_TOKEN` is configured).
 
 ## Metrics
 
