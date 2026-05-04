@@ -255,10 +255,19 @@ python scripts/build_impostor_cohort.py \
 ### 段階的導入
 
 Phase 1 ✅ (PR #18): cohort build script + docs。
-Phase 2 ✅ (本 PR): `gating.py` に AS-Norm 実装、`GatingConfig` 拡張、
+Phase 2 ✅ (PR #19): `gating.py` に AS-Norm 実装、`GatingConfig` 拡張、
 `pipeline.process_offline` 分岐、CI で cohort 自動 build → scenario_5 に反映。
-Phase 3: AS-Norm 有効状態で baseline 計測、`theta_pass_as_norm` 最終キャリブ、
-scenario_5 hard-fail 閾値引き締め。
+**Phase 2 実観測**: ja TPR が 0.67 → 0.85 (+18pp) で取りこぼし問題解消、
+ただし zh-CN FPR が 0.23 → 0.42 (+19pp) と悪化、de TPR も -8pp の新規
+regression。`docs/decisions.md` D-010「Phase 2 実観測」/`docs/benchmarks.md`
+シナリオ 5「Phase 2: AS-Norm 適用後の deltas」参照。default
+`theta_pass_as_norm=1.5` のヒューリスティック値が言語ごと過剰/不足。
+
+Phase 3 (進行中): `scripts/calibrate.py` に AS-Norm 拡張 + per-language sweep
+で `theta_pass_as_norm` を data 駆動で確定。完了後に scenario_5 hard-fail
+閾値も引き締める。
+Phase 4 (任意): C/D/E への拡張、または cohort 拡大 (per-language 5 → 10、
+top-K 10 → 20) — Phase 3 結果次第で要否判断。
 
 ### 実装メモ (Phase 2)
 
