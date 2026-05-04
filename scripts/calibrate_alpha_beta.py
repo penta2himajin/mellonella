@@ -33,8 +33,6 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import lfilter, resample_poly
-
 from mellonella_poc.config import AudioConfig, Config, GatingConfig
 from mellonella_poc.gating import GateState
 from mellonella_poc.pipeline import (
@@ -42,17 +40,14 @@ from mellonella_poc.pipeline import (
     enroll_from_recording,
     process_offline,
 )
+from scipy.signal import lfilter, resample_poly
 
 SAMPLE_RATE = 16_000
 SPEAKERS: tuple[str, ...] = ("libri1", "libri2", "libri3")
 NOISE_TYPES: tuple[str, ...] = ("white", "pink")
 SNRS_DB: tuple[float, ...] = (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0)
-ALPHA_GRID: tuple[float, ...] = tuple(
-    round(0.0 + 0.1 * i, 2) for i in range(11)
-)  # 0.0..1.0
-THETA_GRID: tuple[float, ...] = tuple(
-    round(0.20 + 0.05 * i, 3) for i in range(8)
-)  # 0.20..0.55
+ALPHA_GRID: tuple[float, ...] = tuple(round(0.0 + 0.1 * i, 2) for i in range(11))  # 0.0..1.0
+THETA_GRID: tuple[float, ...] = tuple(round(0.20 + 0.05 * i, 3) for i in range(8))  # 0.20..0.55
 SEED = 0
 MIN_REPRESENTATIVE_SNR_DB = 5.0
 MAX_MEAN_FPR = 0.05
@@ -77,6 +72,26 @@ def _load_speaker(name: str) -> np.ndarray:
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
     return _to_target_sr(np.asarray(audio, dtype=np.float32), int(sr), SAMPLE_RATE)
+
+
+def _load_speakers_from_librosa() -> tuple[dict[str, np.ndarray], str]:
+    return {name: _load_speaker(name) for name in SPEAKERS}, "en"
+
+
+def _load_speakers_from_manifest(
+    manifest_path: Path,
+    language: str,
+) -> tuple[dict[str, np.ndarray], str]:
+    from mellonella_bench.datasets.commonvoice import load_speakers_from_manifest
+
+    raw = load_speakers_from_manifest(manifest_path, SAMPLE_RATE)
+    speakers = {name: np.asarray(audio, dtype=np.float32) for name, audio in raw.items()}
+    if not speakers:
+        raise ValueError(
+            f"manifest {manifest_path} yielded zero usable speakers "
+            f"(after the min-duration filter)"
+        )
+    return speakers, language
 
 
 def _make_noise(kind: str, n_samples: int, rng: np.random.Generator) -> np.ndarray:
@@ -121,10 +136,24 @@ def _simulate_gate(
     )
 
 
-def measure_cells() -> list[dict[str, float | str]]:
-    """Run every cell once, sweep (α, θ) post-hoc, return one row per combination."""
-    print(f"[alpha-beta] loading {len(SPEAKERS)} speakers from librosa...")
-    speakers = {name: _load_speaker(name) for name in SPEAKERS}
+def measure_cells(
+    speakers: dict[str, np.ndarray] | None = None,
+    language: str = "en",
+) -> list[dict[str, float | str]]:
+    """Run every cell once, sweep (α, θ) post-hoc, return one row per combination.
+
+    ``speakers`` overrides the default librosa libri1/2/3 source — pass a
+    dict produced by ``mellonella_bench.datasets.commonvoice
+    .load_speakers_from_manifest`` to drive the sweep with CommonVoice
+    multi-language data.
+    """
+    if speakers is None:
+        speakers, language = _load_speakers_from_librosa()
+    speaker_names = list(speakers)
+    print(
+        f"[alpha-beta] using {len(speaker_names)} speakers "
+        f"(language={language!r}): {', '.join(speaker_names)}"
+    )
     for name, a in speakers.items():
         print(f"  {name}: {a.size / SAMPLE_RATE:.2f}s @ {SAMPLE_RATE} Hz")
 
@@ -148,12 +177,10 @@ def measure_cells() -> list[dict[str, float | str]]:
 
     rows: list[dict[str, float | str]] = []
     cells: list[tuple[str, str, str, float]] = list(
-        itertools.product(SPEAKERS, SPEAKERS, NOISE_TYPES, SNRS_DB)
+        itertools.product(speaker_names, speaker_names, NOISE_TYPES, SNRS_DB)
     )
     n_cells = len(cells)
-    print(
-        f"[alpha-beta] running {n_cells} cells × {len(ALPHA_GRID)} α × {len(THETA_GRID)} θ..."
-    )
+    print(f"[alpha-beta] running {n_cells} cells × {len(ALPHA_GRID)} α × {len(THETA_GRID)} θ...")
     t_start = time.perf_counter()
 
     for idx, (enroll_name, test_name, noise_kind, snr_db) in enumerate(cells, 1):
@@ -177,6 +204,7 @@ def measure_cells() -> list[dict[str, float | str]]:
                 rate = float(gate.mean()) if gate.size else 0.0
                 rows.append(
                     {
+                        "language": language,
                         "enroll": enroll_name,
                         "test": test_name,
                         "noise": noise_kind,
@@ -201,6 +229,7 @@ def measure_cells() -> list[dict[str, float | str]]:
 def write_results_csv(rows: list[dict[str, float | str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "language",
         "enroll",
         "test",
         "noise",
@@ -214,7 +243,7 @@ def write_results_csv(rows: list[dict[str, float | str]], path: Path) -> None:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for r in rows:
-            writer.writerow(r)
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
 
 
 def aggregate(
@@ -272,6 +301,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip the pipeline sweep; re-aggregate the existing results CSV",
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help=(
+            "CommonVoice subset manifest.csv to drive speaker selection. "
+            "When omitted, uses the librosa libri1/2/3 default."
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="en",
+        help="Language tag recorded in every output row (default: en)",
+    )
     args = parser.parse_args(argv)
 
     if args.from_csv:
@@ -281,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         with args.results_csv.open() as fh:
             rows = [
                 {
+                    "language": r.get("language", "en"),
                     "enroll": r["enroll"],
                     "test": r["test"],
                     "noise": r["noise"],
@@ -294,18 +339,18 @@ def main(argv: list[str] | None = None) -> int:
             ]
         print(f"[alpha-beta] re-aggregating {len(rows)} rows from {args.results_csv}")
     else:
-        rows = measure_cells()
+        if args.manifest is not None:
+            speakers, language = _load_speakers_from_manifest(args.manifest, args.language)
+        else:
+            speakers, language = _load_speakers_from_librosa()
+        rows = measure_cells(speakers=speakers, language=language)
         write_results_csv(rows, args.results_csv)
         print(f"\n[alpha-beta] wrote {len(rows)} rows to {args.results_csv}")
 
     summary = aggregate(rows)
     recommended = recommend(summary)
-    print(
-        f"\n[alpha-beta] per-(α, θ) aggregate (snr ≥ {MIN_REPRESENTATIVE_SNR_DB:.0f} dB):"
-    )
-    print(
-        f"  {'α':>5} {'θ':>6} {'tpr_med':>9} {'fpr_med':>9} {'tpr_mean':>10} {'fpr_mean':>10}"
-    )
+    print(f"\n[alpha-beta] per-(α, θ) aggregate (snr ≥ {MIN_REPRESENTATIVE_SNR_DB:.0f} dB):")
+    print(f"  {'α':>5} {'θ':>6} {'tpr_med':>9} {'fpr_med':>9} {'tpr_mean':>10} {'fpr_mean':>10}")
     for (alpha, theta), m in sorted(summary.items()):
         marker = ""
         if recommended is not None and (alpha, theta) == recommended:
