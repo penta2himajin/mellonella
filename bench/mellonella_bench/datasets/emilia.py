@@ -87,7 +87,7 @@ def _extract_audio(sample: dict[str, Any]) -> tuple[np.ndarray, int]:
         raise KeyError("emilia sample missing audio (mp3/audio/flac)")
     if isinstance(blob, dict) and "array" in blob:
         return np.asarray(blob["array"], dtype=np.float32), int(blob["sampling_rate"])
-    if isinstance(blob, (bytes, bytearray)):
+    if isinstance(blob, bytes | bytearray):
         audio, sr = sf.read(io.BytesIO(blob), dtype="float32", always_2d=False)
         return np.asarray(audio, dtype=np.float32), int(sr)
     raise TypeError(f"unsupported emilia audio payload type: {type(blob)!r}")
