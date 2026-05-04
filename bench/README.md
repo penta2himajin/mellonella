@@ -75,6 +75,28 @@ top-K most-clipped speakers (default 10) with N clips each (default 20),
 and writes a flat `subset/manifest.csv` for downstream calibration. The
 calibrate scripts will be extended to read this manifest in a follow-up.
 
+#### Running scenario_5 against the manifests
+
+`scripts/scenario_5_from_manifest.py` chains the manifest output into the
+multilingual robustness scenario. It picks the top-N speakers per
+language, materialises target / other / noise wavs to a working dir,
+runs `scenario_5`, and emits per-row stats plus a `failures.json` that
+lists every (item, SNR, mode) below the configured TPR/FPR thresholds —
+non-zero exit when any threshold is violated, so the script is suitable
+for hard-fail CI gates.
+
+```bash
+python scripts/scenario_5_from_manifest.py \
+    --manifest ja=$MELLONELLA_DATA_DIR/commonvoice/ja/subset/manifest.csv \
+    --manifest en=$MELLONELLA_DATA_DIR/commonvoice/en/subset/manifest.csv \
+    --output benchmark_results/scenario_5/$(date +%Y%m%d_%H%M%S) \
+    --tpr-min 0.5 --fpr-max 0.5 \
+    --real-pipeline
+```
+
+Drop `--real-pipeline` to exercise the wiring with the deterministic stub
+(useful for CI smoke tests when CommonVoice data is not available).
+
 ## Metrics
 
 | Module | Indicator | Implementation |
