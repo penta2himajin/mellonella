@@ -1,0 +1,124 @@
+name: scenario-5
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  MELLONELLA_DATA_DIR: ${{ github.workspace }}/data
+
+jobs:
+  scenario-5:
+    name: scenario_5 (multilingual robustness; MLS + Emilia-YODAS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Fork PRs do not see secrets — skip there so contributors aren't blocked
+    # by an obviously-failing required check. Push to main + same-repo PRs run
+    # the full thing.
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system audio deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsndfile1 ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+
+      - name: Install poc[models] + bench[hf] (CPU torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e "poc[models]"
+          pip install -e "bench[hf]"
+
+      - name: Cache HF + SpeechBrain + DFN3 model downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/mellonella
+            ~/.cache/librosa
+            ~/.cache/DeepFilterNet
+          key: scenario5-models-v1-${{ runner.os }}-${{ hashFiles('poc/pyproject.toml') }}
+          restore-keys: |
+            scenario5-models-v1-${{ runner.os }}-
+
+      - name: Cache MLS + Emilia subset materials
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: scenario5-data-v1-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py') }}
+          restore-keys: |
+            scenario5-data-v1-${{ runner.os }}-
+
+      # ---- Prepare per-language subsets ----
+      # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
+      # HF_TOKEN is configured. Either path's manifest is reused on warm cache.
+
+      - name: Prepare MLS subsets (en, de, fr)
+        run: |
+          python -m mellonella_bench.datasets.mls prepare --language en
+          python -m mellonella_bench.datasets.mls prepare --language de
+          python -m mellonella_bench.datasets.mls prepare --language fr
+
+      - name: Check HF_TOKEN availability
+        id: hf
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -n "$HF_TOKEN" ]; then
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HF_TOKEN not set — skipping Emilia-YODAS (ja/ko/zh) prep"
+          fi
+
+      - name: Prepare Emilia-YODAS subsets (ja, ko, zh-CN)
+        if: steps.hf.outputs.have_token == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m mellonella_bench.datasets.emilia prepare --language ja
+          python -m mellonella_bench.datasets.emilia prepare --language ko
+          python -m mellonella_bench.datasets.emilia prepare --language zh-CN
+
+      # ---- Build the --manifest argument list dynamically and run scenario_5 ----
+
+      - name: Run scenario_5 against all available manifests
+        run: |
+          set -euo pipefail
+          ARGS=()
+          for lang in en de fr; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
+          done
+          if [ "${{ steps.hf.outputs.have_token }}" = "true" ]; then
+            for lang in ja ko zh-CN; do
+              ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
+            done
+          fi
+          python scripts/scenario_5_from_manifest.py \
+            "${ARGS[@]}" \
+            --output benchmark_results/scenario_5 \
+            --tpr-min 0.3 --fpr-max 0.7 \
+            --real-pipeline
+
+      - name: Upload scenario_5 outputs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-5-results
+          path: benchmark_results/scenario_5/
+          retention-days: 30

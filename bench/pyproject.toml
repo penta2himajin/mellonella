@@ -21,6 +21,10 @@ metrics = [
     "pesq>=0.0.4",
     "pystoi>=0.4",
 ]
+hf = [
+    "datasets>=2.14",
+    "huggingface_hub>=0.20",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
