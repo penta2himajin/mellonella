@@ -172,6 +172,12 @@ def test_save_and_load_roundtrip(tmp_path):
     assert summary["n_embeddings"] == 4
     assert summary["embedding_dim"] == EMBEDDING_DIM
     assert summary["per_language_counts"] == {"de": 1, "en": 2, "ja": 1}
+    # New diagnostic field: per-language ordered speaker_id list.
+    assert summary["selected_speakers"] == {
+        "de": ["C"],
+        "en": ["A", "B"],
+        "ja": ["D"],
+    }
 
     loaded_emb, loaded_langs, loaded_spks = mod.load_cohort(out)
     assert np.allclose(loaded_emb, embeddings)

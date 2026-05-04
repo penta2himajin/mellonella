@@ -206,6 +206,17 @@ def save_cohort(
             lang: int(sum(1 for x in languages if x == lang))
             for lang in sorted(set(languages))
         },
+        # Per-language ordered list of upstream speaker IDs that fed the
+        # cohort, for run-to-run diff inspection. Without this, AS-Norm
+        # variance investigations (per `docs/decisions.md` D-010 Phase 2
+        # follow-up) need to crack open the .npz to see what changed —
+        # making the artifact upload from CI low-signal.
+        "selected_speakers": {
+            lang: [
+                speaker_ids[i] for i in range(len(languages)) if languages[i] == lang
+            ]
+            for lang in sorted(set(languages))
+        },
     }
     output_path.with_suffix(".json").write_text(json.dumps(summary, indent=2))
 
@@ -262,6 +273,14 @@ def main(argv: list[str] | None = None) -> int:
                 "embedding_dim": int(embeddings.shape[1]),
                 "per_language_counts": {
                     lang: int(sum(1 for x in languages if x == lang))
+                    for lang in sorted(set(languages))
+                },
+                "selected_speakers": {
+                    lang: [
+                        speaker_ids[i]
+                        for i in range(len(languages))
+                        if languages[i] == lang
+                    ]
                     for lang in sorted(set(languages))
                 },
                 "output": str(args.output),
