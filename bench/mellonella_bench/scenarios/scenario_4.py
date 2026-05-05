@@ -2,7 +2,7 @@
 
     INPUT:  target_speaker_audio + other_speaker_audio mixed at a range of
             target-to-other ratios
-    EXPECT: gate passes whenever the target component is audible (FP 許容方針)
+    EXPECT: gate passes whenever the target component is audible (FP-tolerant policy)
             even if the other speaker leaks through
 
 Per ``docs/benchmarks.md`` Scenario 4 / ``docs/evaluation.md`` §Scenario 4

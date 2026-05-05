@@ -169,7 +169,7 @@ plt.show()
 # ## Take-away
 #
 # A reasonable operating point keeps TPR > 0.85 while FPR < 0.20. Per
-# `docs/gating.md` we explicitly accept FP > FN ("FP 許容方針") for the
+# `docs/gating.md` we explicitly accept FP > FN (the "FP-tolerant policy") for the
 # single-speaker target case, so a slightly tighter `θ_pass` than the EER
 # crossing is usually preferred.
 #

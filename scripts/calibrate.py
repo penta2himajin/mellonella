@@ -17,7 +17,7 @@ Two calibration modes share this driver (D-010 Phase 3):
   :data:`THETA_GRID_AS_NORM` (0.5-3.0, 0.25 step). Outputs to
   ``docs/benchmarks/calibration_as_norm_{results.csv,summary.json}``.
 
-Recommendation policy (per ``docs/gating.md`` D-004 "FP 許容方針"):
+Recommendation policy (per ``docs/gating.md`` D-004, the FP-tolerant policy):
 the docs explicitly accept FP > FN for the single-target case, so we
 pick the **smallest θ whose mean FPR across all (speaker pair, noise,
 SNR ≥ 5dB) cells stays at or below the budget**. This maximises
