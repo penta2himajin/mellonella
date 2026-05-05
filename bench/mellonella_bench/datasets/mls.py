@@ -57,6 +57,11 @@ LANGUAGE_TO_MLS_CONFIG: dict[str, str] = {
     "pt": "portuguese",
 }
 SUPPORTED_LANGUAGES = tuple(LANGUAGE_TO_MLS_CONFIG)
+DATASET_REPO = "facebook/multilingual_librispeech"
+# Pin the upstream revision so streaming iteration is reproducible across
+# CI runs even when GitHub Actions cache misses force a fresh manifest
+# rebuild. Bump this when we knowingly want to pick up upstream changes.
+DATASET_REVISION = "2e83e61823b4c47dcbcb1980bb88601274127609"
 
 
 def _resample_to_target(audio: np.ndarray, src_sr: int) -> np.ndarray:
@@ -144,10 +149,11 @@ def prepare(
     # is no longer accepted (and not needed). The English config was also dropped
     # in the migration — see LANGUAGE_TO_MLS_CONFIG below.
     ds = load_dataset(
-        "facebook/multilingual_librispeech",
+        DATASET_REPO,
         config,
         split=split,
         streaming=True,
+        revision=DATASET_REVISION,
     )
 
     # Scan a fixed window and over-collect clips per speaker. We don't

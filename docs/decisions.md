@@ -269,14 +269,18 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
    後述の理由により **見送り** (cohort 規模に起因する run-to-run variance が
    CI hard-fail を不安定にするため)。
 4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + actions/cache 化
-5. **Phase 5** ✅ (本 PR): cohort 決定化 — `mls.prepare` / `emilia.prepare`
-   の streaming-arrival 依存ラベル割当を撤廃し、speaker は upstream id
-   lex 順、clip は audio sha1 順で選択。同じ split に対して常に
-   bit-identical な manifest を出力し、Phase 4 cache の "miss 時に別 cohort"
-   弱点を塞ぐ。
+5. **Phase 5** ✅ (PR #27 + PR #28): cohort 決定化 +
+   HF stream 入力 pin。PR #27 で `mls.prepare` / `emilia.prepare`
+   の選択ロジックを決定化 (speaker は upstream id lex 順、clip は
+   `(-len, sha1)` 順)。PR #28 で HF stream 入力自体を pin —
+   `load_dataset(..., revision=<commit_sha>)` + Emilia は HfApi で
+   shard 一覧を取得 → lex sort して `data_files=` に明示。これで
+   manifest は cache 状態に依らず bit-identical。**threshold tightening
+   は別 PR に分離**: pin 後の安定 baseline を一度観測してから
+   `--fpr-max < --tpr-min` 不変条件付きで設定する。
 6. **Phase 6** (任意): cohort 拡大 (per-language 8 → 50-100、top-K 10 → 20-30)、
-   `--fpr-max` 引き締め、別 scenario への AS-Norm 横展開 — 規模拡大が
-   実現してから再開
+   別 scenario への AS-Norm 横展開、theta_pass_as_norm の data 駆動再
+   calibration — 規模拡大が実現してから再開
 
 ### Phase 2 の設計ノート
 
@@ -539,6 +543,62 @@ audio 長が tied な 4 話者から lex 上位 2 が選ばれることを asser
   cohort" の弱点が消える。
 - これで cohort 規模拡大 (Phase 4 当初目標) や `--fpr-max` 引き締め
   (Phase 3 後段で見送り) を、再現可能な baseline の上で再開できる。
+
+### Phase 5 後段: HF revision pin (true idempotency)
+
+PR #27 マージ後に PR #28 で `--tpr-min 0.60 --fpr-max 0.55` の引き締めを
+試みた CI で 2/48 row 失敗を観測 (per-language では fr FPR mean 0.414、
+ja TPR mean 0.793、gate 全体は TPR mean 0.828 / FPR mean 0.118 で健全)。
+Phase 5 が「`mls.prepare` / `emilia.prepare` の選択ロジックを決定化」と
+謳っていたのに何故 baseline が再現しないのかを掘ると、**HF stream 入力
+自体が固定されていない** という穴が残っていた:
+
+1. `load_dataset(...)` の `revision` 引数が unset → 暗黙に upstream の
+   `main` HEAD を解決。次に dataset が更新されると静かに別 universe
+   になる。
+2. Emilia は `data_files={"train": "Emilia-YODAS/JA/*.tar"}` という glob
+   を渡していたが、HF datasets 内部の `resolve_pattern`
+   (`src/datasets/data_files.py`) は `fs.glob(...).items()` を直接消費し
+   ていて **直後に `sorted()` が無い**。matching tar の順序は
+   fsspec/HfFileSystem 実装任せで契約上は不定。
+3. PR #27 が固定したのは「同じ stream 入力 → 同じ manifest」だけで、
+   stream 入力そのものの再現性は射程外だった。
+
+**修正** (PR #28):
+
+- `bench/mellonella_bench/datasets/{mls,emilia}.py` に
+  `DATASET_REVISION` 定数 (commit SHA) を追加し、`load_dataset(...,
+  revision=DATASET_REVISION)` で pin。
+  - MLS: `facebook/multilingual_librispeech@2e83e61823b4c47dcbcb1980bb88601274127609`
+    (2024-08-12)
+  - Emilia: `amphion/Emilia-Dataset@d7f2f7340a6385696f3766c8049fa920a4707c07`
+    (2025-02-28)
+- Emilia の glob を撤廃。`HfApi().list_repo_files(...,
+  revision=DATASET_REVISION)` で shard 一覧を取得 → lex sort →
+  `data_files={"train": shards}` で明示的に pinned-and-sorted な順序
+  を `load_dataset` に渡す。これで shard 入力順は
+  `(DATASET_REPO, DATASET_REVISION, language)` のみの関数になる。
+- `scenario_5.yml` の cache key を v4 → v5 に bump。pre-pin 時代に
+  unsorted glob で構築されていた v4 manifest cache が再利用されると
+  `prepare()` の冒頭 short-circuit で新コードに食わされる古い manifest
+  が温存されるため。
+
+**threshold tightening は本 PR では見送り**:
+
+PR #28 当初の `--tpr-min 0.60 --fpr-max 0.55` (with `fpr_max <
+tpr_min` invariant) は、idempotent な baseline が一度 main で観測され
+てから別 PR で再開する。pin 適用後の安定 baseline で per-row max FPR /
+min TPR を見ながら値を決める。
+
+### Phase 5 closeout 残課題
+
+- main で v5 cache を populate するために merge 後に scenario_5 を
+  一度走らせる (PR merge イベントが workflow を triggerするか
+  `workflow_dispatch` で手動 kick)。
+- 同じ commit を 2 回回して per-row metrics が bit-identical か
+  verify。
+- 通った時点の per-row 表を観測値として記録し、Phase 5 後段 part 2
+  で threshold tightening PR を出す (`fpr_max < tpr_min` 維持)。
 
 ### 参考文献
 
