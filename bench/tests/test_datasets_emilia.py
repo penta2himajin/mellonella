@@ -26,14 +26,19 @@ def _install_fake_datasets(monkeypatch, samples: Iterable[dict]) -> None:
     monkeypatch.setitem(sys.modules, "datasets", fake_mod)
 
     # prepare() also calls HfApi().list_repo_files to enumerate tar shards
-    # (deterministic alternative to HF's unsorted *.tar glob). Stub it with
-    # a single fake shard per language so the test stays offline.
-    from huggingface_hub import HfApi
+    # (deterministic alternative to HF's unsorted *.tar glob). Stub
+    # huggingface_hub via sys.modules — the real package only ships in the
+    # `bench[hf]` extra, and CI installs `bench[dev]` (no `hf`), so a real
+    # import would NameError before the monkeypatch can intercept it.
+    class _FakeHfApi:
+        def list_repo_files(self, repo_id, *, repo_type=None, revision=None, token=None):
+            return [
+                f"Emilia-YODAS/{upper}/000.tar" for upper in ("EN", "ZH", "DE", "FR", "JA", "KO")
+            ]
 
-    def fake_list_repo_files(self, repo_id, *, repo_type=None, revision=None, token=None):
-        return [f"Emilia-YODAS/{upper}/000.tar" for upper in ("EN", "ZH", "DE", "FR", "JA", "KO")]
-
-    monkeypatch.setattr(HfApi, "list_repo_files", fake_list_repo_files)
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeHfApi  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
 
 def _make_emilia_sample(
