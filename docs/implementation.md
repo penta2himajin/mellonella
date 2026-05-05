@@ -1,190 +1,190 @@
 # Implementation Plan
 
-## 技術スタック
+## Tech stack
 
-### コア言語
+### Core language
 
-**Rust** をコア実装言語とする：
+**Rust** is the implementation language for the production build:
 
-- DeepFilterNet 3 が公式 Rust 実装（`deep_filter` crate）を提供している
-- ONNX Runtime の Rust binding（`ort`）が成熟しており、PyTorch モデルを ONNX 経由で利用可能
-- 単一バイナリでデスクトップ・モバイル両対応が現実的
-- ユーザーの Rust 適性とも整合
+- DeepFilterNet 3 ships an official Rust implementation (the `deep_filter` crate).
+- The Rust ONNX Runtime binding (`ort`) is mature, so PyTorch models can be consumed via ONNX.
+- A single binary that targets both desktop and mobile is realistic.
+- It also matches the project owner's Rust proficiency.
 
-Python は PoC・検証用途に限定し、本実装は Rust に寄せる。
+Python is restricted to PoC / validation work; the production implementation lives in Rust.
 
-### 推論ランタイム
+### Inference runtime
 
-**ONNX Runtime** を統一推論ランタイムとする。理由：
+**ONNX Runtime** is the unified inference runtime. Reasons:
 
-- silero-vad、ECAPA-TDNN、CREPE すべて ONNX 化されたモデルが公開されている
-- INT8 量子化が容易（モバイル展開時のサイズ削減）
-- CPU/GPU 両対応、CoreML / NNAPI 経由で各プラットフォームのアクセラレータ利用可能
+- silero-vad, ECAPA-TDNN, and CREPE all have ONNX-converted models published.
+- INT8 quantization is straightforward (helpful for mobile size reduction).
+- CPU + GPU support, with platform accelerators reachable via CoreML / NNAPI.
 
-DFN3 のみ独立した Rust 実装を使う（公式の `deep_filter` crate）。
+DFN3 is the only exception: it uses its own standalone Rust implementation (the official `deep_filter` crate).
 
-### コンポーネント別実装
+### Per-component implementation
 
-| コンポーネント | 実装 | 形式 |
+| Component | Implementation | Form |
 |---|---|---|
-| Resampler | `rubato` crate | Rust ネイティブ |
-| DeepFilterNet 3 | `deep_filter` crate | Rust ネイティブ |
-| silero-vad | ONNX | `ort` 経由 |
-| ECAPA-TDNN | ONNX（SpeechBrain → ONNX 変換） | `ort` 経由 |
-| F0 (YIN) | 自前実装または `pitch-detection` crate | Rust ネイティブ |
-| F0 (CREPE, optional) | ONNX | `ort` 経由 |
+| Resampler | `rubato` crate | Rust-native |
+| DeepFilterNet 3 | `deep_filter` crate | Rust-native |
+| silero-vad | ONNX | via `ort` |
+| ECAPA-TDNN | ONNX (SpeechBrain → ONNX) | via `ort` |
+| F0 (YIN) | hand-rolled or `pitch-detection` crate | Rust-native |
+| F0 (CREPE, optional) | ONNX | via `ort` |
 
-## プラットフォーム対応
+## Platform support
 
-### デスクトップ
+### Desktop
 
-- **Linux**: x86_64-unknown-linux-gnu
-- **macOS**: aarch64-apple-darwin（Apple Silicon）, x86_64-apple-darwin
-- **Windows**: x86_64-pc-windows-msvc
+- **Linux**: `x86_64-unknown-linux-gnu`.
+- **macOS**: `aarch64-apple-darwin` (Apple Silicon), `x86_64-apple-darwin`.
+- **Windows**: `x86_64-pc-windows-msvc`.
 
-統合方法:
-- ライブラリ（`.so`/`.dylib`/`.dll`）として配布
-- CLI ツールとしての単体実行も可能
-- 仮想オーディオデバイス連携（PipeWire / CoreAudio / WASAPI）は将来検討
+Integration:
+- Shipped as a library (`.so` / `.dylib` / `.dll`).
+- Can also run standalone as a CLI tool.
+- Virtual-audio-device integration (PipeWire / CoreAudio / WASAPI) is planned for later.
 
-### モバイル
+### Mobile
 
-- **iOS**: aarch64-apple-ios
-- **Android**: aarch64-linux-android
+- **iOS**: `aarch64-apple-ios`.
+- **Android**: `aarch64-linux-android`.
 
-最適化:
-- INT8 量子化で ECAPA-TDNN を 23 MB → 約 6 MB に圧縮
-- CoreML / NNAPI バックエンド利用でアクセラレータ活用
-- 起動時遅延短縮のため、モデルファイルは事前バンドル
+Optimizations:
+- INT8 quantization shrinks ECAPA-TDNN from 23 MB to ~6 MB.
+- CoreML / NNAPI back-ends are used to reach the on-device accelerator.
+- Model files are bundled ahead of time to keep startup latency low.
 
-推定バイナリサイズ:
-- DFN3: 6 MB
-- silero-vad: 2 MB
-- ECAPA-TDNN (INT8): 6 MB
-- F0 (YIN): 0 MB（DSP コードのみ）
-- ランタイム + 周辺: 約 10 MB
-- **合計**: 約 25 MB
+Estimated binary size:
+- DFN3: 6 MB.
+- silero-vad: 2 MB.
+- ECAPA-TDNN (INT8): 6 MB.
+- F0 (YIN): 0 MB (DSP code only).
+- Runtime + supporting code: ~10 MB.
+- **Total**: ~25 MB.
 
-## 実装フェーズ
+## Implementation phases
 
-### Phase 1: PoC（Python + PyTorch）
+### Phase 1: PoC (Python + PyTorch)
 
-目的: アルゴリズム妥当性検証、閾値・パラメータ初期チューニング
+Goal: validate the algorithm and do initial threshold / parameter tuning.
 
-タスク:
-- silero-vad + ECAPA-TDNN + DFN3 の Python パイプライン構築
-- 明示登録機構の実装
-- ゲートロジック（統合判定 + ハングオーバー + エンベロープ）の実装
-- 自分の声 + 環境音の混合データで動作確認
-- 閾値（θ_pass, θ_learn）の初期値検証
+Tasks:
+- Build the Python pipeline: silero-vad + ECAPA-TDNN + DFN3.
+- Implement the explicit enrollment mechanism.
+- Implement the gate logic (combined decision + hangover + envelope).
+- Smoke-test on the developer's own voice mixed with ambient noise.
+- Validate initial values for `θ_pass` and `θ_learn`.
 
-想定期間: 1-2 週間
-成果物: 動作する Jupyter Notebook + 簡易 CLI
+Estimated time: 1–2 weeks.
+Deliverable: a working Jupyter notebook plus a minimal CLI.
 
-### Phase 2: 拡張機能追加（Python）
+### Phase 2: Feature extensions (Python)
 
-目的: F0 補助判定と自動学習の検証
+Goal: validate the F0 auxiliary decision and auto-learning.
 
-タスク:
-- F0 抽出（YIN または CREPE）追加
-- F0 マッチによる統合判定の改善検証
-- 自動学習プール実装
-- Anchor 保護、drift 検出機構の実装
-- 長時間通話シミュレーションでの安定性検証
+Tasks:
+- Add F0 extraction (YIN or CREPE).
+- Verify that the F0 match improves the combined decision.
+- Implement the auto-learn pool.
+- Implement anchor protection and drift detection.
+- Stability test with a long-call simulation.
 
-想定期間: 1-2 週間
-成果物: 機能完成版 Python 実装
+Estimated time: 1–2 weeks.
+Deliverable: a feature-complete Python implementation.
 
-### Phase 3: Rust 移植（デスクトップ）
+### Phase 3: Rust port (desktop)
 
-目的: デスクトップ向け本実装、性能最適化
+Goal: production desktop implementation, performance optimization.
 
-タスク:
-- ONNX 変換: ECAPA-TDNN（SpeechBrain → ONNX）、silero-vad は既製
-- Rust crate 構造設計（`mellonella-core`, `mellonella-cli`, `mellonella-ffi` 等）
-- ストリーミング処理（リングバッファ、フレーム同期）
-- DFN3 の Rust 実装統合
-- ONNX Runtime 統合（`ort` crate）
-- ベンチマーク（Python 版との性能比較、CPU 使用率測定）
+Tasks:
+- ONNX conversion: ECAPA-TDNN (SpeechBrain → ONNX); silero-vad already ships in ONNX form.
+- Design the Rust crate layout (`mellonella-core`, `mellonella-cli`, `mellonella-ffi`, etc.).
+- Streaming processing (ring buffer, frame sync).
+- Integrate the Rust DFN3 implementation.
+- Integrate ONNX Runtime (the `ort` crate).
+- Benchmarks (perf parity with the Python version, CPU usage).
 
-想定期間: 2-3 週間
-成果物: Linux/macOS/Windows 動作する CLI + ライブラリ
+Estimated time: 2–3 weeks.
+Deliverable: a CLI plus library that runs on Linux / macOS / Windows.
 
-### Phase 4: モバイル対応
+### Phase 4: Mobile support
 
-目的: iOS/Android で動作するバイナリ
+Goal: binaries that run on iOS and Android.
 
-タスク:
-- iOS: Swift 経由で Rust ライブラリ呼び出し（`cbindgen` + Swift Package）
-- Android: Kotlin 経由で JNI 呼び出し
-- INT8 量子化適用
-- CoreML / NNAPI バックエンドの動作確認
-- バッテリー消費測定
+Tasks:
+- iOS: call the Rust library from Swift (`cbindgen` + Swift Package).
+- Android: call via JNI from Kotlin.
+- Apply INT8 quantization.
+- Verify the CoreML / NNAPI back-ends.
+- Measure battery consumption.
 
-想定期間: 2-3 週間
-成果物: iOS/Android 用 SDK + サンプルアプリ
+Estimated time: 2–3 weeks.
+Deliverable: iOS / Android SDKs plus sample apps.
 
-### Phase 5: 仮想オーディオデバイス連携（オプション）
+### Phase 5: Virtual-audio-device integration (optional)
 
-通話アプリ（Zoom、Google Meet 等）と統合するための、システム全体への適用：
+System-wide integration so call apps (Zoom, Google Meet, etc.) can use it:
 
-- macOS: BlackHole / Loopback 経由、または CoreAudio HAL プラグイン
-- Linux: PipeWire filter-chain（DFN3 が既にこの形式で提供されている、参考になる）
-- Windows: VB-Cable + WASAPI、または独自 APO 開発
+- macOS: via BlackHole / Loopback, or a CoreAudio HAL plugin.
+- Linux: PipeWire filter-chain (DFN3 already ships in this form, useful as a reference).
+- Windows: VB-Cable + WASAPI, or a custom APO.
 
-複雑度が高いため、Phase 5 は別プロジェクトとして切り出す可能性あり。
+Given the complexity, Phase 5 may be split out as a separate project.
 
-## ベンチマーク方針
+## Benchmarking policy
 
-ベンチマーク用データセット選定、評価シナリオ、ミニマル評価セット構成、評価指標一覧の詳細は [benchmarks.md](benchmarks.md) を参照。評価プロトコル、合否基準、結果記録・管理方針の詳細は [evaluation.md](evaluation.md) を参照。
+Benchmark dataset selection, evaluation scenarios, the minimal eval set, and the metrics list are detailed in [benchmarks.md](benchmarks.md). The evaluation protocol, pass/fail criteria, and result-recording / management policy are detailed in [evaluation.md](evaluation.md).
 
-各 Phase での評価実行方針：
+Per-phase evaluation cadence:
 
-- **Phase 1 完了時**: シナリオ 1（ソロ + ノイズ）+ シナリオ 5（多言語）
-- **Phase 2 完了時**: 上記 + シナリオ 6（drift 検証）
-- **Phase 3 完了時**: 全シナリオ + レイテンシ・CPU 実測
-- **Phase 4 完了時**: モバイル実機での実測（レイテンシ・バッテリー）
+- **End of Phase 1**: scenario 1 (solo + noise) + scenario 5 (multilingual).
+- **End of Phase 2**: the above + scenario 6 (drift validation).
+- **End of Phase 3**: all scenarios + measured latency / CPU.
+- **End of Phase 4**: measurement on real mobile devices (latency / battery).
 
-各 Phase の次フェーズへのゲート条件として、対応シナリオの最低基準クリアを設定する。具体的な閾値は Phase 1 の初期測定で確定。
+Phase progression is gated on clearing the minimum criteria for the corresponding scenarios. Concrete thresholds are fixed by the Phase 1 initial measurement.
 
-## 開発環境とディレクトリ構成（暫定）
+## Development layout and directory structure (tentative)
 
 ```
 mellonella/
-├── docs/                          # 本仕様書群
-├── poc/                           # Phase 1-2: Python PoC
+├── docs/                          # this design spec
+├── poc/                           # Phase 1–2: Python PoC
 │   ├── notebooks/
 │   ├── mellonella_poc/
 │   └── pyproject.toml
-├── crates/                        # Phase 3: Rust 本実装
-│   ├── mellonella-core/           # コアロジック
+├── crates/                        # Phase 3: Rust production implementation
+│   ├── mellonella-core/           # core logic
 │   ├── mellonella-cli/            # CLI
-│   ├── mellonella-ffi/            # FFI（モバイル用）
-│   └── mellonella-bench/          # ベンチマーク
-├── models/                        # ONNX 変換済みモデル（git-lfs）
+│   ├── mellonella-ffi/            # FFI (mobile bindings)
+│   └── mellonella-bench/          # benchmarks
+├── models/                        # ONNX-converted models (git-lfs)
 ├── mobile/                        # Phase 4
 │   ├── ios/
 │   └── android/
-└── tests/                         # 統合テスト・ベンチマーク用音声
+└── tests/                         # integration-test / benchmark audio
 ```
 
-## 依存関係（暫定リスト）
+## Dependencies (tentative list)
 
 ### Rust
 
-- `deep_filter`（DFN3 公式）
-- `ort`（ONNX Runtime binding）
-- `rubato`（リサンプリング）
-- `ndarray`（テンソル操作）
-- `pitch-detection`（YIN）または自前実装
-- `crossbeam` または `flume`（ストリーミング channel）
-- `serde` + `serde_json`（設定ファイル）
+- `deep_filter` (official DFN3).
+- `ort` (ONNX Runtime binding).
+- `rubato` (resampling).
+- `ndarray` (tensor ops).
+- `pitch-detection` (YIN) or hand-rolled.
+- `crossbeam` or `flume` (streaming channel).
+- `serde` + `serde_json` (config files).
 
-### Python（PoC）
+### Python (PoC)
 
-- `torch`, `torchaudio`
-- `speechbrain`（ECAPA-TDNN）
-- `silero-vad`
-- `deepfilternet`
-- `librosa`（オーディオ前処理）
-- `numpy`, `scipy`
+- `torch`, `torchaudio`.
+- `speechbrain` (ECAPA-TDNN).
+- `silero-vad`.
+- `deepfilternet`.
+- `librosa` (audio pre-processing).
+- `numpy`, `scipy`.
