@@ -24,10 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system audio deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsndfile1 ffmpeg
+      - name: Install system audio deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libsndfile1 ffmpeg
+          version: 1.0
 
       - uses: actions/setup-python@v5
         with:
