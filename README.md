@@ -48,4 +48,6 @@ Phase 1 PoC 着手中。Python 実装は [`poc/`](poc/)、評価ハーネスは 
 
 ## ライセンス
 
-TBD（プロジェクト本体は private、構成コンポーネントは各ライセンスに従う）。
+本プロジェクトは [Apache License 2.0](LICENSE) で配布されます。
+構成コンポーネント (DeepFilterNet 3, silero-vad, ECAPA-TDNN 等) は
+[`docs/references.md`](docs/references.md) に記載の各ライセンスに従います。
