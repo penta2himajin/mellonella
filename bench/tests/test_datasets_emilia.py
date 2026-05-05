@@ -25,6 +25,16 @@ def _install_fake_datasets(monkeypatch, samples: Iterable[dict]) -> None:
     fake_mod.load_dataset = fake_load_dataset  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "datasets", fake_mod)
 
+    # prepare() also calls HfApi().list_repo_files to enumerate tar shards
+    # (deterministic alternative to HF's unsorted *.tar glob). Stub it with
+    # a single fake shard per language so the test stays offline.
+    from huggingface_hub import HfApi
+
+    def fake_list_repo_files(self, repo_id, *, repo_type=None, revision=None, token=None):
+        return [f"Emilia-YODAS/{upper}/000.tar" for upper in ("EN", "ZH", "DE", "FR", "JA", "KO")]
+
+    monkeypatch.setattr(HfApi, "list_repo_files", fake_list_repo_files)
+
 
 def _make_emilia_sample(
     *,

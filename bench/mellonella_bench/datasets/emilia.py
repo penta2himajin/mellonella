@@ -64,6 +64,13 @@ LANGUAGE_TO_EMILIA_DIR: dict[str, str] = {
 }
 SUPPORTED_LANGUAGES = tuple(LANGUAGE_TO_EMILIA_DIR)
 DATASET_REPO = "amphion/Emilia-Dataset"
+# Pin the upstream revision so streaming iteration is reproducible across
+# CI runs even when GitHub Actions cache misses force a fresh manifest
+# rebuild. Without this, a future commit on the dataset's main branch
+# would silently shift the universe of samples and the cohort + per-row
+# scenario_5 metrics would drift. Bump this when we knowingly want to
+# pick up upstream changes.
+DATASET_REVISION = "d7f2f7340a6385696f3766c8049fa920a4707c07"
 
 
 def _resample_to_target(audio: np.ndarray, src_sr: int) -> np.ndarray:
@@ -159,13 +166,33 @@ def prepare(
         )
 
     from datasets import load_dataset
+    from huggingface_hub import HfApi
 
-    pattern = f"Emilia-YODAS/{LANGUAGE_TO_EMILIA_DIR[language]}/*.tar"
+    # Resolve the language's tar shards explicitly and sort lex so streaming
+    # iteration order is reproducible. HF datasets' internal glob resolver
+    # (resolve_pattern in src/datasets/data_files.py) consumes
+    # `fs.glob(...).items()` directly with no `sorted()` — matching files
+    # come back in fsspec/HfFileSystem order, which is not contractual.
+    # Listing-then-sorting here makes the shard sequence a function only of
+    # (DATASET_REPO, DATASET_REVISION, language).
+    lang_dir = LANGUAGE_TO_EMILIA_DIR[language]
+    shard_prefix = f"Emilia-YODAS/{lang_dir}/"
+    repo_files = HfApi().list_repo_files(
+        DATASET_REPO, repo_type="dataset", revision=DATASET_REVISION, token=token
+    )
+    shards = sorted(f for f in repo_files if f.startswith(shard_prefix) and f.endswith(".tar"))
+    if not shards:
+        raise RuntimeError(
+            f"Emilia-YODAS({language}) revision {DATASET_REVISION[:12]} "
+            f"has no shards under {shard_prefix!r} — upstream layout may have "
+            "changed; bump DATASET_REVISION after verifying."
+        )
     ds = load_dataset(
         DATASET_REPO,
-        data_files={"train": pattern},
+        data_files={"train": shards},
         split="train",
         streaming=True,
+        revision=DATASET_REVISION,
         token=token,
     )
 
