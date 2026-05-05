@@ -1,20 +1,20 @@
 # Gating Logic & Enrollment
 
-## 設計方針
+## Design principles
 
-### FP（False Positive）許容
+### FP (false-positive) tolerance
 
-通話用途では「相手の声を漏らす（FP）」と「自分の声を切る（FN）」の二者択一が発生する瞬間がある。本システムは **FP 許容** を選択する：
+In call use cases there are moments where the system must choose between leaking the other speaker's voice (FP) and cutting the user's own (FN). This system chooses **FP tolerance**:
 
-- 対象話者の声紋成分が含まれていれば pass
-- 同時発話時に他話者の音漏れがあっても、対象話者の発話は確実に通す
-- 自分の発話が短時間でも切れる方が体験を損なうという判断
+- A frame passes whenever the target voiceprint component is present.
+- Some leakage of other speakers under simultaneous speech is acceptable; passing the user's own voice reliably is non-negotiable.
+- Cutting the user's own speech, even briefly, hurts UX more than leakage does.
 
-### 単一話者ターゲット前提
+### Single-target-speaker assumption
 
-本システムは「特定の 1 人の話者を通す」設計に特化する。複数話者をターゲットにする拡張は将来的な検討事項とし、初期実装では考慮しない。
+The system is specialised for letting a single specified speaker pass. Multi-target extensions are deferred future work and are not considered in the initial implementation.
 
-## 統合判定式
+## Combined decision formula
 
 ```
 target_score(t) = α × cos_sim_max(t)  +  β × f0_match(t)
@@ -24,44 +24,44 @@ where:
                         cos_similarity(current_embedding(t), emb_i)
                      }
     f0_match(t)    = exp(-((f0_mean(t) - μ_enroll) / σ_enroll)^2 / 2)
-                     ※ 登録 F0 ガウシアンへの当てはまり度
+                     # goodness-of-fit to the enrolled F0 Gaussian
     α + β = 1.0
-    推奨初期値: α = 0.8, β = 0.2
+    recommended initial values: α = 0.8, β = 0.2
 ```
 
-## 二段階閾値
+## Two-tier thresholds
 
-FP 許容方針 + 自動学習併用のため、用途を分離した 2 つの閾値を設ける：
+Because the FP-tolerant policy is combined with auto-learning, two thresholds with separated roles are used:
 
-| 閾値 | 用途 | 推奨初期値 |
+| Threshold | Role | Recommended initial |
 |---|---|---|
-| `θ_pass` | 出力ゲート判定 | 0.30 |
-| `θ_learn` | 自動学習プールへの追加可否 | 0.80 |
+| `θ_pass` | output gate decision | 0.30 |
+| `θ_learn` | admission to the auto-learn pool | 0.80 |
 
-`θ_pass < θ_learn` という関係を厳守する。理由：
+The relation `θ_pass < θ_learn` is strictly enforced. Reasoning:
 
-- 出力ゲートは多少緩く（FP 許容 = 取りこぼし防止）
-- 自動学習は厳格に（drift 防止 = 確信度の高いソロ発話のみ採用）
+- The output gate is intentionally a bit loose (FP-tolerant — avoid drops).
+- Auto-learning is strict (drift prevention — admit only high-confidence solo speech).
 
-> **`θ_pass` の calibration 履歴**: 当初は clean-vs-clean の cos 類似度直感から `0.50` を仮置きしていたが、`scripts/calibrate.py` で librosa libri1/2/3 × white/pink ノイズ × SNR -5..20 dB の 108 セルを sweep した結果 `0.50` ではノイズ下で gate が完全閉になることが判明。FP 許容方針 (mean FPR ≤ 0.05) を満たす最小 θ_pass として `0.30` を選択（median TPR ≈ 0.84, mean FPR ≈ 4.6 %）。詳細は [`benchmarks/calibration_summary.json`](benchmarks/calibration_summary.json) 参照。
+> **`θ_pass` calibration history**: originally a placeholder `0.50` based on clean-vs-clean cosine intuition, but a sweep with `scripts/calibrate.py` over librosa libri1/2/3 × white/pink noise × SNR -5..20 dB (108 cells) showed `0.50` causes the gate to close completely under noise. `0.30` was selected as the smallest `θ_pass` that meets the FP-tolerant target (mean FPR ≤ 0.05), with median TPR ≈ 0.84 and mean FPR ≈ 4.6 %. See [`benchmarks/calibration_summary.json`](benchmarks/calibration_summary.json) for details.
 
-この分離により、自動学習による drift リスクを抑制しつつ FP 許容を実現する。
+This separation gives FP tolerance while keeping auto-learning's drift risk in check.
 
-## ハングオーバー
+## Hangover
 
-短時間の無声音（破裂音前の閉鎖期、息継ぎ等）で誤って OFF に切り替わるのを防ぐ：
+Prevents the gate from flipping OFF during transient silences (closure before plosives, breaths, etc.):
 
 ```
 if gate(t-1) == ON and target_score(t) < θ_pass:
-    if elapsed_off_duration < hangover_ms (推奨 200-500 ms):
-        gate(t) = ON  # 維持
+    if elapsed_off_duration < hangover_ms (recommended 200–500 ms):
+        gate(t) = ON   # hold
     else:
         gate(t) = OFF
 ```
 
-## エンベロープ
+## Envelope
 
-バイナリ ON/OFF を直接適用するとクリック音や音切れが目立つため、ゲート信号に attack/release を適用：
+Applying binary ON/OFF directly produces audible clicks and choppiness, so attack/release smoothing is applied to the gate signal:
 
 ```
 attack_coef  = 1 - exp(-1 / (attack_ms  × sr / 1000))
@@ -75,51 +75,51 @@ else:
 output(t) = dfn3_output(t) × envelope(t)
 ```
 
-推奨値:
-- `attack_ms = 15`（瞬時反応）
-- `release_ms = 100`（緩やかなフェードアウト）
+Recommended values:
+- `attack_ms = 15` (fast attack).
+- `release_ms = 100` (gentle fadeout).
 
-## 登録（Enrollment）
+## Enrollment
 
-### 明示登録プロトコル
+### Explicit enrollment protocol
 
-1. ユーザーに 30 秒〜1 分の音声録音を要求
-   - 短文・長文・相槌などバリエーションを含む発話文脈
-   - SNR > 20 dB のクリーン録音
-2. 録音から 5-10 個の埋め込みを抽出
-   - スライディングウィンドウ（例: 3 秒チャンク、1.5 秒シフト）
-   - 各チャンクごとに ECAPA-TDNN を実行
-3. F0 統計量も記録
-   - `μ_enroll`, `σ_enroll` を発話部分のみから計算
-4. 上記を `enrollment_pool` として永続保存
+1. Ask the user for a 30 s – 1 min recording.
+   - Varied utterance context: short and long sentences, backchannels, etc.
+   - Clean recording with SNR > 20 dB.
+2. Extract 5–10 embeddings from the recording.
+   - Sliding window (e.g. 3 s chunks, 1.5 s shift).
+   - Run ECAPA-TDNN on each chunk.
+3. Also record F0 statistics.
+   - Compute `μ_enroll`, `σ_enroll` from the speech segments only.
+4. Persist the above as the `enrollment_pool`.
 
-### 自動学習（Auto-learning）
+### Auto-learning
 
-通話中に高確信度で「対象話者」と判定されたフレームから埋め込みを継続的に追加：
+Continuously add embeddings from frames judged high-confidence "target speaker" during a call:
 
 ```
-採用条件:
+admission conditions:
     cos_sim_max(t) > θ_learn        (= 0.80)
-    AND f0_match(t) > θ_f0          (= 0.7 推奨)
+    AND f0_match(t) > θ_f0          (= 0.7 recommended)
     AND continuous_speech > 1.0 sec
-    AND anchor_distance(emb) < δ    (drift 防止、後述)
+    AND anchor_distance(emb) < δ    (drift prevention; see below)
     AND auto_learn_pool.is_consistent()
 ```
 
-### Anchor 保護
+### Anchor protection
 
-明示登録時の埋め込みを **anchor** として永久保持し、自動学習で削除されない：
+The embeddings from explicit enrollment are kept permanently as **anchors** and are never removed by auto-learning:
 
 ```
 struct EmbeddingPool:
-    anchors: Vec<Embedding>          # 明示登録、不変
-    auto_learn: VecDeque<Embedding>  # 自動学習、FIFO 上限あり
+    anchors: Vec<Embedding>          # explicit enrollment, immutable
+    auto_learn: VecDeque<Embedding>  # auto-learned, FIFO with cap
     max_auto_learn_size: usize = 20
 ```
 
-### 整合性チェック
+### Consistency check
 
-自動学習プールへの追加前に、anchor との距離を検証：
+Before adding to the auto-learn pool, check the distance from the anchors:
 
 ```
 fn anchor_distance(emb: &Embedding, anchors: &[Embedding]) -> f32 {
@@ -128,27 +128,27 @@ fn anchor_distance(emb: &Embedding, anchors: &[Embedding]) -> f32 {
                   .max()
 }
 
-if anchor_distance(emb) > δ (= 0.4 推奨):
-    reject  // anchor から離れすぎている、drift 兆候
+if anchor_distance(emb) > δ (= 0.4 recommended):
+    reject  // too far from the anchors — drift signal
 ```
 
-### 定期的な異常検知
+### Periodic anomaly detection
 
-プール全体の中央値を監視し、anchor から大きく逸脱したら自動学習部分をリセット：
+Monitor the pool-wide median; reset the auto-learn portion if it drifts far from the anchors:
 
 ```
-周期: 5 分ごと、または auto_learn_pool 更新 N 回ごと
+period: every 5 minutes, or every N auto_learn_pool updates
 
-if median(auto_learn_pool) の anchor_distance > δ_reset (= 0.5):
+if median(auto_learn_pool)'s anchor_distance > δ_reset (= 0.5):
     auto_learn_pool.clear()
     log_warning("auto-learn pool drifted, resetting")
 ```
 
-## VAD-conditioned 動的チャンキング
+## VAD-conditioned dynamic chunking
 
-ECAPA-TDNN は本質的に 1 秒以上のサンプルで安定する。しかし固定 1 秒バッファを常時保持すると、沈黙区間が混入し精度が低下する。
+ECAPA-TDNN is essentially stable only on samples of 1 s or longer. However, holding a fixed 1-second buffer at all times mixes in silence regions and degrades accuracy.
 
-対策: **silero-vad で speech 判定されたフレームのみを内部バッファに append**：
+Fix: **append only frames marked as speech by silero-vad to the internal buffer**:
 
 ```
 let mut speech_buffer: VecDeque<f32> = VecDeque::new();
@@ -166,7 +166,7 @@ for frame in input_stream {
         }
     }
 
-    // 250 ms ごと、かつバッファが 1 秒以上で SV 更新
+    // Update SV every 250 ms once the buffer holds at least 1 s
     if last_emb_update.elapsed() > Duration::from_millis(250)
        && speech_buffer.len() >= 16000 {
         let emb = ecapa.embed(&speech_buffer);
@@ -180,65 +180,58 @@ for frame in input_stream {
 }
 ```
 
-## F0 補助判定の意義
+## Why F0 as an auxiliary
 
-ECAPA-TDNN だけでは「対象話者と声紋が似た別人」を区別しきれない場合がある。F0 レンジは個人差が大きく、補助判定として有効：
+ECAPA-TDNN alone may not always distinguish the target from a different speaker with a similar voiceprint. F0 range varies significantly between people and works as an auxiliary signal:
 
-- 男性平均 F0: 約 120 Hz（個人差 80-180 Hz）
-- 女性平均 F0: 約 220 Hz（個人差 150-300 Hz）
-- 同性であっても F0 の標準偏差レベルでの違いは判定に寄与する
+- Male mean F0: ~120 Hz (individual variation 80–180 Hz).
+- Female mean F0: ~220 Hz (individual variation 150–300 Hz).
+- Even within the same gender, differences at the σ level of F0 contribute to discrimination.
 
-本システムでは F0 を「ハードフィルタ」ではなく「ソフトな補強」として使う：
+The system uses F0 as a *soft reinforcement* rather than a *hard filter*:
 
-- F0 マッチ度をガウシアンで計算（0.0-1.0）
-- 統合スコアに重み β = 0.2 で加味
-- F0 レンジ外でも cos sim が十分高ければ pass する設計
+- F0 match score is computed as a Gaussian (0.0–1.0).
+- Folded into the combined score with weight β = 0.2.
+- A frame still passes outside the F0 range if cos sim is high enough.
 
-これにより、登録時と推論時で発話状態（普段の声 vs 興奮した声）が異なっても誤検出を最小化できる。
+This minimises false detections when speaking state differs between enrollment and inference (everyday voice vs excited voice).
 
-## 古典手法との将来的な統合
+## Future integration with classical methods
 
-F0 マッチ以外にも、信号処理ベースの補強候補がある（優先度低）：
+Beyond F0 matching, several signal-processing reinforcements are candidates (low priority):
 
-- **Harmonic + Residual Model (HNM)**: 音声を周期成分・非周期成分に分解、周期成分のみ pass
-- **Computational Auditory Scene Analysis (CASA)**: ハーモニック構造に沿った時間-周波数マスク
-- **Spectral envelope matching**: 登録音声の MFCC/LPC エンベロープと推論時を比較
+- **Harmonic + Residual Model (HNM)**: decompose audio into periodic and aperiodic components; pass only the periodic part.
+- **Computational Auditory Scene Analysis (CASA)**: a time–frequency mask following the harmonic structure.
+- **Spectral envelope matching**: compare the MFCC / LPC envelope between enrollment and inference.
 
-初期実装ではスキップ。F0 マッチで判定精度が不足する場合に追加検討。
+Skipped in the initial implementation. Revisit if F0 matching proves insufficient.
 
-## AS-Norm（Adaptive S-Norm）によるスコア正規化
+## Score normalisation with AS-Norm (Adaptive S-Norm)
 
-詳細は `docs/decisions.md` D-010 参照。
+See `docs/decisions.md` D-010 for full details.
 
-### 動機
+### Motivation
 
-`target_score(emb, pool) = α·max_cos_sim + β·f0_match` の生 score は、
-言語/ノイズ/録音条件によって絶対値分布がシフトする。Scenario 5 (PR #17)
-の baseline 計測では、単一 global θ_pass=0.30 で:
+The raw `target_score(emb, pool) = α·max_cos_sim + β·f0_match` shifts in absolute value with language, noise, and recording conditions. The Scenario 5 (PR #17) baseline measurement showed, with a single global `θ_pass = 0.30`:
 
-- ja TPR=0.59 (低 SNR、target を取りこぼす方向)
-- zh-CN FPR=0.33 (低 SNR、other を通す方向)
+- ja TPR = 0.59 (drops the target at low SNR).
+- zh-CN FPR = 0.33 (lets other speakers through at low SNR).
 
-という対称的な失敗が出た。**1 つの threshold で複数言語を同時最適化できない**。
+These are symmetric failure modes: **no single threshold can jointly optimise multiple languages**.
 
-### 仕組み
+### Mechanism
 
-事前構築した「impostor cohort」(多言語の非ターゲット話者 30-50 名分の
-ECAPA embedding) と test 時 embedding の cosine sim を計算し、その top-K
-スコアの平均/標準偏差で target score を z-score 正規化する:
+A pre-built "impostor cohort" (ECAPA embeddings of 30–50 multilingual non-target speakers) is used: at test time, the cosine similarity between the current embedding and each cohort entry is computed, and the target score is z-score-normalised by the mean / std of the top-K impostor scores:
 
 ```
 S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 ```
 
-これにより score の絶対値分布シフト (言語別 bias) が消え、global
-θ_pass で複数言語をカバーできる。
+This removes the absolute-value distribution shift (per-language bias), so a global `θ_pass` can cover multiple languages.
 
-### コホート構築
+### Cohort construction
 
-`scripts/build_impostor_cohort.py` が manifest (CommonVoice / MLS /
-Emilia-YODAS いずれの形式も可) から ECAPA embedding を抽出し
-`.npz` で保存する。
+`scripts/build_impostor_cohort.py` extracts ECAPA embeddings from a manifest (CommonVoice / MLS / Emilia-YODAS — any of these formats works) and saves them as `.npz`.
 
 ```bash
 python scripts/build_impostor_cohort.py \
@@ -249,54 +242,36 @@ python scripts/build_impostor_cohort.py \
     --output bench/data/cohorts/impostor_cohort_v1.npz
 ```
 
-各言語 5 話者程度で十分 (cohort size は EER に対し対数的に効く)。
-出力ファイルは ~38 KB (50 話者 × 192 dim × 4B)、package 同梱可。
+Roughly 5 speakers per language is enough — cohort size has a logarithmic effect on EER. The output file is ~38 KB (50 speakers × 192 dim × 4 B), small enough to bundle with the package.
 
-### 段階的導入
+### Phased rollout
 
-Phase 1 ✅ (PR #18): cohort build script + docs。
-Phase 2 ✅ (PR #19): `gating.py` に AS-Norm 実装、`GatingConfig` 拡張、
-`pipeline.process_offline` 分岐、CI で cohort 自動 build → scenario_5 に反映。
-**Phase 2 実観測**: ja TPR が 0.67 → 0.85 (+18pp) で取りこぼし問題解消、
-ただし zh-CN FPR が 0.23 → 0.42 (+19pp) と悪化、de TPR も -8pp の新規
-regression。`docs/decisions.md` D-010「Phase 2 実観測」/`docs/benchmarks.md`
-シナリオ 5「Phase 2: AS-Norm 適用後の deltas」参照。default
-`theta_pass_as_norm=1.5` のヒューリスティック値が言語ごと過剰/不足。
+Phase 1 ✅ (PR #18): cohort build script + docs.
+Phase 2 ✅ (PR #19): AS-Norm implemented in `gating.py`, `GatingConfig` extended, `pipeline.process_offline` branched, CI auto-builds the cohort and feeds it into scenario_5.
+**Phase 2 observation**: ja TPR rose from 0.67 to 0.85 (+18 pp), resolving the drop problem; however zh-CN FPR worsened from 0.23 to 0.42 (+19 pp), and de TPR showed a new regression (-8 pp). See `docs/decisions.md` D-010 "Phase 2 observation" and `docs/benchmarks.md` Scenario 5 "Phase 2: deltas after AS-Norm" for details. The heuristic default `theta_pass_as_norm = 1.5` is over- or under-tight on a per-language basis.
 
-**Phase 4 (cohort-disjoint fix、進行中)**: PR #21 の cohort 診断で構造的
-バグが判明。cohort が test 話者を含んでおり、`mls.prepare`/`emilia.prepare`
-の default 3 話者では cohort も小さすぎた (18 embeddings、top-K=10 = 56%)。
-default を 10 話者に引き上げ、`build_impostor_cohort.py --skip-top-n 2` で
-test 話者を cohort から carve out して構造的に分離する。
+**Phase 4 (cohort-disjoint fix, in progress)**: cohort diagnostics in PR #21 revealed a structural bug. The cohort contained test speakers, and the default of 3 speakers made the cohort itself too small (18 embeddings, top-K = 10 = 56 %). The fix bumps the default to 10 speakers and uses `build_impostor_cohort.py --skip-top-n 2` to carve test speakers out of the cohort and enforce structural separation.
 
-Phase 3 (calibrate.py 拡張): Phase 4 で正常な cohort が得られた後に着手。
-壊れた cohort の上でキャリブレーションしても意味がない。
-Phase 5 (任意): C/D/E (Language-Dependent AS-Norm 等) への拡張は Phase 3 後
-に再評価。
+Phase 3 (calibrate.py extensions): starts once Phase 4 produces a clean cohort. Calibrating on top of a broken cohort is meaningless.
+Phase 5 (optional): extensions C / D / E (Language-Dependent AS-Norm, etc.) are revisited after Phase 3.
 
-### 実装メモ (Phase 2)
+### Implementation notes (Phase 2)
 
-- 公開 API:
+- Public API:
   - `mellonella_poc.gating.load_cohort(path) -> np.ndarray`
   - `mellonella_poc.gating.as_norm_score(emb, raw, cohort, top_k) -> float`
   - `mellonella_poc.gating.target_score_as_norm(emb, pool, cohort, config) -> float`
-- `GatingConfig` 新フィールド:
+- New `GatingConfig` fields:
   - `use_as_norm: bool = False`
   - `as_norm_cohort_path: str | None = None`
   - `as_norm_top_k: int = 10`
   - `theta_pass_as_norm: float = 1.5` (z-score scale)
   - `theta_learn_as_norm: float = 2.5`
-- `PipelineComponents` が cohort を build 時に 1 度ロードし、`process_offline`
-  が per-frame で参照する (毎呼び出し再ロードはしない)。
-- AS-Norm 経路では per-frame の score formula が
-  `α·cs + β·f0_match` から `as_norm(cs vs cohort)` に切り替わる。F0 は
-  引き続き auto-learn 入口の `theta_f0` で使われる。
-- `use_as_norm = False` のとき既存パスは bit-identical (deault False)。
+- `PipelineComponents` loads the cohort once at build time; `process_offline` references it per-frame (no per-call reload).
+- On the AS-Norm path, the per-frame score formula switches from `α·cs + β·f0_match` to `as_norm(cs vs cohort)`. F0 is still used at the auto-learn admission gate via `theta_f0`.
+- When `use_as_norm = False`, the legacy path is bit-identical (default `False`).
 
-### CLI / CI 統合
+### CLI / CI integration
 
-- `scripts/scenario_5_from_manifest.py --as-norm-cohort PATH` で AS-Norm
-  経路に切り替え可能 (`--real-pipeline` 必須)。
-- `.github/workflows/scenario_5.yml` は MLS + Emilia 準備後に
-  `scripts/build_impostor_cohort.py` で cohort を auto-build し、
-  scenario_5 に渡す。第三者 cohort artifact 管理は不要。
+- `scripts/scenario_5_from_manifest.py --as-norm-cohort PATH` switches to the AS-Norm path (`--real-pipeline` required).
+- `.github/workflows/scenario_5.yml` auto-builds the cohort with `scripts/build_impostor_cohort.py` after MLS + Emilia preparation and feeds it to scenario_5; no external cohort-artifact management is needed.
