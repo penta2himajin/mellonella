@@ -254,7 +254,7 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 3. **Phase 3** ✅ (PR #24 + follow-up PR): add the AS-Norm extension to `scripts/calibrate.py`, fix `theta_pass_as_norm` data-drivenly via a per-language sweep, and document the baseline with CI observations. Tightening `scenario_5.yml --fpr-max` is **deferred** for the reason described below (run-to-run variance from the cohort scale would make the CI hard-fail flaky).
 4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + `actions/cache`-isation.
 5. **Phase 5** ✅ (PR #27 + PR #28): cohort determinisation + pinning the HF stream input. PR #27 determinises the `mls.prepare` / `emilia.prepare` selection logic (speakers by upstream-id lex order; clips by `(-len, sha1)` order). PR #28 pins the HF stream input itself: `load_dataset(..., revision=<commit_sha>)` plus, for Emilia, fetch the shard list via `HfApi`, lex-sort it, and pass it explicitly via `data_files=`. The manifest is now bit-identical regardless of cache state. **Threshold tightening is split into a separate PR**: with the post-pin stable baseline observed once, set values under the `--fpr-max < --tpr-min` invariant.
-6. **Phase 6** (optional): cohort scale-up (per-language 8 → 50–100, top-K 10 → 20–30), extending AS-Norm to other scenarios, and data-driven re-calibration of `theta_pass_as_norm` — resume after the scale-up is realised.
+6. **Phase 6** (in progress): cohort scale-up to the literature recommendation. **Part 1** (this PR): scale per-language 8 → 50, top-K 10 → 20 in code (`DEFAULT_TOP_SPEAKERS = 60`, `max_stream = 20_000` in mls/emilia.prepare; `--per-language 50` in scenario_5.yml; `as_norm_top_k = 20` in GatingConfig; cache key v5 → v6). **Part 2** (follow-up, gated on hosted-runner restoration): `theta_pass_as_norm` data-driven re-calibration on the v6 cohort, scenario_5 threshold tightening (combined with Phase 5 closeout follow-up), extending AS-Norm to scenarios 1 / 4 / 6. See "Phase 6: cohort scale-up to literature recommendation" below.
 
 ### Phase 2 design notes
 
@@ -435,6 +435,41 @@ PR #28's original `--tpr-min 0.60 --fpr-max 0.55` (with the `fpr_max < tpr_min` 
 - Run scenario_5 once after merge to populate the v5 cache on main (the merge event triggers the workflow, or kick it manually via `workflow_dispatch`).
 - Run the same commit twice and verify per-row metrics are bit-identical.
 - Record the per-row table at that point as the observed values, and land a threshold-tightening PR in Phase 5 follow-up part 2 (maintaining `fpr_max < tpr_min`).
+
+**Status (2026-05-05)**: blocked on a hosted-runner allocation outage on `penta2himajin/mellonella` — every push-event scenario_5 run since PR #28 merged (run #34 onwards, 12 consecutive failures) terminates within ~11 s at the "Job is waiting for a hosted runner to come online" line, before any user step executes. The job's `system.txt` confirms the `if:` evaluates true; the failure is at GitHub's runner scheduler, not in the workflow. Until the runner allocation is restored (likely a billing / quota issue on the account side), the bit-identical observation cannot be made, and the threshold-tightening follow-up stays deferred. Phase 6 (cohort scale-up) was opened in parallel because it does not depend on the Phase 5 baseline observation — the threshold-tightening follow-up will then land combined Phase 5 + Phase 6 numbers in one PR once the runner is back.
+
+### Phase 6: cohort scale-up to literature recommendation
+
+Phase 4 carved test target / other out of the cohort (cohort-disjoint) and Phase 5 made the manifest + cohort bit-identical across cache rebuilds. Both fixes were prerequisites to scaling the cohort up; on a non-disjoint or non-deterministic cohort, scaling would have just amplified the existing structural bugs. With those out of the way, Phase 6 moves the cohort from the Phase 4-5 working size (6 langs × 8 spk = 48 embeddings, top-K = 10 = 21 % of cohort) to the literature recommendation (50–100 spk/lang, top-K 20–30) — see Thienpondt 2020 and the AS-Norm survey in Park 2025.
+
+**Chosen target**: 6 langs × 50 spk = 300 embeddings, top-K = 20 (= 6.7 % of cohort). The lower top-K / cohort ratio collapses μ/σ variance on the impostor tail (the dominant noise term in PR #19's per-language regression on de TPR / zh-CN FPR) while still leaving 20 samples per call to estimate (μ, σ) — well above the 5–10 minimum the AS-Norm formulation needs to be statistically sound. 100 spk/lang was rejected for cost: each cohort speaker costs one ECAPA pass at cohort-build time, so 50 → 100 doubles the cold-cache wall-clock without a clear win in spread.
+
+**Code changes (this PR)**:
+
+- `bench/mellonella_bench/datasets/mls.py` and `.../emilia.py`: bump `DEFAULT_TOP_SPEAKERS` from 10 → 60 (50 + 2-speaker test carve-out + 8-speaker buffer for selection variability across cache rebuilds), and bump `max_stream` from 5_000 → 20_000 — the previous window could not surface 60 distinct speakers per language with `clips_per_speaker × OVERSAMPLE_FACTOR = 16` clips each.
+- `.github/workflows/scenario_5.yml`: bump `--per-language 8 → 50` (passed to `scripts/build_impostor_cohort.py`), bump cache key v5 → v6 (a v5 manifest only ships 10 speakers per language, so a v5 cache hit would silently feed an under-sized `--per-language 50` selection through `select_speakers_for_language` → empty cohort tail).
+- `poc/mellonella_poc/config.py`: bump `as_norm_top_k = 10 → 20` (matches the new cohort scale; literature ratio 5–30 % of cohort).
+
+**Deferred to Phase 6 follow-up part 2** (needs CI baseline observation):
+
+1. **`theta_pass_as_norm` data-driven re-calibration**. The heuristic 1.5 σ default was empirically validated on the Phase 4-5 cohort (48 embeddings, top-K 10). The new cohort (300 embeddings, top-K 20) has a different impostor-tail distribution, so re-running `scripts/calibrate.py --use-as-norm` on the post-scale-up cohort is required before the heuristic can be replaced with a fitted value. This is the same deferral pattern as Phase 3 → Phase 5 closeout: heuristic shipped, data-driven update gated on one stable baseline observation.
+2. **Threshold tightening** (`scenario_5.yml --tpr-min` / `--fpr-max`). Inherits the Phase 5 closeout deferral. Once the v6 cache is populated and we have one bit-identical CI baseline, both Phase 5 and Phase 6 follow-ups can land in the same PR.
+3. **Extending AS-Norm to other scenarios** (scenario_1 / 4 / 6). Currently only scenario_5 wires the cohort through; the gating layer already supports it via `GatingConfig.use_as_norm` so the change is mostly per-scenario YAML wiring + per-scenario θ. Better done after the threshold landed because the new threshold is the shared default.
+
+**Cost projection**:
+
+- Manifest prep (cold cache): scanning 20 000 streamed samples × 6 language streams ≈ 30–40 min on the Hosted runner (vs. ~5–10 min at the Phase 5 budget). Within the 45 min job timeout but only by a slim margin; if Emilia HF resolution gets slower, lift the timeout to 60 min before scaling further.
+- Cohort build (cold cache): 300 ECAPA passes ≈ 5–6 min vs. the previous 1 min for 48 passes. Negligible.
+- Warm cache (the steady state once main has cached the v6 artifacts): no measurable change vs. v5.
+- Cohort `.npz` size: 300 × 192 × 4 B ≈ 230 KB (vs. 38 KB for v5). Still negligible for the artifact upload.
+
+**Phase 6 closeout: remaining tasks** (gated on the same hosted-runner restoration as Phase 5 closeout):
+
+- Once a Phase 6 push-event run completes successfully, observe the per-row TPR / FPR baseline with the larger cohort.
+- Run the same commit twice; bit-identical guarantee should still hold (Phase 5 fixes apply unchanged).
+- Run `scripts/calibrate.py --use-as-norm --cohort data/cohorts/scenario5_cohort.npz` against the v6 cohort, propagate the recommended `theta_pass_as_norm` into `GatingConfig` default.
+- Tighten `scenario_5.yml` thresholds under the `--fpr-max < --tpr-min` invariant (combined Phase 5 + Phase 6 follow-up).
+- Add `use_as_norm = True` to scenario_1 / 4 / 6 with the new global θ.
 
 ### References
 

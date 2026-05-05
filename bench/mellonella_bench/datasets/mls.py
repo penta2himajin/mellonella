@@ -30,13 +30,19 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-DEFAULT_TOP_SPEAKERS = 10
+# D-010 Phase 6 cohort scale-up: bumped from 10 → 60 to support
+# scenario_5's `--per-language 50` AS-Norm cohort + `--skip-top-n 2`
+# carve-out + an 8-speaker buffer for selection variability across cache
+# rebuilds. The literature recommendation is 50–100 spk/lang; 50 hits
+# the lower bound while keeping prep wall-clock and ECAPA-pass cost
+# tractable in CI (45 min timeout, 6 streams).
+DEFAULT_TOP_SPEAKERS = 60
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
 # We over-collect per speaker (up to OVERSAMPLE_FACTOR × clips_per_speaker)
 # so the post-stream deterministic clip sort has real material to choose
 # from. 4× is enough to absorb streaming-order shuffle for most MLS test
-# splits without blowing memory on 5 000-sample windows.
+# splits without blowing memory on the streaming window.
 OVERSAMPLE_FACTOR = 4
 
 # MLS HF config names spell out the language. We expose short ISO codes
@@ -118,7 +124,10 @@ def prepare(
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
     split: str = DEFAULT_SPLIT,
-    max_stream: int = 5_000,
+    # Phase 6 cohort scale-up bumped 5_000 → 20_000 alongside top_speakers
+    # 10 → 60 — the original budget could not surface 60 distinct speakers
+    # with ≥ clips_per_speaker × OVERSAMPLE_FACTOR clips each.
+    max_stream: int = 20_000,
 ) -> Path:
     """Stream MLS for ``language``, materialise top-K speakers + manifest.csv.
 
