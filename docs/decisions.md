@@ -1,220 +1,218 @@
 # Design Decisions
 
-本ドキュメントは、設計過程で検討した代替案と却下理由、および重要な設計判断の記録を残す。
+This document records the alternatives considered during design, their rejection reasons, and the major design decisions.
 
-## D-001: 真の TSE ではなくハードゲーティング型を採用
+## D-001: Hard-gating instead of true TSE
 
-### 検討した代替案
+### Alternatives considered
 
-A. ConVoiFilter（オフライン TSE）の自前運用
-B. ESPnet TD-SpeakerBeam の causal 化（要再訓練）
-C. SpeakerBeam-SS / E3Net 等の論文ベース実装（要自前実装）
-D. ハードゲーティング型（VAD + SV + NS、Personal VAD の Score Combination 方式）
+A. Run ConVoiFilter (offline TSE) in-house.
+B. Causal-ise ESPnet TD-SpeakerBeam (requires retraining).
+C. Paper-based implementation of SpeakerBeam-SS / E3Net etc. (requires writing it ourselves).
+D. Hard-gating (VAD + SV + NS, the Score Combination style of Personal VAD).
 
-### 採用: D（ハードゲーティング型）
+### Chosen: D (hard-gating)
 
-理由:
-- A は 5 秒チャンクのオフライン処理で、リアルタイム通話に不適合
-- B/C はいずれも自前訓練が必要、「追加訓練不要」要件と整合しない
-- D は全コンポーネントが既存事前学習モデルで構成可能
-- 「特定単一話者ターゲット」という本質要件を踏まえると、N 人分離の複雑性は不要
-- 対象話者音声への副作用が最小（マスク方式の人工感や GAN 生成系のスペクトル変質なし）
+Reasons:
+- A is 5-second-chunk offline processing, unsuitable for real-time calls.
+- B / C both require in-house training, which conflicts with the "no additional training" requirement.
+- D can be built entirely from existing pretrained models.
+- Given the underlying single-target-speaker requirement, the complexity of N-speaker separation is unnecessary.
+- Minimal artifacts on the target voice (no mask-based unnaturalness, no spectral distortion from GAN-based generators).
 
-### トレードオフ
+### Trade-offs
 
-- 同時発話シーンで完全な分離はできない → FP 許容方針で対応
-- 短時間発話（相槌等）では SV 判定が不安定 → 動的チャンクと時間平滑化で対応
+- Full separation under simultaneous speech is not possible → addressed by the FP-tolerant policy.
+- SV judgment is unstable on short utterances (backchannels, etc.) → addressed by dynamic chunking + temporal smoothing.
 
-## D-002: 48 kHz 出力 + 内部 16 kHz 判定のハイブリッド構成
+## D-002: Hybrid 48 kHz output + 16 kHz internal decision
 
-### 検討した代替案
+### Alternatives considered
 
-A. 16 kHz 統一（ConVoiFilter 単体構成）
-B. 48 kHz NS + 16 kHz TSE ハイブリッド（MossFormer2_SE_48K + ConVoiFilter）
-C. 48 kHz 出力 + DFN3 + 16 kHz 判定（本構成の前身）
-D. 3 段カスケード（DFN3 → TSE → MossFormer2_SR_48K）
+A. Unified 16 kHz (ConVoiFilter standalone).
+B. Hybrid 48 kHz NS + 16 kHz TSE (MossFormer2_SE_48K + ConVoiFilter).
+C. 48 kHz output + DFN3 + 16 kHz decision (the predecessor of the current configuration).
+D. 3-stage cascade (DFN3 → TSE → MossFormer2_SR_48K).
 
-### 採用: C（DFN3 + 16 kHz 判定）
+### Chosen: C (DFN3 + 16 kHz decision)
 
-理由:
-- A は ConVoiFilter のチャンク制約（5 秒）でリアルタイム不可
-- B は MossFormer2_SE_48K + ConVoiFilter で計算量大、かつ ConVoiFilter のリアルタイム制約は解消されない
-- D は MossFormer2_SR_48K が 4 秒チャンク・GAN 生成・TTS 訓練データのため通話用途に不適合（[詳細](references.md#mossformer2_sr_48k-評価)）
-- C は DFN3 の 48 kHz フルバンド処理を活用しつつ、判定は ECAPA-TDNN の native レート（16 kHz）で実行できる
+Reasons:
+- A is impossible in real-time due to ConVoiFilter's chunk constraint (5 s).
+- B has high compute cost from MossFormer2_SE_48K + ConVoiFilter, and ConVoiFilter's real-time constraint remains.
+- D is unsuitable for call use because MossFormer2_SR_48K uses 4-second chunks, GAN generation, and TTS training data ([details](references.md#mossformer2_sr_48k-evaluation)).
+- C leverages DFN3's full-band 48 kHz processing while running the decision step on ECAPA-TDNN's native rate (16 kHz).
 
-### MossFormer2_SR_48K 却下の決定的理由
+### Decisive reasons for rejecting MossFormer2_SR_48K
 
-- アルゴリズム遅延 4 秒（`decode_window: 4`）→ リアルタイム不可
-- 訓練データが TTS 合成音声 → out-of-distribution
-- GAN 生成による高域生成 → 話者個性の変質
-- 3 段カスケードによるアーティファクト累積
+- Algorithmic latency of 4 seconds (`decode_window: 4`) → not real-time.
+- Trained on TTS-synthesised audio → out-of-distribution.
+- High-frequency generation via GAN → distortion of speaker characteristics.
+- Artifact accumulation through the 3-stage cascade.
 
-## D-003: 順序設計は案A（NS → 判定 → DFN3 後音声を出力）
+## D-003: Ordering is option A (NS → decision → output the post-DFN3 signal)
 
-### 検討した代替案
+### Alternatives considered
 
-A. 入力 → DFN3 → 判定 → ゲート → DFN3 後音声を出力
-B. 入力 → 判定 → ゲート → DFN3 → 出力
-C. 入力 → DFN3 → 判定 / 元音声をゲート → 出力
+A. input → DFN3 → decision → gate → output the post-DFN3 signal.
+B. input → decision → gate → DFN3 → output.
+C. input → DFN3 → decision; gate the original signal → output.
 
-### 採用: A
+### Chosen: A
 
-理由:
-- 判定をクリーン音声で実行できる（精度向上）
-- 出力に NS 効果を反映できる（通話品質向上）
-- DFN3 を 1 回だけ計算し、判定パスと出力パスで共有 → 計算コスト最小
+Reasons:
+- The decision is made on the clean signal (improved accuracy).
+- The output reflects the NS effect (improved call quality).
+- DFN3 is computed only once and shared by the decision and output paths → minimum compute cost.
 
-### 案C の検討経緯
+### How option C was considered
 
-設計途中で「DFN3 アーティファクトを最終出力に乗せない」目的で案C を一時推奨したが、通話用途では NS の利点が NS アーティファクトより大きいと判断し直し、案A に戻した。録音編集等の音楽的用途では案C が再検討の余地あり。
+Mid-design, option C was temporarily preferred with the goal of "not letting DFN3 artifacts reach the final output." On reassessment, the NS benefit outweighs its artifacts for call use, so we returned to option A. For recording / music-style use cases, option C is worth revisiting.
 
-## D-004: 明示登録 + 自動学習の併用
+## D-004: Combine explicit enrollment + auto-learning
 
-### 検討した代替案
+### Alternatives considered
 
-A. 明示登録のみ
-B. 自動学習のみ（zero-enrollment）
-C. 明示登録 + 自動学習併用
+A. Explicit enrollment only.
+B. Auto-learning only (zero-enrollment).
+C. Explicit enrollment + auto-learning combined.
 
-### 採用: C
+### Chosen: C
 
-理由:
-- A は経時変化（風邪・疲労・マイク変更）に追従できない
-- B は登録時の信頼性が低い（最初のセッションが純粋に対象話者であるという保証がない）
-- C は明示登録の信頼性と自動学習の適応性を両立
+Reasons:
+- A cannot track time-varying changes (cold, fatigue, mic change).
+- B has low reliability at enrollment (no guarantee that the first session is purely the target speaker).
+- C combines the reliability of explicit enrollment with the adaptability of auto-learning.
 
-### Drift 対策（重要）
+### Drift mitigation (important)
 
-FP 許容方針 + 自動学習の組み合わせは drift リスクが高い：
+The combination of an FP-tolerant policy and auto-learning has high drift risk:
 
-- FP 許容で他話者混合フレームも pass しやすい
-- それを自動学習に流すと他話者声紋がプールに浸透
+- FP tolerance lets frames with other-speaker mixing pass easily.
+- Feeding those into auto-learning lets other speakers' voiceprints seep into the pool.
 
-対策として以下を必須とする：
+The following are made mandatory to mitigate this:
 
-1. **二段階閾値**: `θ_learn (0.80) > θ_pass (0.50)` を厳守
-2. **Anchor 保護**: 明示登録時の埋め込みは永久保持、自動学習で削除されない
-3. **整合性チェック**: 自動学習プールへの追加前に anchor 距離検証
-4. **異常検知**: プール中央値の anchor からの逸脱を定期監視、逸脱時はリセット
+1. **Two-tier thresholds**: strictly enforce `θ_learn (0.80) > θ_pass (0.50)`.
+2. **Anchor protection**: explicit-enrollment embeddings are kept permanently and are not removed by auto-learning.
+3. **Consistency check**: validate distance from the anchors before adding to the auto-learn pool.
+4. **Anomaly detection**: periodically monitor the pool's median deviation from the anchors; reset on excessive deviation.
 
-## D-005: F0 補助判定の追加
+## D-005: Add F0 as an auxiliary
 
-### 検討した代替案
+### Alternatives considered
 
-A. ECAPA-TDNN 単独（cos similarity のみで判定）
-B. ECAPA-TDNN + F0 マッチ
-C. ECAPA-TDNN + F0 + Harmonic 構造解析
+A. ECAPA-TDNN alone (judge by cosine similarity only).
+B. ECAPA-TDNN + F0 match.
+C. ECAPA-TDNN + F0 + harmonic-structure analysis.
 
-### 採用: B
+### Chosen: B
 
-理由:
-- A だけでは「対象話者と声紋が似た別人」を区別しきれない場合がある
-- F0 は個人差が大きく、補助判定として有効
-- C は実装コストが高く、初期実装では過剰
+Reasons:
+- A alone may not always distinguish "a different speaker with a similar voiceprint."
+- F0 has large individual variation and works as an auxiliary signal.
+- C has high implementation cost and is overkill for the initial implementation.
 
-### 設計詳細
+### Design details
 
-- F0 はハードフィルタではなく統合スコアに重み β を以って加味
-- ガウシアン当てはまりで連続値化（厳密なレンジチェックを避ける）
-- 登録時と推論時で発話状態が異なっても誤検出を最小化する設計
-- 実装は YIN（DSP ベース、軽量）を第一候補、CREPE（ONNX）を高精度オプションとする
+- F0 is folded into the combined score with weight β rather than used as a hard filter.
+- A continuous score via Gaussian fitness avoids strict range checks.
+- The design minimises false detections when speaking state at enrollment differs from inference.
+- YIN (DSP-based, lightweight) is the primary candidate for the implementation; CREPE (ONNX) is the high-accuracy option.
 
-### 重み (α, β) の calibration 履歴
+### Calibration history for weights (α, β)
 
-当初は直感で `α=0.8, β=0.2` を仮置き。`scripts/calibrate_alpha_beta.py` で librosa libri1/2/3 × white/pink ノイズ × SNR -5..20 dB に対し α ∈ [0.0, 1.0]、θ ∈ [0.20, 0.55] の joint sweep を実施した結果、**`α=0.9, β=0.1, θ_pass=0.30`** が FP 許容方針 (mean FPR ≤ 0.05) を満たしつつ TPR_median を最大化する操作点だった (α=0.8 と同じ TPR_median=0.84 で FPR_mean が 0.046 → 0.017 に低減)。
+Initial values were placed by intuition at `α = 0.8, β = 0.2`. A joint sweep over α ∈ [0.0, 1.0] and θ ∈ [0.20, 0.55] using `scripts/calibrate_alpha_beta.py` on librosa libri1/2/3 × white/pink noise × SNR -5..20 dB selected **`α = 0.9, β = 0.1, θ_pass = 0.30`** as the operating point that meets the FP-tolerant target (mean FPR ≤ 0.05) while maximising TPR_median: at the same TPR_median = 0.84 as `α = 0.8`, FPR_mean drops from 0.046 to 0.017.
 
-参考:
-- α=1.0 (cosine 単独, F0 不使用) は TPR_median=0.81 / FPR_mean=0.008 — F0 を全く使わないと TPR が ~3 ポイント下がる
-- α=0.9 はその間で「F0 を控えめに使う」スイートスポット
+For reference:
+- `α = 1.0` (cosine only, F0 disabled) gives TPR_median = 0.81 / FPR_mean = 0.008 — disabling F0 entirely costs ~3 points of TPR.
+- `α = 0.9` is the "sparing F0 use" sweet spot in between.
 
-詳細は [`benchmarks/calibration_alpha_beta_summary.json`](benchmarks/calibration_alpha_beta_summary.json) と [`../poc/notebooks/02_alpha_beta_sweep.py`](../poc/notebooks/02_alpha_beta_sweep.py)。
+For details, see [`benchmarks/calibration_alpha_beta_summary.json`](benchmarks/calibration_alpha_beta_summary.json) and [`../poc/notebooks/02_alpha_beta_sweep.py`](../poc/notebooks/02_alpha_beta_sweep.py).
 
-> **Caveat**: calibration の話者は全て英語 LibriSpeech で F0 分布が近い。男女混合や母語横断では β の最適値が上がる可能性が高い。CI baseline (libri1 specific) では α=0.9 で低 SNR の TPR がやや下がる (例: SNR 5 dB で 0.46 → 0.32) — 集計平均で α=0.9 が勝つが特定話者の頑健性とのトレードオフがある。本格的な再 calibration は CommonVoice / VCTK + 話者多様性込みで Phase 2 に行う想定。
+> **Caveat**: the calibration speakers are all English LibriSpeech, so F0 distributions are close. With mixed-gender or cross-language data, the optimal β is likely higher. On the CI baseline (libri1-specific), `α = 0.9` lowers the low-SNR TPR slightly (e.g. 0.46 → 0.32 at SNR 5 dB) — `α = 0.9` wins on the aggregate mean but trades against per-speaker robustness. A full re-calibration with CommonVoice / VCTK and speaker diversity is planned for Phase 2.
 
-## D-006: VoiceFilter-Lite を採用しない
+## D-006: Not adopting VoiceFilter-Lite
 
-### 検討経緯
+### History
 
-Google の VoiceFilter-Lite（2020）は軽量・ストリーミング対応で一見魅力的に見えた。
+Google's VoiceFilter-Lite (2020) looked attractive at first thanks to its lightweight, streaming-friendly nature.
 
-### 却下理由
+### Reason for rejection
 
-論文を直接読むと、VoiceFilter-Lite は：
-- 入力: log-mel filterbank energies
-- 出力: enhanced log-mel filterbank energies
+Reading the paper directly, VoiceFilter-Lite has:
+- Input: log-mel filterbank energies.
+- Output: enhanced log-mel filterbank energies.
 
-つまり **波形を出力しない**。ASR 前処理専用設計で、通話用途には根本的に使えない。SpeakerBeam-SS 論文（Sato et al., Interspeech 2024）も明示的に指摘している：
+In other words, **it does not output waveforms**. It is designed exclusively as an ASR front-end and is fundamentally unusable for call applications. The SpeakerBeam-SS paper (Sato et al., Interspeech 2024) also notes this explicitly:
 
 > "Since VoiceFilter-Lite enhances filterbank features for ASR, it is not suitable for communication applications."
 
-オリジナル VoiceFilter（2019）は波形出力対応だが、ConVoiFilter はその上位互換であり、自前実装する場合でも ConVoiFilter ベースの方が合理的。
+The original VoiceFilter (2019) does output waveforms, but ConVoiFilter is a strict upgrade; even when rolling our own, basing it on ConVoiFilter is more reasonable.
 
-## D-007: WHAM! データセットの扱い
+## D-007: Handling the WHAM! dataset
 
-### 状況
+### Situation
 
-- ConVoiFilter は WHAM! ノイズで訓練されている
-- WHAM! は CC BY-NC 4.0（非商用）
-- ただし本プロジェクトはハードゲーティング型のため、ConVoiFilter は使わない
+- ConVoiFilter is trained on WHAM! noise.
+- WHAM! is CC BY-NC 4.0 (non-commercial).
+- However, since this project is hard-gating, ConVoiFilter is not used.
 
-### 結論
+### Conclusion
 
-本構成では WHAM! 由来モデルを使用しないため、グレーゾーン問題は発生しない：
+This configuration does not use any WHAM!-derived models, so no grey-zone issue arises:
 
-- DFN3: DNS Challenge データ（CC BY 4.0）+ 独自データ
-- silero-vad: 独自データ
-- ECAPA-TDNN: VoxCeleb1+2（公開、非商用利用にやや配慮要）
+- DFN3: DNS Challenge data (CC BY 4.0) + proprietary data.
+- silero-vad: proprietary data.
+- ECAPA-TDNN: VoxCeleb1+2 (public; some non-commercial caveats).
 
-VoxCeleb のライセンス条項は「メディアが BBC/YouTube から取得されている」点で完全クリーンとは言い難い。本プロジェクトの最終的な商用展開時には、ECAPA-TDNN の代替（CommonVoice 等で訓練したもの）を検討する可能性あり。
+The VoxCeleb licence terms are not fully clean given the media is sourced from BBC / YouTube. At full commercial deployment, we may consider an ECAPA-TDNN alternative (e.g. one trained on CommonVoice).
 
-## D-008: ECAPA-TDNN を話者埋め込みとして採用
+## D-008: Adopt ECAPA-TDNN as the speaker embedding
 
-### 検討した代替案
+### Alternatives considered
 
-A. d-vector（VoiceFilter 系で標準）
-B. x-vector（古典的、ConVoiFilter で採用）
-C. ECAPA-TDNN（現代の標準、SpeechBrain で公開）
-D. ECAPA2（2024 改良版）
-E. WavLM ベースの埋め込み
+A. d-vector (standard in the VoiceFilter family).
+B. x-vector (classic; used in ConVoiFilter).
+C. ECAPA-TDNN (modern standard; published by SpeechBrain).
+D. ECAPA2 (2024 improved version).
+E. WavLM-based embedding.
 
-### 採用: C（ECAPA-TDNN）
+### Chosen: C (ECAPA-TDNN)
 
-理由:
-- 性能・効率のバランスが現時点で最良
-- SpeechBrain の `spkrec-ecapa-voxceleb` が Apache 2.0 で公開、即動作
-- ONNX 変換が容易、モバイル展開対応可能
-- D（ECAPA2）は新しいが、公開重みの整備が C より劣る
-- E（WavLM）はモデルサイズが大きく、リアルタイム性に懸念
+Reasons:
+- Currently the best balance of performance and efficiency.
+- SpeechBrain's `spkrec-ecapa-voxceleb` is published under Apache 2.0 and works immediately.
+- ONNX conversion is straightforward; mobile deployment is feasible.
+- D (ECAPA2) is newer, but its published weights are less polished than C.
+- E (WavLM) has a large model size, with real-time concerns.
 
-### 将来的な代替検討
+### Future alternatives to consider
 
-- ECAPA2 への移行（性能優位が確認できれば）
-- TitaNet（NVIDIA、ただし CC-BY-NC で非商用）
-- 自前訓練（CommonVoice ベース、完全クリーンライセンス確保のため）
+- Migrate to ECAPA2 (if a performance advantage is confirmed).
+- TitaNet (NVIDIA; CC-BY-NC, non-commercial).
+- Train our own (CommonVoice-based, to secure fully clean licensing).
 
-## D-009: 言語非依存の設計を維持
+## D-009: Keep the design language-independent
 
-### 判断
+### Decision
 
-DFN3、silero-vad、ECAPA-TDNN いずれも言語非依存。日本語特化のファインチューンは行わない。
+DFN3, silero-vad, and ECAPA-TDNN are all language-independent. We do not run Japanese-specific fine-tuning.
 
-### 理由
+### Reasons
 
-- ECAPA-TDNN は VoxCeleb（多言語）で訓練済み、日本語話者でも動作
-- 日本語特化の話者埋め込みモデルはオープンソースでは限定的
-- 言語非依存設計は使用国を選ばないというメリットがある
+- ECAPA-TDNN is trained on VoxCeleb (multilingual) and works on Japanese speakers.
+- Japanese-specific speaker-embedding models in OSS are limited.
+- Language-independence has the benefit of not being country-specific.
 
-### 将来的な再検討タイミング
+### Future revisit trigger
 
-日本語話者で実機検証して EER が悪化した場合のみ、日本語データでのファインチューンを検討。
+Only if device-level testing on Japanese speakers shows EER regression will we consider fine-tuning on Japanese data.
 
-## D-010: AS-Norm（Adaptive S-Norm）でスコア正規化を導入
+## D-010: Introduce score normalisation with AS-Norm (Adaptive S-Norm)
 
-### 背景
+### Background
 
-PR #17 で導入した Scenario 5 (多言語ロバスト性) の初回 baseline 計測 (real
-pipeline, MLS+Emilia-YODAS, 6 言語 × 4 SNR) で、global θ_pass=0.30 では
-言語間で score 分布が偏ることが定量的に確認された:
+The initial baseline measurement of Scenario 5 (multilingual robustness) introduced in PR #17 (real pipeline, MLS + Emilia-YODAS, 6 languages × 4 SNRs) quantitatively confirmed that, with the global `θ_pass = 0.30`, score distributions skew across languages:
 
 | Lang | TPR | FPR |
 |---|---|---|
@@ -225,80 +223,48 @@ pipeline, MLS+Emilia-YODAS, 6 言語 × 4 SNR) で、global θ_pass=0.30 では
 | **ja** | **0.67** | 0.07 |
 | **zh-CN** | 0.86 | **0.23** |
 
-ja は SNR≤5dB で TPR=0.59 に落ち (FN 偏り)、zh-CN は同 SNR 帯で FPR=0.33
-に上がる (FP 偏り)。**1 つの global θ_pass では同時最適化不能**。
+ja falls to TPR = 0.59 at SNR ≤ 5 dB (FN bias), while zh-CN rises to FPR = 0.33 in the same SNR band (FP bias). **No single global `θ_pass` can jointly optimise both.**
 
-### 検討した代替案
+### Alternatives considered
 
-| 案 | 採否 | 理由 |
+| Option | Decision | Reason |
 |---|---|---|
-| A. per-language θ_pass オーバーライド | 不採用 | 言語ごと手動チューニング、保守困難 |
-| B. **AS-Norm (Adaptive S-Norm)** | **採用** | 業界標準 (>20年)、推論時オーバーヘッド軽量 (cohort K=30 で +30 cosine sim/call)、global threshold 1 つで済む |
-| C. Language-Dependent AS-Norm (Thienpondt 2020) | 将来検討 | LID head 必要、B より複雑度↑ |
-| D. TAS-Norm (2025 trainable) | 将来検討 | 学習データ必要、PoC scope を超える |
-| E. Discriminative condition-aware backend (Ferrer 2019) | 将来検討 | 大量の calibration data + 学習が必要 |
+| A. per-language `θ_pass` overrides | rejected | per-language manual tuning, hard to maintain |
+| B. **AS-Norm (Adaptive S-Norm)** | **chosen** | industry standard (>20 years), light inference-time overhead (+30 cosine sims per call with cohort K = 30), one global threshold suffices |
+| C. Language-Dependent AS-Norm (Thienpondt 2020) | future consideration | needs an LID head, more complex than B |
+| D. TAS-Norm (2025, trainable) | future consideration | needs training data, exceeds the PoC scope |
+| E. Discriminative condition-aware backend (Ferrer 2019) | future consideration | needs lots of calibration data and training |
 
-### 採用: B（AS-Norm）
+### Chosen: B (AS-Norm)
 
-仕組み:
+Mechanism:
 
 ```
 S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 ```
 
-- 推論時に target embedding と enrollment との cosine sim を求めるのに加え、
-  事前構築した **impostor cohort** (多言語の非ターゲット話者 30-50 名分の
-  embedding) との cosine sim も計算
-- top-K (K=10 程度) impostor score の平均と標準偏差で z-score 正規化
-- 言語/ノイズ/録音条件に依存する score 分布の系統バイアスが消え、
-  global θ_pass で複数言語をカバー可能
+- At inference time, in addition to computing the cosine sim between the target embedding and the enrollment, also compute the cosine sims against a pre-built **impostor cohort** (embeddings for 30–50 multilingual non-target speakers).
+- Z-score-normalise by the mean and standard deviation of the top-K (K ≈ 10) impostor scores.
+- Systematic bias in the score distribution that depends on language / noise / recording conditions disappears, so a global `θ_pass` covers multiple languages.
 
-### 実装フェーズ
+### Implementation phases
 
-1. **Phase 1** ✅ (PR #18): cohort build script
-   `scripts/build_impostor_cohort.py` で MLS+Emilia の manifest から
-   ECAPA embedding を抽出し `.npz` で出力
-2. **Phase 2** ✅ (PR #19): `gating.py` に `as_norm_score` / `load_cohort`
-   実装、`GatingConfig` に `use_as_norm` / `as_norm_cohort_path` /
-   `as_norm_top_k` / `theta_pass_as_norm` / `theta_learn_as_norm` 追加、
-   `pipeline.process_offline` の score 経路を分岐、CI で cohort
-   自動 build → scenario_5 に反映
-3. **Phase 3** ✅ (PR #24 + 後段 PR): `scripts/calibrate.py` に AS-Norm 拡張、
-   per-language sweep で `theta_pass_as_norm` を data 駆動で確定、
-   CI 観測値で baseline を文書化。`scenario_5.yml --fpr-max` の引き締めは
-   後述の理由により **見送り** (cohort 規模に起因する run-to-run variance が
-   CI hard-fail を不安定にするため)。
-4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + actions/cache 化
-5. **Phase 5** ✅ (PR #27 + PR #28): cohort 決定化 +
-   HF stream 入力 pin。PR #27 で `mls.prepare` / `emilia.prepare`
-   の選択ロジックを決定化 (speaker は upstream id lex 順、clip は
-   `(-len, sha1)` 順)。PR #28 で HF stream 入力自体を pin —
-   `load_dataset(..., revision=<commit_sha>)` + Emilia は HfApi で
-   shard 一覧を取得 → lex sort して `data_files=` に明示。これで
-   manifest は cache 状態に依らず bit-identical。**threshold tightening
-   は別 PR に分離**: pin 後の安定 baseline を一度観測してから
-   `--fpr-max < --tpr-min` 不変条件付きで設定する。
-6. **Phase 6** (任意): cohort 拡大 (per-language 8 → 50-100、top-K 10 → 20-30)、
-   別 scenario への AS-Norm 横展開、theta_pass_as_norm の data 駆動再
-   calibration — 規模拡大が実現してから再開
+1. **Phase 1** ✅ (PR #18): cohort build script. `scripts/build_impostor_cohort.py` extracts ECAPA embeddings from MLS + Emilia manifests and outputs `.npz`.
+2. **Phase 2** ✅ (PR #19): implement `as_norm_score` / `load_cohort` in `gating.py`; extend `GatingConfig` with `use_as_norm` / `as_norm_cohort_path` / `as_norm_top_k` / `theta_pass_as_norm` / `theta_learn_as_norm`; branch `pipeline.process_offline`'s score path; CI auto-builds the cohort and feeds it to scenario_5.
+3. **Phase 3** ✅ (PR #24 + follow-up PR): add the AS-Norm extension to `scripts/calibrate.py`, fix `theta_pass_as_norm` data-drivenly via a per-language sweep, and document the baseline with CI observations. Tightening `scenario_5.yml --fpr-max` is **deferred** for the reason described below (run-to-run variance from the cohort scale would make the CI hard-fail flaky).
+4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + `actions/cache`-isation.
+5. **Phase 5** ✅ (PR #27 + PR #28): cohort determinisation + pinning the HF stream input. PR #27 determinises the `mls.prepare` / `emilia.prepare` selection logic (speakers by upstream-id lex order; clips by `(-len, sha1)` order). PR #28 pins the HF stream input itself: `load_dataset(..., revision=<commit_sha>)` plus, for Emilia, fetch the shard list via `HfApi`, lex-sort it, and pass it explicitly via `data_files=`. The manifest is now bit-identical regardless of cache state. **Threshold tightening is split into a separate PR**: with the post-pin stable baseline observed once, set values under the `--fpr-max < --tpr-min` invariant.
+6. **Phase 6** (optional): cohort scale-up (per-language 8 → 50–100, top-K 10 → 20–30), extending AS-Norm to other scenarios, and data-driven re-calibration of `theta_pass_as_norm` — resume after the scale-up is realised.
 
-### Phase 2 の設計ノート
+### Phase 2 design notes
 
-- AS-Norm 経路では F0 を per-frame gate decision から外し、cohort
-  正規化された SV 類似度のみで判定する (F0 は引き続き auto-learn 入口の
-  `theta_f0` で使用)。理由: AS-Norm の literature は SV 類似度に直接適用
-  するのが標準で、F0 と z-score を加算するとスケール不整合になる。
-- `theta_pass_as_norm = 1.5` / `theta_learn_as_norm = 2.5` はヒューリスティック
-  初期値。Phase 3 で `scripts/calibrate.py` を AS-Norm 経路で再走して
-  data 駆動で確定する。
-- `use_as_norm = False` を default に維持し、既存 PoC + bench テストが
-  bit-identical に通ることを担保 (`enable_auto_learn` と同じパターン)。
+- On the AS-Norm path, F0 is removed from the per-frame gate decision; the judgment is made purely on the cohort-normalised SV similarity (F0 is still used at the auto-learn admission gate via `theta_f0`). Reason: AS-Norm literature applies it directly to SV similarity, and adding F0 to a z-score creates a scale mismatch.
+- `theta_pass_as_norm = 1.5` / `theta_learn_as_norm = 2.5` are heuristic initial values. Phase 3 re-runs `scripts/calibrate.py` on the AS-Norm path to fix them data-drivenly.
+- `use_as_norm = False` is kept as the default to ensure existing PoC + bench tests still pass bit-identically (same pattern as `enable_auto_learn`).
 
-### Phase 2 実観測 (PR #19 初回 CI run, real pipeline, MLS+Emilia-YODAS, 6 言語)
+### Phase 2 observation (PR #19 initial CI run, real pipeline, MLS + Emilia-YODAS, 6 languages)
 
-PR #17 の legacy `α·cs + β·f0` ベースラインと、PR #19 の AS-Norm (default
-`theta_pass_as_norm=1.5`、cohort 30 embeddings × 6 言語) を per-language
-で比較した結果:
+Comparing PR #17's legacy `α·cs + β·f0` baseline against PR #19's AS-Norm (default `theta_pass_as_norm = 1.5`, cohort 30 embeddings × 6 languages) per-language:
 
 | Lang | TPR (legacy) | TPR (AS-Norm) | Δ TPR | FPR (legacy) | FPR (AS-Norm) | Δ FPR |
 |---|---|---|---|---|---|---|
@@ -311,105 +277,62 @@ PR #17 の legacy `α·cs + β·f0` ベースラインと、PR #19 の AS-Norm (
 | **mean** | 0.78 | **0.82** | **+0.04** | 0.05 | 0.10 | +0.05 |
 | **stddev** | 0.058 | 0.060 | +0.002 | 0.084 | 0.148 | +0.064 |
 
-**評価**:
+**Assessment**:
 
-- **大成功**: ja TPR が 0.67 → 0.85 (+18pp)。低 SNR (0/5dB) で 0.59 → 0.85
-  に改善し、本決定の主目的だった日本語取りこぼし問題が解消。en/fr/ko も
-  微改善で aggregate TPR は +4pp。
-- **新規 regression (2 件)**:
-  - **zh-CN FPR**: 0.23 → 0.42 (+19pp)。SNR=0 で 0.54 まで上昇。tonal 言語の
-    impostor 区別が cohort 30 embeddings (per-language 5) では薄く、top-K=10
-    が cohort 全体の 33% を占めるため normalization が弱い可能性。
-  - **de TPR**: 0.77 → 0.69 (−8pp)。SNR=0 で 0.48 まで落ちる新規 regression。
-    AS-Norm が de の cohort 分布バイアスを意図せず作っている可能性。
-- aggregate FPR は 0.05 → 0.10 (+5pp 悪化、zh-CN 起因)、cross-lang stddev も
-  0.084 → 0.148 と拡大。
+- **Major win**: ja TPR rose from 0.67 to 0.85 (+18 pp). At low SNR (0 / 5 dB) it improved 0.59 → 0.85, resolving the Japanese drop problem that motivated this decision. en / fr / ko also improved slightly, with aggregate TPR up +4 pp.
+- **Two new regressions**:
+  - **zh-CN FPR**: 0.23 → 0.42 (+19 pp); rose to 0.54 at SNR = 0. With a 30-embedding cohort (per-language 5), impostor discrimination for tonal languages is thin, and top-K = 10 occupies 33 % of the whole cohort, so normalisation may be weak.
+  - **de TPR**: 0.77 → 0.69 (−8 pp), dropping to 0.48 at SNR = 0 — a new regression. AS-Norm may be unintentionally biasing the de cohort distribution.
+- Aggregate FPR worsened 0.05 → 0.10 (+5 pp; zh-CN-driven), and cross-language stddev widened from 0.084 to 0.148.
 
-**Phase 3 への示唆**:
+**Implications for Phase 3**:
 
-1. `theta_pass_as_norm = 1.5` のヒューリスティック値が言語ごと過剰/不足。
-   `calibrate.py` の AS-Norm 拡張で sweep してグローバル最適値を求めるのが
-   主軸。
-2. 上記で吸収できない場合のみ Phase 4 として cohort 拡大 (per-language
-   5 → 10) や top-K 引き上げを検討する。事前に決め打ちしない。
-3. 最終的に `theta_pass_as_norm` を更新した時点で scenario_5 hard-fail
-   閾値も引き締める (現在 `--tpr-min 0.3 --fpr-max 0.7` は legacy 観測値
-   からの 27pp バッファ — Phase 3 完了後に縮められる見込み)。
+1. The heuristic `theta_pass_as_norm = 1.5` is too tight or too loose per language. Sweeping with the AS-Norm extension of `calibrate.py` to find a global optimum is the main thrust.
+2. Only if that cannot absorb the issue do we consider Phase 4-style cohort scale-up (per-language 5 → 10) or higher top-K. We do not pre-commit.
+3. Once `theta_pass_as_norm` is updated, also tighten the scenario_5 hard-fail thresholds (currently `--tpr-min 0.3 --fpr-max 0.7` is a 27 pp buffer over the legacy observed values — expected to shrink after Phase 3).
 
-### Phase 2 後の再観測 (PR #21 cohort 診断 + 構造的バグの発見)
+### Re-observation after Phase 2 (PR #21 cohort diagnostics + discovery of a structural bug)
 
-PR #21 で cohort summary を artifact 化した後、PR #19 と PR #21 の cohort
-を比較した結果、**variance はランダム noise ではなく構造的なバグ起因**
-だったことが判明:
+After PR #21 turned the cohort summary into an artifact, comparing PR #19 and PR #21 cohorts revealed that the **variance was not random noise but caused by a structural bug**:
 
-1. **cohort が test 話者を含んでいた** (致命的 algorithm 違反):
-   `scenario_5_from_manifest.py` は同じ manifest から target / other を選択し、
-   cohort も同じ manifest から構築されていた。各 manifest は 3 話者しか
-   含んでいなかったため、cohort = {speaker01, 02, 03}、test = 2 of those。
-   → AS-Norm の "impostor cohort" のはずが target/other 自身を含んでおり、
-   z-score 正規化の前提が崩れていた。
-2. **cohort が想定の半分** (18 vs 30): `mls.prepare` / `emilia.prepare` の
-   default `top_speakers=3` で manifests に 3 話者しか入っていなかった。
-   `--per-language 5` を渡しても 3 しか取れない。top-K=10 / 18 = 56% で
-   literature の上限 (10-30%) を大きく超過。
-3. **同名の "speaker01" が run 間で異なる upstream 話者だった**: prepare
-   段階で「streaming で見つかった順」にラベルを振っていたため、HF datasets
-   の並行 IO 由来の順序揺れがそのまま cohort 内訳に伝播していた。
+1. **The cohort contained test speakers** (a fatal algorithm violation): `scenario_5_from_manifest.py` selected target / other from the same manifest, and the cohort was built from the same manifest. Each manifest contained only 3 speakers, so the cohort was {speaker01, 02, 03} and the test was 2 of those. The "impostor cohort" for AS-Norm was actually including target / other themselves, breaking the premise of z-score normalisation.
+2. **Cohort half the assumed size** (18 vs 30): `mls.prepare` / `emilia.prepare` defaulted to `top_speakers = 3`, putting only 3 speakers into each manifest. Even passing `--per-language 5` could only retrieve 3. top-K = 10 / 18 = 56 %, far exceeding the literature ceiling (10–30 %).
+3. **The same `speaker01` referred to different upstream speakers across runs**: at the prepare stage, labels were assigned in "encounter order while streaming"; ordering jitter from HF datasets' parallel IO propagated directly into the cohort composition.
 
 ### Phase 4: cohort-disjoint fix ✅ (PR #22) + cohort cache stability ✅ (PR #23)
 
-Phase 3 (calibrate.py 拡張) の前に、**まず構造的バグを潰す必要がある** ため
-Phase 4 として優先実施した:
+Before Phase 3 (calibrate.py extensions), **the structural bug had to be killed first**, so we ran Phase 4 as a priority:
 
-- `mls.prepare` / `emilia.prepare` の default `top_speakers` を 3 → 10 に
-  引き上げ。各 manifest に 10 話者用意。
-- `scripts/build_impostor_cohort.py` に `--skip-top-n N` 追加。
-  scenario_5 が test に使う rank を cohort から carve out。
-- `.github/workflows/scenario_5.yml` で `--skip-top-n 2 --per-language 8` を
-  渡す。結果: 各言語 8 cohort 話者 = 48 embeddings、top-K=10 = 21%
-  (literature 範囲)、test と完全分離。
+- Bumped `mls.prepare` / `emilia.prepare`'s default `top_speakers` from 3 to 10. Each manifest now ships 10 speakers.
+- Added `--skip-top-n N` to `scripts/build_impostor_cohort.py`: carve the ranks scenario_5 uses for testing out of the cohort.
+- `.github/workflows/scenario_5.yml` now passes `--skip-top-n 2 --per-language 8`. Result: 8 cohort speakers per language = 48 embeddings, top-K = 10 = 21 % (within the literature range), and fully disjoint from the test set.
 
-PR #22 マージ後、disjoint な cohort で 2 回連続 CI を回したところ
-zh-CN FPR が 0.76 → 0.85 と run-to-run で揺れた。HF datasets streaming の
-非決定的順序で manifest 自体が再生成されるたびに変わるのが原因。**Phase 4
-追加対応** として cohort を `actions/cache@v4` で **永続化 + skip-if-exists
-guard** を追加 (PR #23):
+After PR #22 merged, running CI twice in a row on the disjoint cohort still showed zh-CN FPR fluctuating 0.76 → 0.85 between runs. The cause was that HF datasets streaming's non-deterministic order made the manifest itself regenerate differently on each cache miss. As an **additional Phase 4 measure**, we persisted the cohort with `actions/cache@v4` plus a skip-if-exists guard (PR #23):
 
-- cache key に `scripts/build_impostor_cohort.py` のハッシュを追加 →
-  selection ロジックが変わったら自動 invalidate。
-- cache key を v1 → v2 に bump して既存の broken-cohort cache を強制廃棄。
-- workflow の cohort build step に "if exists, skip" guard。1 度生成された
-  `.npz` は cache hit が続く限りそのまま使い回される → 完全決定的。
-- 新言語追加 / `top_speakers` 変更などで再生成したい場合は cache key を
-  bump (v2 → v3) すれば良い。repo に commit する必要なし (~38 KB だが
-  毎回 git に乗せるよりキャッシュの方が運用が軽い)。
+- Added the hash of `scripts/build_impostor_cohort.py` to the cache key, so the cache auto-invalidates if the selection logic changes.
+- Bumped the cache key v1 → v2 to force-discard the existing broken-cohort cache.
+- Added a "skip if exists" guard to the workflow's cohort build step. Once generated, the `.npz` is reused as long as the cache hit continues — fully deterministic.
+- To regenerate after adding a new language or changing `top_speakers`, just bump the cache key (v2 → v3); no need to commit it to the repo (~38 KB, but caching is operationally lighter than putting it into git every time).
 
-これで Phase 3 の calibrate.py 拡張に進める前提が整った。Phase 4 の修正前に
-キャリブレーションしても "壊れた cohort" の上で fitting するだけになる。
+This makes Phase 3's `calibrate.py` extensions ready to start. Calibrating without Phase 4's fix would just fit on top of a "broken cohort."
 
-### Phase 3: calibrate.py AS-Norm 拡張 (PR #24)
+### Phase 3: calibrate.py AS-Norm extension (PR #24)
 
-PR #23 で cohort が CI cache 経由で完全決定的になった後、`scripts/calibrate.py`
-に AS-Norm 経路の sweep を追加した:
+After PR #23 made the cohort fully deterministic via CI cache, we added an AS-Norm sweep to `scripts/calibrate.py`:
 
-- 新 CLI フラグ `--use-as-norm --cohort PATH`。両方必須。
-- 新 sweep 範囲 `THETA_GRID_AS_NORM = (0.5, 0.75, ..., 3.0)`。z-score scale
-  に合わせて 11 段階。legacy の `THETA_GRID` (0.20-0.55、cosine scale) は維持。
-- 出力ファイルが mode で分岐:
-  - legacy → `docs/benchmarks/calibration_{results.csv,summary.json}`
-  - as_norm → `docs/benchmarks/calibration_as_norm_{results.csv,summary.json}`
-- `recommend_theta()` を引数化 (`max_mean_fpr` / `min_tpr_floor`)。AS-Norm 用
-  default は `MAX_MEAN_FPR_AS_NORM = 0.10` (PR #23 の per-language FPR spread
-  が広いため legacy の 0.05 を緩めた)。
-- CSV/summary に `mode` 列を追加。schema_version 1 → 2。
-- ライトユニットテスト (10 件) を `bench/tests/test_scripts_calibrate.py` に追加:
-  theta grid 範囲、`_simulate_gate` の AS-Norm/legacy 分岐、`recommend_theta`
-  の各 fallback、`--use-as-norm` で `--cohort` 必須のチェック。
+- New CLI flags `--use-as-norm --cohort PATH`. Both required.
+- New sweep range `THETA_GRID_AS_NORM = (0.5, 0.75, ..., 3.0)` — 11 steps to match the z-score scale. The legacy `THETA_GRID` (0.20–0.55, cosine scale) is kept.
+- Output files branch by mode:
+  - legacy → `docs/benchmarks/calibration_{results.csv,summary.json}`.
+  - as_norm → `docs/benchmarks/calibration_as_norm_{results.csv,summary.json}`.
+- `recommend_theta()` is parametrised (`max_mean_fpr` / `min_tpr_floor`). The AS-Norm default is `MAX_MEAN_FPR_AS_NORM = 0.10`, loosened from legacy's 0.05 because the per-language FPR spread observed in PR #23 is wide.
+- Added a `mode` column to the CSV / summary; schema_version 1 → 2.
+- Added 10 lightweight unit tests in `bench/tests/test_scripts_calibrate.py`: theta grid range, the AS-Norm / legacy branch in `_simulate_gate`, each fallback in `recommend_theta`, and the check that `--cohort` is required when `--use-as-norm` is set.
 
-実行手順 (user 手元):
+How to run (locally):
 
 ```bash
-# 1. cohort を build (まだなら)
+# 1. Build the cohort (if not already)
 python scripts/build_impostor_cohort.py \
     --manifest en=$MELLONELLA_DATA_DIR/emilia_yodas/en/manifest.csv \
     --manifest ja=$MELLONELLA_DATA_DIR/emilia_yodas/ja/manifest.csv \
@@ -417,7 +340,7 @@ python scripts/build_impostor_cohort.py \
     --skip-top-n 2 --per-language 8 \
     --output bench/data/cohorts/scenario5_cohort_v1.npz
 
-# 2. AS-Norm calibration sweep (per language で繰り返し or 連結 manifest)
+# 2. AS-Norm calibration sweep (repeat per language or use a concatenated manifest)
 python scripts/calibrate.py \
     --use-as-norm \
     --cohort bench/data/cohorts/scenario5_cohort_v1.npz \
@@ -425,190 +348,97 @@ python scripts/calibrate.py \
     --language ja
 ```
 
-結果 (`calibration_as_norm_summary.json`) の `recommended_theta_pass` を
-`GatingConfig.theta_pass_as_norm` のデフォルトに反映する PR を別立てで
-出す (Phase 3 後段)。その後 `scenario_5.yml` の `--fpr-max` を引き締め予定
-だったが、後述のとおり **CI 観測 variance により今回は見送り**。
+A separate follow-up PR was planned to propagate `recommended_theta_pass` from `calibration_as_norm_summary.json` into the default of `GatingConfig.theta_pass_as_norm` (Phase 3 follow-up), with `scenario_5.yml --fpr-max` tightened afterwards. As described below, **the tightening is deferred** due to CI-observed variance.
 
-### Phase 3 後段: CI baseline 観測と threshold 据え置き判断
+### Phase 3 follow-up: CI baseline observation and decision to hold the threshold
 
-PR #24 マージ後、cohort-disjoint + cache-frozen な状態 (PR #22 + #23) で
-複数回 scenario_5 を回し、`theta_pass_as_norm = 1.5` のままどの程度安定
-するかを観察した:
+After PR #24 merged, scenario_5 was run multiple times in a cohort-disjoint + cache-frozen state (PR #22 + #23) to observe how stable `theta_pass_as_norm = 1.5` is:
 
 | Run | TPR mean | FPR mean | zh-CN FPR mean | zh-CN per-row max |
 |---|---|---|---|---|
-| PR #23 直後 | 0.79 | 0.15 | 0.31 | 0.62 |
-| PR #24 マージ直後 | 0.77 | 0.13 | 0.31 | ~0.6 |
-| 続き run 1 | 0.74 | 0.11 | 0.34 | 0.71 |
-| 続き run 2 | 0.77 | 0.10 | 0.31 | ~0.6 |
+| Just after PR #23 | 0.79 | 0.15 | 0.31 | 0.62 |
+| Just after PR #24 merge | 0.77 | 0.13 | 0.31 | ~0.6 |
+| Follow-up run 1 | 0.74 | 0.11 | 0.34 | 0.71 |
+| Follow-up run 2 | 0.77 | 0.10 | 0.31 | ~0.6 |
 
-aggregate 値 (TPR mean ~0.77、FPR mean ~0.12) は run 間で ±2-3pp 程度に
-収束しているが、**zh-CN per-row max は 0.6-0.85 で大きく揺れる**。原因は
-Phase 4 で議論した HF datasets streaming の非決定性が cache miss のたびに
-再発し、cohort 構成 (どの 8 話者が ranks 2-9 に入るか) が変わるため、
-AS-Norm の μ/σ がずれて zh-CN の特定 row のみ突き抜ける。
+The aggregate values (TPR mean ~0.77, FPR mean ~0.12) converge to within ±2–3 pp across runs, but **the zh-CN per-row max fluctuates 0.6–0.85**. The cause is exactly the HF datasets streaming non-determinism discussed in Phase 4 recurring on each cache miss: the cohort composition (which 8 speakers fall into ranks 2-9) changes, AS-Norm's μ / σ shifts, and only certain zh-CN rows spike out.
 
-**判断**: `--fpr-max` を観測 baseline に合わせて引き締める (例 0.95 → 0.4)
-と PR #25 で実証されたとおり 1-2 run に 1 回 hard-fail し、CI が
-"AS-Norm の真の regression 検出" ではなく "cohort cache の世代差による
-ノイズ" を拾うようになる。Phase 3 完了の意味付けを **「閾値引き締め」**
-ではなく **「閾値の data 駆動候補値の特定 + CI 観測値の文書化」** に
-変更する:
+**Decision**: tightening `--fpr-max` to match the observed baseline (e.g. 0.95 → 0.4) was demonstrated by PR #25 to hard-fail once every 1–2 runs, with CI then catching "noise from cohort cache generation differences" rather than "true AS-Norm regressions." We reinterpret "Phase 3 complete" as **"identify data-driven threshold candidates and document CI observations"** rather than **"tighten the threshold"**:
 
-- `theta_pass_as_norm = 1.5` は CI baseline (PR #23-25 で TPR mean 0.77、
-  FPR mean 0.13 前後) を達成する spec として確定。
-- `scenario_5.yml --fpr-max 0.95` は据え置き。catastrophic regression
-  (例: cohort が壊れて FPR > 0.9) を catch する safety net としては
-  機能するが、この緩さは **conscious choice** で、Phase 4 で cohort 規模を
-  拡大して variance を抑えるまでは tightening しない。
-- 真の data 駆動 calibration (Phase 3 当初目標) は cohort 規模が
-  literature 推奨の 50-100 spk/lang に達してから再走する。現在の
-  per-language 8 spk = 48 cohort embeddings は足元の variance を切るには
-  小さすぎる。
+- `theta_pass_as_norm = 1.5` is fixed as the spec achieving the CI baseline (TPR mean 0.77 / FPR mean 0.13 across PR #23–25).
+- `scenario_5.yml --fpr-max 0.95` is held. It still functions as a safety net catching catastrophic regressions (e.g. broken cohort with FPR > 0.9), but this looseness is a conscious choice; we do not tighten until the cohort scale-up tames the variance in Phase 4.
+- A truly data-driven calibration (the original Phase 3 goal) is re-run only after the cohort scale reaches the literature recommendation of 50–100 spk/lang. The current per-language 8 spk = 48 cohort embeddings is too small to cut the variance.
 
-### Phase 3 補足: ローカル sweep による mechanism 検証
+### Phase 3 addendum: mechanism verification via local sweep
 
-ユーザー手元 (mvenv: torch 2.4.1+cpu, speechbrain 1.1.0, DeepFilterNet
-0.5.6) で `scripts/calibrate.py --use-as-norm --cohort cohort_v1.npz` を
-108 cells × 11 θ で 8.5 分かけて流し、`_simulate_gate` の AS-Norm 経路、
-`recommend_theta` の AS-Norm 専用 budget (0.10)、CSV/summary の
-`mode=as_norm` 出力を end-to-end で確認した。**ただしこの sweep の
-recommended θ (= 3.0) は production 値として採用しない**:
+On the user's machine (mvenv: torch 2.4.1+cpu, speechbrain 1.1.0, DeepFilterNet 0.5.6), running `scripts/calibrate.py --use-as-norm --cohort cohort_v1.npz` over 108 cells × 11 θ for 8.5 min end-to-end-verified the AS-Norm path of `_simulate_gate`, the AS-Norm-specific `recommend_theta` budget (0.10), and the `mode = as_norm` output to CSV / summary. **However, the recommended θ from this sweep (= 3.0) is not adopted as a production value**:
 
-- ローカル cohort = MLS de + fr (2 言語、16 話者)、test = librosa libri 英語。
-- cohort 言語と test 言語が disjoint な構図で、AS-Norm の μ がそもそも
-  低めに出るため全 θ で FPR ≫ 0.10 になり、`recommend_theta` の
-  fallback 経路 (= 最厳の θ) で 3.0 が選ばれている。
-- production の cohort は 6 言語 48 話者、test との overlap も含めた
-  実分布なので意味が違う。
+- Local cohort = MLS de + fr (2 languages, 16 speakers); test = librosa libri (English).
+- With cohort and test languages disjoint, AS-Norm's μ comes out low to begin with; FPR ≫ 0.10 at every θ, and `recommend_theta`'s fallback path (= the strictest θ) selects 3.0.
+- The production cohort is 6 languages × 48 speakers and represents the real distribution including overlap with the test, so the meaning differs.
 
-ローカル sweep の役割は **「コードが落ちずに end-to-end 動く」** の確認に
-留め、production 値の決定は Phase 3 後段 (上記表) で行った。
+The role of the local sweep is limited to verifying **"the code runs end-to-end without crashing"**. Production values are decided in the Phase 3 follow-up section (the table above).
 
-### Phase 5: cohort 決定化 (cohort-determinism fix)
+### Phase 5: cohort determinisation (cohort-determinism fix)
 
-Phase 3 後段で観測した zh-CN per-row FPR の 0.6-0.85 揺れは、Phase 4 で
-`actions/cache` を導入してもなお **cache miss のたびに manifest が異なる
-upstream 話者で再生成される** ことが根本原因だった。これは
-`mls.prepare` / `emilia.prepare` の構造的バグ:
+The zh-CN per-row FPR fluctuation of 0.6–0.85 observed in the Phase 3 follow-up persisted even after introducing `actions/cache` in Phase 4: the root cause is that **on each cache miss, the manifest is regenerated with different upstream speakers**. This is a structural bug in `mls.prepare` / `emilia.prepare`:
 
-1. HF datasets streaming は同じ split に対して同じ sample 集合を返すが
-   **順序は保証されない** (parallel IO、retry、shard interleave)。
-2. 旧実装は「streaming で出会った順に `speaker01..N` ラベル」「同 speaker
-   から最初に来た K clips」「top-N 揃ったら early-break」だったため、
-   順序揺れがそのまま manifest 内訳の揺れになっていた。
+1. HF datasets streaming returns the same sample set for the same split, but **ordering is not guaranteed** (parallel IO, retry, shard interleave).
+2. The old implementation labelled speakers in encounter order (`speaker01..N`), took the first K clips from each speaker, and early-broke once top-N speakers were collected — so ordering jitter propagated directly into manifest jitter.
 
-**修正** (`bench/mellonella_bench/datasets/mls.py` /
-`bench/mellonella_bench/datasets/emilia.py`):
+**Fix** (`bench/mellonella_bench/datasets/mls.py` and `bench/mellonella_bench/datasets/emilia.py`):
 
-- early-break 撤廃。streaming window (`max_stream=5000`) を最後まで scan。
-- per-speaker bucket cap を `clips_per_speaker × 4` に引き上げ、後段で選別。
-- 後処理で deterministic に選択:
-  - speaker 選択: `(clips_count desc, speaker_id lex asc)` の sort で top-N。
-    数 tied でも lex tiebreak で順序確定。
-  - ラベル割当: 選択集合を **upstream speaker_id 昇順** に並べ替え、
-    `speaker01..N` を順に振る。同じ upstream 話者は常に同じスロット。
-  - clip 選択: `(-len(audio), sha1(audio.tobytes()))` で sort し先頭 K を
-    採用。長い clip = ECAPA に渡す concat が情報量豊かで TPR 安定化に
-    寄与。tiebreak は content-hash で arrival 順非依存。**初版 (sha1
-    のみ) では Emilia-YODAS の 1-2 秒 snippet を引いて ko/fr で per-row
-    TPR が 0.3 を切る事例が出たため length-first に修正。**
-- `scripts/build_impostor_cohort.py` の `select_speakers_for_language` も
-  `(-audio_size, speaker_id)` の lex tiebreak を追加。同 size 話者間の
-  選択が dict-iteration 順に依存していた残りの leak を塞ぐ。
+- Remove the early-break. Scan the streaming window (`max_stream = 5000`) to the end.
+- Raise the per-speaker bucket cap to `clips_per_speaker × 4` and select afterwards.
+- Deterministic post-hoc selection:
+  - Speaker selection: top-N by `(clips_count desc, speaker_id lex asc)`. Even when counts tie, the lex tiebreak fixes the order.
+  - Label assignment: sort the selected set by **upstream `speaker_id` ascending** and assign `speaker01..N` in order. The same upstream speaker always lands in the same slot.
+  - Clip selection: sort by `(-len(audio), sha1(audio.tobytes()))` and adopt the top K. Longer clips → richer information in the concat fed to ECAPA, which stabilises TPR. Tiebreak by content-hash, independent of arrival order. **A first revision (sha1 only) drew 1–2 s snippets from Emilia-YODAS, causing per-row TPR below 0.3 on ko / fr; we switched to length-first.**
+- `select_speakers_for_language` in `scripts/build_impostor_cohort.py` also gains an `(-audio_size, speaker_id)` lex tiebreak. This plugs the remaining leak where selection among speakers of equal size depended on dict-iteration order.
 
-**契約テスト** (`bench/tests/test_datasets_{mls,emilia}.py` に
-`test_prepare_is_deterministic_under_streaming_reorder` を追加):
+**Contract test** (added `test_prepare_is_deterministic_under_streaming_reorder` in `bench/tests/test_datasets_{mls,emilia}.py`):
 
-- 同じ fixture を `random.Random(seed)` で 2 種の異なる順序に shuffle し、
-  prepare を 2 回実行
-- manifest.csv を bytes 比較、各 wav を `filecmp.cmp(shallow=False)` で
-  binary 比較。すべて bit-identical を要求。
+- Shuffle the same fixture into two different orderings via `random.Random(seed)` and run prepare twice.
+- Compare manifest.csv as bytes and each wav with `filecmp.cmp(shallow=False)`. All require fully bit-identical results.
 
-加えて build_impostor_cohort 側にも
-`test_select_speakers_uses_lex_tiebreak_for_equal_audio_lengths` を追加し、
-audio 長が tied な 4 話者から lex 上位 2 が選ばれることを assert。
+In addition, `test_select_speakers_uses_lex_tiebreak_for_equal_audio_lengths` was added to build_impostor_cohort, asserting that lex top-2 are selected from 4 speakers tied on audio length.
 
-**cache 影響**: 旧 manifest は CSV としては valid だが speaker01..N が
-別の upstream 話者を指しているため、cache hit でそのまま使うと AS-Norm の
-μ/σ が無音で壊れる。`scenario_5.yml` の cache key を v2 → v3 に bump し、
-旧 cache を破棄して新 prep で再生成する。
+**Cache impact**: the old manifest is valid as CSV, but `speaker01..N` point to different upstream speakers, so reusing it via cache hit silently breaks AS-Norm's μ / σ. Bump `scenario_5.yml`'s cache key v2 → v3 to discard the old cache and regenerate via the new prep.
 
-**期待する効果**:
+**Expected effect**:
 
-- HF streaming の順序揺れに対して manifest が完全に invariant になり、
-  cache miss → 再 prep → 再 cohort build の chain が full deterministic に
-  なる。Phase 4 で `actions/cache` 導入時に残っていた "cache miss = 別
-  cohort" の弱点が消える。
-- これで cohort 規模拡大 (Phase 4 当初目標) や `--fpr-max` 引き締め
-  (Phase 3 後段で見送り) を、再現可能な baseline の上で再開できる。
+- The manifest becomes fully invariant under ordering jitter, so the cache miss → re-prep → re-cohort-build chain becomes fully deterministic. The "cache miss = different cohort" weakness left over after Phase 4's `actions/cache` introduction goes away.
+- This makes it possible to resume cohort scale-up (Phase 4's original goal) and `--fpr-max` tightening (deferred at Phase 3 follow-up) on a reproducible baseline.
 
-### Phase 5 後段: HF revision pin (true idempotency)
+### Phase 5 follow-up: HF revision pin (true idempotency)
 
-PR #27 マージ後に PR #28 で `--tpr-min 0.60 --fpr-max 0.55` の引き締めを
-試みた CI で 2/48 row 失敗を観測 (per-language では fr FPR mean 0.414、
-ja TPR mean 0.793、gate 全体は TPR mean 0.828 / FPR mean 0.118 で健全)。
-Phase 5 が「`mls.prepare` / `emilia.prepare` の選択ロジックを決定化」と
-謳っていたのに何故 baseline が再現しないのかを掘ると、**HF stream 入力
-自体が固定されていない** という穴が残っていた:
+After PR #27 merged, an attempt in PR #28 to tighten to `--tpr-min 0.60 --fpr-max 0.55` saw 2/48 row failures in CI (per-language: fr FPR mean 0.414, ja TPR mean 0.793; the gate as a whole was healthy at TPR mean 0.828 / FPR mean 0.118). Digging into why the baseline did not reproduce — given that Phase 5 had claimed to "determinise the `mls.prepare` / `emilia.prepare` selection logic" — revealed that **the HF stream input itself was not pinned**:
 
-1. `load_dataset(...)` の `revision` 引数が unset → 暗黙に upstream の
-   `main` HEAD を解決。次に dataset が更新されると静かに別 universe
-   になる。
-2. Emilia は `data_files={"train": "Emilia-YODAS/JA/*.tar"}` という glob
-   を渡していたが、HF datasets 内部の `resolve_pattern`
-   (`src/datasets/data_files.py`) は `fs.glob(...).items()` を直接消費し
-   ていて **直後に `sorted()` が無い**。matching tar の順序は
-   fsspec/HfFileSystem 実装任せで契約上は不定。
-3. PR #27 が固定したのは「同じ stream 入力 → 同じ manifest」だけで、
-   stream 入力そのものの再現性は射程外だった。
+1. `load_dataset(...)` was called with `revision` unset, implicitly resolving upstream's `main` HEAD. The next time the dataset updates, you silently end up in a different universe.
+2. Emilia was passing `data_files={"train": "Emilia-YODAS/JA/*.tar"}` — a glob — but HF datasets' internal `resolve_pattern` (`src/datasets/data_files.py`) consumes `fs.glob(...).items()` directly with **no `sorted()` immediately after**. The order of matching tars is implementation-defined by fsspec / HfFileSystem and contractually undefined.
+3. PR #27 only fixed "same stream input → same manifest"; reproducibility of the stream input itself was out of scope.
 
-**修正** (PR #28):
+**Fix** (PR #28):
 
-- `bench/mellonella_bench/datasets/{mls,emilia}.py` に
-  `DATASET_REVISION` 定数 (commit SHA) を追加し、`load_dataset(...,
-  revision=DATASET_REVISION)` で pin。
-  - MLS: `facebook/multilingual_librispeech@2e83e61823b4c47dcbcb1980bb88601274127609`
-    (2024-08-12)
-  - Emilia: `amphion/Emilia-Dataset@d7f2f7340a6385696f3766c8049fa920a4707c07`
-    (2025-02-28)
-- Emilia の glob を撤廃。`HfApi().list_repo_files(...,
-  revision=DATASET_REVISION)` で shard 一覧を取得 → lex sort →
-  `data_files={"train": shards}` で明示的に pinned-and-sorted な順序
-  を `load_dataset` に渡す。これで shard 入力順は
-  `(DATASET_REPO, DATASET_REVISION, language)` のみの関数になる。
-- `scenario_5.yml` の cache key を v4 → v5 に bump。pre-pin 時代に
-  unsorted glob で構築されていた v4 manifest cache が再利用されると
-  `prepare()` の冒頭 short-circuit で新コードに食わされる古い manifest
-  が温存されるため。
+- Add a `DATASET_REVISION` constant (commit SHA) to `bench/mellonella_bench/datasets/{mls,emilia}.py` and pin via `load_dataset(..., revision=DATASET_REVISION)`.
+  - MLS: `facebook/multilingual_librispeech@2e83e61823b4c47dcbcb1980bb88601274127609` (2024-08-12).
+  - Emilia: `amphion/Emilia-Dataset@d7f2f7340a6385696f3766c8049fa920a4707c07` (2025-02-28).
+- Drop Emilia's glob. Fetch the shard list via `HfApi().list_repo_files(..., revision=DATASET_REVISION)`, lex-sort, and pass `data_files={"train": shards}` — explicitly pinned-and-sorted ordering into `load_dataset`. Shard input order is now a function only of `(DATASET_REPO, DATASET_REVISION, language)`.
+- Bump `scenario_5.yml`'s cache key v4 → v5: if a v4 manifest cache built with the pre-pin unsorted glob is reused, the opening short-circuit of `prepare()` would let an outdated manifest through to the new code.
 
-**threshold tightening は本 PR では見送り**:
+**Threshold tightening is deferred to a separate PR**:
 
-PR #28 当初の `--tpr-min 0.60 --fpr-max 0.55` (with `fpr_max <
-tpr_min` invariant) は、idempotent な baseline が一度 main で観測され
-てから別 PR で再開する。pin 適用後の安定 baseline で per-row max FPR /
-min TPR を見ながら値を決める。
+PR #28's original `--tpr-min 0.60 --fpr-max 0.55` (with the `fpr_max < tpr_min` invariant) is to resume in a separate PR after observing one idempotent baseline on main. Decide values from the per-row max FPR / min TPR observed on the post-pin stable baseline.
 
-### Phase 5 closeout 残課題
+### Phase 5 closeout: remaining tasks
 
-- main で v5 cache を populate するために merge 後に scenario_5 を
-  一度走らせる (PR merge イベントが workflow を triggerするか
-  `workflow_dispatch` で手動 kick)。
-- 同じ commit を 2 回回して per-row metrics が bit-identical か
-  verify。
-- 通った時点の per-row 表を観測値として記録し、Phase 5 後段 part 2
-  で threshold tightening PR を出す (`fpr_max < tpr_min` 維持)。
+- Run scenario_5 once after merge to populate the v5 cache on main (the merge event triggers the workflow, or kick it manually via `workflow_dispatch`).
+- Run the same commit twice and verify per-row metrics are bit-identical.
+- Record the per-row table at that point as the observed values, and land a threshold-tightening PR in Phase 5 follow-up part 2 (maintaining `fpr_max < tpr_min`).
 
-### 参考文献
+### References
 
-- Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with
-  Domain-Balanced Hard Prototype Mining and Language-Dependent Score
-  Normalization", https://arxiv.org/abs/2007.07689
-- Park et al. (2025) "Trainable Adaptive Score Normalization for
-  Automatic Speaker Verification", https://arxiv.org/abs/2504.04512
-- Ferrer et al. (2019) "A Discriminative Condition-Aware Backend for
-  Speaker Verification", https://arxiv.org/abs/1911.11622
-- Klusáček et al. (2025) "On the influence of language similarity in
-  non-target speaker verification trials",
-  https://arxiv.org/abs/2506.02777
+- Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with Domain-Balanced Hard Prototype Mining and Language-Dependent Score Normalization", https://arxiv.org/abs/2007.07689
+- Park et al. (2025) "Trainable Adaptive Score Normalization for Automatic Speaker Verification", https://arxiv.org/abs/2504.04512
+- Ferrer et al. (2019) "A Discriminative Condition-Aware Backend for Speaker Verification", https://arxiv.org/abs/1911.11622
+- Klusáček et al. (2025) "On the influence of language similarity in non-target speaker verification trials", https://arxiv.org/abs/2506.02777
