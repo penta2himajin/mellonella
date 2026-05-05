@@ -1,130 +1,129 @@
 # References
 
-## 採用コンポーネント
+## Adopted components
 
 ### DeepFilterNet 3
 
-- 論文: Schröter et al., *DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering*, ICASSP 2022
-- リポジトリ: https://github.com/Rikorose/DeepFilterNet
-- ライセンス: MIT / Apache 2.0 デュアル
-- 採用バージョン: DeepFilterNet 3
-- 設定:
-  - サンプリングレート: 48 kHz
-  - フレーム長: 20 ms (`fft_size: 960`)
-  - ホップ長: 10 ms (`hop_size: 480`)
-  - Lookahead: 20 ms (`df_lookahead: 2`)
-  - アルゴリズム遅延: 約 30 ms
+- Paper: Schröter et al., *DeepFilterNet: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering*, ICASSP 2022.
+- Repository: https://github.com/Rikorose/DeepFilterNet
+- License: MIT / Apache 2.0 dual.
+- Adopted version: DeepFilterNet 3.
+- Configuration:
+  - Sampling rate: 48 kHz.
+  - Frame length: 20 ms (`fft_size: 960`).
+  - Hop length: 10 ms (`hop_size: 480`).
+  - Lookahead: 20 ms (`df_lookahead: 2`).
+  - Algorithmic latency: ~30 ms.
 
 ### silero-vad
 
-- リポジトリ: https://github.com/snakers4/silero-vad
-- ライセンス: MIT
-- フレーム長: 30 ms
-- 出力: speech 確信度 [0, 1]
-- ONNX 形式で配布、軽量（約 2 MB）
+- Repository: https://github.com/snakers4/silero-vad
+- License: MIT.
+- Frame length: 30 ms.
+- Output: speech confidence in `[0, 1]`.
+- Distributed in ONNX form, lightweight (~2 MB).
 
-### ECAPA-TDNN（SpeechBrain）
+### ECAPA-TDNN (SpeechBrain)
 
-- 論文: Desplanques et al., *ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in TDNN Based Speaker Verification*, Interspeech 2020
-- 公開モデル: https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb
-- ライセンス: Apache 2.0（コード）+ VoxCeleb 訓練データ依存
-- 出力: 192 次元埋め込み
-- 訓練データ: VoxCeleb1 + VoxCeleb2
+- Paper: Desplanques et al., *ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in TDNN Based Speaker Verification*, Interspeech 2020.
+- Published model: https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb
+- License: Apache 2.0 (code) + dependency on VoxCeleb training data.
+- Output: 192-dim embedding.
+- Training data: VoxCeleb1 + VoxCeleb2.
 
-### F0 抽出
+### F0 extraction
 
-- **YIN**（採用候補 1）: De Cheveigné & Kawahara, 2002, アルゴリズム自体は public domain
-- **CREPE**（採用候補 2）: Kim et al., *CREPE: A Convolutional Representation for Pitch Estimation*, ICASSP 2018, https://github.com/marl/crepe (MIT)
-- **SwiftF0**（採用候補 3）: 軽量、Apple Silicon 最適化
+- **YIN** (candidate 1): De Cheveigné & Kawahara, 2002; the algorithm itself is public domain.
+- **CREPE** (candidate 2): Kim et al., *CREPE: A Convolutional Representation for Pitch Estimation*, ICASSP 2018, https://github.com/marl/crepe (MIT).
+- **SwiftF0** (candidate 3): lightweight, optimised for Apple Silicon.
 
-## 検討して却下した手法・モデル
+## Methods / models considered and rejected
 
-### TSE（オフライン）
+### TSE (offline)
 
 - **ConVoiFilter** (Nguyen et al., ICASSP 2024): https://huggingface.co/nguyenvulebinh/voice-filter
-  - License: Apache 2.0（コード+重み）
-  - チャンク 5 秒、リアルタイム不可、却下
+  - License: Apache 2.0 (code + weights).
+  - 5 s chunks, not real-time, rejected.
 - **ESPnet TD-SpeakerBeam** (LibriMix 16 kHz): https://huggingface.co/espnet/Wangyou_Zhang_librimix_train_enh_tse_td_speakerbeam_raw
-  - License: CC BY 4.0
-  - 双方向アテンション、causal 化には再訓練必要、却下
+  - License: CC BY 4.0.
+  - Bidirectional attention; causal-ising would require retraining; rejected.
 - **SpEx+** (Ge et al., 2020): https://github.com/gemengtju/SpEx_Plus
-  - License: MIT（コード）、訓練データ WSJ0 が LDC 商用ライセンス
-  - 8 kHz fixed、却下
-- **MossFormer2 系**: https://github.com/modelscope/ClearerVoice-Studio
-  - License: Apache 2.0
-  - 音声のみ TSE は SpEx+ 8 kHz のみ、48 kHz 版は SE/SR
+  - License: MIT (code); training data WSJ0 is under LDC's commercial licence.
+  - 8 kHz fixed; rejected.
+- **MossFormer2 family**: https://github.com/modelscope/ClearerVoice-Studio
+  - License: Apache 2.0.
+  - The audio-only TSE variant is SpEx+ 8 kHz only; the 48 kHz variant is SE / SR.
 
-### TSE（ストリーミング、論文ベース）
+### TSE (streaming, paper-based)
 
-- **VoiceFilter-Lite** (Wang et al., Interspeech 2020)
-  - log-mel 入出力で波形再合成不可、ASR 専用、通話用途には不適合
-- **E3Net** (Liu et al., Microsoft, 2022): 公式コード非公開
-- **pDCCRN** (Eskimez et al., Microsoft, ICASSP 2022): 公式コード非公開
+- **VoiceFilter-Lite** (Wang et al., Interspeech 2020): log-mel I/O — cannot resynthesise waveforms; ASR-only; unsuitable for call use.
+- **E3Net** (Liu et al., Microsoft, 2022): no official code released.
+- **pDCCRN** (Eskimez et al., Microsoft, ICASSP 2022): no official code released.
 - **SpeakerBeam-SS** (Sato et al., NTT, Interspeech 2024): https://arxiv.org/abs/2407.01857
-  - S4D ベース、causal、軽量、公式コード非公開
-- **TEA-PSE 1/2/3** (Ju et al., Tencent): 商用化のため非公開
-- **pDeepFilterNet2** (Orosound, SHNU): 公式コード非公開
+  - S4D-based, causal, lightweight; no official code released.
+- **TEA-PSE 1 / 2 / 3** (Ju et al., Tencent): closed source for commercialisation.
+- **pDeepFilterNet2** (Orosound, SHNU): no official code released.
 
-### 48 kHz PSE/TSE（探索結果: 公開モデルなし）
+### 48 kHz PSE / TSE (search result: no public model)
 
-商用化価値が高い領域のため、論文発表されてもオープン化されない構造的傾向：
+This is a commercially valuable area, so even when papers are published the results tend not to be opened structurally:
 
-- Personalized PercepNet (Amazon, 2021): 非公開
-- TEA-PSE 1/2/3 (Tencent): 非公開
-- DNS Challenge baseline (Microsoft): 出力サンプルのみ、モデル重み非公開
-- pDeepFilterNet2: 非公開
+- Personalized PercepNet (Amazon, 2021): closed.
+- TEA-PSE 1 / 2 / 3 (Tencent): closed.
+- DNS Challenge baseline (Microsoft): only output samples are released; weights are closed.
+- pDeepFilterNet2: closed.
 
-Hugging Face / GitHub 全般を系統的に探索した結果、48 kHz クリーンライセンスの TSE/PSE モデルは存在しないと結論。
+After a systematic search of Hugging Face / GitHub, the conclusion is that no 48 kHz cleanly-licensed TSE / PSE model exists.
 
 ### Speech Restoration / Super Resolution
 
 - **MossFormer2_SR_48K (HiFi-SR)** (Zhao et al., ICASSP 2025): https://huggingface.co/alibabasglab/MossFormer2_SR_48K
-  - License: Apache 2.0
-  - 4 秒チャンク、GAN 生成（TTS 訓練データ）、リアルタイム不可、話者個性変質懸念、却下
+  - License: Apache 2.0.
+  - 4 s chunks; GAN-generated (TTS training data); not real-time; concerns about distortion of speaker characteristics; rejected.
 
-## ハードゲーティング型の理論的基盤
+## Theoretical basis for hard-gating
 
 ### Personal VAD
 
-- 論文: Ding et al., *Personal VAD: Speaker-Conditioned Voice Activity Detection*, 2019, https://arxiv.org/abs/1908.04284
-- 重要な記述: "Score Combination (SC)" を baseline として提示。事前訓練済み VAD と SV を組み合わせる方式で、新規モデル訓練不要であることを明示している。
-- 本プロジェクトの理論的根拠となる手法
+- Paper: Ding et al., *Personal VAD: Speaker-Conditioned Voice Activity Detection*, 2019, https://arxiv.org/abs/1908.04284
+- Key passage: presents "Score Combination (SC)" as a baseline — combining a pretrained VAD and a SV system, explicitly stating that no new model training is required.
+- The theoretical basis for this project.
 - Personal VAD 2.0: https://arxiv.org/abs/2204.03793
-- 非公式実装: https://github.com/pirxus/personalVAD
+- Unofficial implementation: https://github.com/pirxus/personalVAD
 
 ### Speaker-Dependent VAD
 
 - Sholokhov et al., *End-to-End Speaker-Dependent Voice Activity Detection*, 2020, https://arxiv.org/abs/2009.09906
 
-## 訓練データセット（参考）
+## Training datasets (for reference)
 
-本プロジェクトでは追加訓練を行わないため、既存モデルが使用したデータセットを記録のみ：
+This project does no additional training; the datasets used by the existing models are recorded only for reference:
 
-| データセット | License | コメント |
+| Dataset | License | Comment |
 |---|---|---|
-| LibriSpeech | CC BY 4.0 | 商用 OK |
-| VoxCeleb1 / VoxCeleb2 | Custom | BBC/YouTube 由来、グレーゾーン |
-| VCTK | CC BY 4.0 / ODC-By 1.0 | 商用 OK |
-| MUSAN | Apache 2.0 | 商用 OK |
-| DEMAND | CC BY-SA 3.0 | 商用 OK |
-| DNS Challenge | MIT (code) / CC BY 4.0 (data) | 商用 OK |
-| WHAM! | CC BY-NC 4.0 | **非商用のみ**、本プロジェクトでは未使用 |
-| WSJ0 | LDC proprietary | 有償、本プロジェクトでは未使用 |
+| LibriSpeech | CC BY 4.0 | Commercial OK |
+| VoxCeleb1 / VoxCeleb2 | Custom | BBC / YouTube-derived; grey zone |
+| VCTK | CC BY 4.0 / ODC-By 1.0 | Commercial OK |
+| MUSAN | Apache 2.0 | Commercial OK |
+| DEMAND | CC BY-SA 3.0 | Commercial OK |
+| DNS Challenge | MIT (code) / CC BY 4.0 (data) | Commercial OK |
+| WHAM! | CC BY-NC 4.0 | **Non-commercial only**; not used in this project |
+| WSJ0 | LDC proprietary | Paid; not used in this project |
 
-## 関連ツールキット
+## Related toolkits
 
 - **WeSep** (Wang et al., 2024): https://github.com/wenet-e2e/WeSep
-  - TSE 用ツールキット、LICENSE 不在のため商用利用不可
-  - 事前学習済みモデルは未公開
+  - TSE toolkit; commercial use blocked due to missing LICENSE.
+  - No pretrained models published.
 - **SpeechBrain**: https://github.com/speechbrain/speechbrain
-  - Apache 2.0、ECAPA-TDNN 重みの配布元
+  - Apache 2.0; distribution source for the ECAPA-TDNN weights.
 - **ESPnet**: https://github.com/espnet/espnet
-  - Apache 2.0、TSE モデル重みの配布元
+  - Apache 2.0; distribution source for TSE model weights.
 - **Asteroid**: https://github.com/asteroid-team/asteroid
-  - MIT、TSE 含む音源分離全般
+  - MIT; covers source separation in general, including TSE.
 
-## 関連商用製品
+## Related commercial products
 
-- **Krisp**: https://krisp.ai/ — クローズドソース、参考リファレンス
-- **NVIDIA Maxine**: https://developer.nvidia.com/maxine — GPU 前提、非商用ライセンスベース
-- **Microsoft Teams Personalized Speech Enhancement**: 内蔵機能、技術詳細非公開
+- **Krisp**: https://krisp.ai/ — closed source; reference for comparison.
+- **NVIDIA Maxine**: https://developer.nvidia.com/maxine — GPU-only; non-commercial-licence-based.
+- **Microsoft Teams Personalized Speech Enhancement**: built-in feature; technical details undisclosed.
