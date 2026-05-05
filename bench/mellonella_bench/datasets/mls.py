@@ -30,13 +30,16 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-# D-010 Phase 6 cohort scale-up: bumped from 10 → 60 to support
-# scenario_5's `--per-language 50` AS-Norm cohort + `--skip-top-n 2`
-# carve-out + an 8-speaker buffer for selection variability across cache
-# rebuilds. The literature recommendation is 50–100 spk/lang; 50 hits
-# the lower bound while keeping prep wall-clock and ECAPA-pass cost
-# tractable in CI (45 min timeout, 6 streams).
-DEFAULT_TOP_SPEAKERS = 60
+# D-010 Phase 6 cohort scale-up: bumped from 10 → 30 to support
+# scenario_5's `--per-language 25` AS-Norm cohort + `--skip-top-n 2`
+# carve-out + a 3-speaker buffer for selection variability across cache
+# rebuilds. The literature recommendation is 50–100 spk/lang, but
+# **MLS test split exhausts at ~30 unique speakers per language**
+# (German test = 30 speakers / 3 394 samples; French test similar).
+# Going above 30 would require switching cohort sourcing to MLS train
+# split or building dual manifests (test for target/other, train for
+# cohort) — deferred to Phase 6 part 1.5.
+DEFAULT_TOP_SPEAKERS = 30
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
 # We over-collect per speaker (up to OVERSAMPLE_FACTOR × clips_per_speaker)
@@ -124,10 +127,11 @@ def prepare(
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
     split: str = DEFAULT_SPLIT,
-    # Phase 6 cohort scale-up bumped 5_000 → 20_000 alongside top_speakers
-    # 10 → 60 — the original budget could not surface 60 distinct speakers
-    # with ≥ clips_per_speaker × OVERSAMPLE_FACTOR clips each.
-    max_stream: int = 20_000,
+    # Phase 6 cohort scale-up bumped 5_000 → 10_000 alongside top_speakers
+    # 10 → 30. MLS test split is small (~3 400 samples for German), so the
+    # iterator usually exhausts well below this cap — the bump is mostly
+    # for languages with a slightly larger test split.
+    max_stream: int = 10_000,
 ) -> Path:
     """Stream MLS for ``language``, materialise top-K speakers + manifest.csv.
 

@@ -90,14 +90,16 @@ class GatingConfig:
     fresh calibration are wired up.
     """
 
-    as_norm_top_k: int = 20
+    as_norm_top_k: int = 15
     """Number of top-scoring impostor cohort entries used in the AS-Norm
     z-score numerator/denominator. Standard literature picks 10–50; we
-    default to 20 after D-010 Phase 6 scaled the scenario_5 cohort from
-    48 embeddings (6 langs × 8 spk, top-K = 21 % of cohort) to 300
-    embeddings (6 langs × 50 spk, top-K = 6.7 % of cohort). The lower
+    default to 15 after D-010 Phase 6 scaled the scenario_5 cohort from
+    48 embeddings (6 langs × 8 spk, top-K = 21 % of cohort) to 150
+    embeddings (6 langs × 25 spk, top-K = 10 % of cohort). The lower
     ratio reduces μ/σ variance on the impostor tail while keeping enough
-    samples for a stable estimate."""
+    samples for a stable estimate. Reaching the literature 50–100 spk/lang
+    cohort + top-K 20–30 requires MLS train-split sourcing — MLS test
+    split exhausts at ~30 speakers/lang. Deferred to Phase 6 part 1.5."""
 
     as_norm_cohort_path: str | None = None
     """Filesystem path to the impostor cohort ``.npz`` produced by

@@ -72,18 +72,18 @@ jobs:
       # informative; v5 wipes pre-revision-pin caches (mls/emilia.prepare
       # now pin DATASET_REVISION + sort the Emilia *.tar shard list, so v4
       # caches built off the unpinned glob may reference different speakers
-      # than the new manifest produces); v6 wipes pre-cohort-scale-up
-      # caches (D-010 Phase 6 bumps DEFAULT_TOP_SPEAKERS 10 → 60 and
-      # max_stream 5_000 → 20_000 in mls/emilia.prepare, so v5 manifests
-      # ship 10 speakers per language and don't satisfy the new
-      # `--per-language 50` cohort selection).
+      # than the new manifest produces); v6 was the first attempt at the
+      # Phase 6 cohort scale-up (top_speakers 10 → 60) but MLS test split
+      # exhausts at ~30 speakers per language so the manifest prep raised
+      # RuntimeError; v7 wipes the v6 cache and ships the corrected scale
+      # (top_speakers 10 → 30, --per-language 25 in cohort build).
       - name: Cache MLS + Emilia subset materials + AS-Norm cohort
         uses: actions/cache@v4
         with:
           path: data
-          key: scenario5-data-v6-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
+          key: scenario5-data-v7-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
           restore-keys: |
-            scenario5-data-v6-${{ runner.os }}-
+            scenario5-data-v7-${{ runner.os }}-
 
       # ---- Prepare per-language subsets ----
       # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
@@ -129,11 +129,13 @@ jobs:
       #
       # `--skip-top-n 2` matches scenario_5_from_manifest.py's default
       # `--top-speakers 2` so the speakers used as test target / other are
-      # carved out of the cohort. D-010 Phase 6 scale-up: `--per-language 50`
-      # takes ranks 2-51 → 6 langs × 50 spk = 300 cohort embeddings, top-K=20
-      # = 6.7% of cohort (within literature-recommended 5-30% range; the
-      # tighter ratio reduces variance vs the 21% used in Phase 4-5 which
-      # was constrained by the 8-speaker cohort).
+      # carved out of the cohort. D-010 Phase 6 scale-up: `--per-language 25`
+      # takes ranks 2-26 → 6 langs × 25 spk = 150 cohort embeddings, top-K=15
+      # = 10 % of cohort (within literature-recommended 5-30 % range; halves
+      # the 21 % ratio used in Phase 4-5 which was constrained by the
+      # 8-speaker cohort). Reaching the literature 50–100 spk/lang requires
+      # MLS train-split sourcing or dual manifests — deferred to Phase 6
+      # part 1.5; MLS test split caps at ~30 speakers/lang.
 
       - name: Build AS-Norm impostor cohort (skip if cached)
         run: |
@@ -159,7 +161,7 @@ jobs:
           python scripts/build_impostor_cohort.py \
             "${ARGS[@]}" \
             --skip-top-n 2 \
-            --per-language 50 \
+            --per-language 25 \
             --output data/cohorts/scenario5_cohort.npz
 
       # ---- Build the --manifest argument list dynamically and run scenario_5 ----
