@@ -65,6 +65,12 @@ Phase 1 PoC is in progress. The Python implementation lives under
 model-setup helpers under [`scripts/`](scripts/), and CI under
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
+## Contributing
+
+Bug reports, feature requests, and PRs are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and
+[SECURITY.md](SECURITY.md) for security disclosures.
+
 ## License
 
 Distributed under the [Apache License 2.0](LICENSE). Bundled pretrained
