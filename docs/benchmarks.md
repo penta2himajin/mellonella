@@ -1,296 +1,291 @@
 # Benchmarks
 
-## 評価方針
+## Evaluation policy
 
-PoC 段階での性能検証のため、**ミニマルかつ商用クリーンライセンス**のベンチマークデータセットを組み合わせる。本ドキュメントは：
+For PoC-stage performance verification, this combines **minimal and commercially clean** benchmark datasets. This document defines:
 
-- 評価したい指標
-- 採用するデータセットとライセンス
-- 評価シナリオ
-- ミニマル評価セットの構成
+- The metrics to evaluate.
+- The datasets to adopt and their licences.
+- Evaluation scenarios.
+- The composition of the minimal eval set.
 
-を定める。
+## Metrics to evaluate
 
-## 評価したい指標
+### A. NS (DFN3) quality
 
-### A. NS（DFN3）品質
-
-| 指標 | 説明 | 範囲 |
+| Metric | Description | Range |
 |---|---|---|
-| PESQ | ITU-T P.862、知覚的音声品質 | -0.5〜4.5 |
-| STOI | Short-Time Objective Intelligibility | 0〜1 |
+| PESQ | ITU-T P.862, perceptual speech quality | -0.5..4.5 |
+| STOI | Short-Time Objective Intelligibility | 0..1 |
 | SI-SDR | Scale-Invariant Signal-to-Distortion Ratio | dB |
-| DNSMOS P.835 | Microsoft の non-intrusive perceptual quality metric (SIG/BAK/OVRL) | 1〜5 |
-| UTMOS | non-intrusive UTokyo MOS predictor | 1〜5 |
+| DNSMOS P.835 | Microsoft's non-intrusive perceptual quality metric (SIG / BAK / OVRL) | 1..5 |
+| UTMOS | Non-intrusive UTokyo MOS predictor | 1..5 |
 
-### B. VAD 精度
+### B. VAD accuracy
 
-| 指標 | 説明 |
+| Metric | Description |
 |---|---|
-| Frame-level F1 | speech/non-speech のフレーム単位 F1 |
-| Frame accuracy | 正解フレーム / 全フレーム |
-| Onset/Offset error | 発話開始/終了時刻の誤差（ms） |
+| Frame-level F1 | Per-frame F1 over speech / non-speech |
+| Frame accuracy | Correct frames / total frames |
+| Onset / Offset error | Onset / offset time error (ms) |
 
-### C. SV 判定精度
+### C. SV decision accuracy
 
-| 指標 | 説明 |
+| Metric | Description |
 |---|---|
-| EER | Equal Error Rate（target vs non-target） |
-| Gating accuracy | フレームレベルでの正解判定率 |
-| False Positive rate | 他話者を pass してしまう率 |
-| False Negative rate | 対象話者を mute してしまう率 |
+| EER | Equal Error Rate (target vs non-target) |
+| Gating accuracy | Per-frame correct decision rate |
+| False Positive rate | Rate at which other speakers get passed |
+| False Negative rate | Rate at which the target gets muted |
 
-### D. 統合パイプライン
+### D. Integrated pipeline
 
-| 指標 | 説明 |
+| Metric | Description |
 |---|---|
-| 全指標の組合せ | A〜C すべて |
-| 総レイテンシ実測 | 入力 → 出力の wall-clock |
-| CPU 使用率 | 単一スレッド時の使用率 |
-| メモリフットプリント | 推論時のピーク使用量 |
+| All-metric combination | A through C combined |
+| Measured total latency | Wall-clock from input to output |
+| CPU usage | Single-thread usage |
+| Memory footprint | Peak usage at inference |
 
-### E. 主観評価（補助）
+### E. Subjective evaluation (auxiliary)
 
-PoC 段階で自分・家族・同僚による試聴：
+PoC-stage listening by self / family / colleagues:
 
-- 5段階 MOS 評価（1: bad → 5: excellent）
-- A/B test: 元音声 vs 処理後、ハードゲーティング vs DFN3単体
+- 5-point MOS rating (1: bad → 5: excellent).
+- A/B test: raw audio vs processed; hard-gating vs DFN3 standalone.
 
-## 採用データセット
+## Adopted datasets
 
-### NS 品質評価: VoiceBank+DEMAND
+### NS-quality evaluation: VoiceBank+DEMAND
 
-業界標準の SE 評価ベンチマーク。
+Industry-standard SE evaluation benchmark.
 
-- **VoiceBank (VCTK)**: CC BY 4.0 / ODC-By 1.0
-- **DEMAND**: CC BY-SA 3.0
-- **構成**:
-  - test set: 824 paired utterances, 2 話者（unseen）, 5-10 noise types
-  - SNR: 2.5 / 7.5 / 12.5 / 17.5 dB
-  - 16 kHz / 48 kHz どちらでも利用可能
-- **役割**: DFN3 単体の NS 性能、PESQ/STOI/CSIG/CBAK/COVL の標準ベースライン取得
+- **VoiceBank (VCTK)**: CC BY 4.0 / ODC-By 1.0.
+- **DEMAND**: CC BY-SA 3.0.
+- **Composition**:
+  - Test set: 824 paired utterances, 2 unseen speakers, 5–10 noise types.
+  - SNR: 2.5 / 7.5 / 12.5 / 17.5 dB.
+  - Usable at either 16 kHz or 48 kHz.
+- **Role**: DFN3-standalone NS performance; standard PESQ / STOI / CSIG / CBAK / COVL baseline.
 
-### 多言語ロバスト性: Mozilla Common Voice
+### Multilingual robustness: Mozilla Common Voice
 
-CommonVoice は CC0 ライセンスで 250+ 言語をカバー。本プロジェクトの主軸となる多言語評価データセット。
+CommonVoice is CC0-licensed and covers 250+ languages — the primary multilingual evaluation dataset for this project.
 
-- **License**: CC0-1.0（パブリックドメイン）
-- **制約**:
-  - 再ホスト・再配布不可（自身のプロジェクト内利用は OK）
-  - 話者の身元特定試行不可
-- **規模**: v18 時点で 31,841 時間（validated 20,789 時間）、v23/v24 でさらに拡張
-- **PoC 用サブセット**: 主要 5-10 言語、各 50 発話程度を抽出
-- **対象言語候補**:
+- **License**: CC0-1.0 (public domain).
+- **Constraints**:
+  - No re-hosting / no redistribution (in-project use is OK).
+  - No attempts to identify speakers.
+- **Scale**: 31,841 hours as of v18 (validated 20,789 hours); further expanded in v23 / v24.
+- **PoC subset**: extract ~50 utterances each from the main 5–10 languages.
+- **Target language candidates**:
 
-| 言語 | コード | 用途 |
+| Language | Code | Purpose |
 |---|---|---|
-| 英語 | en | 標準・ベースライン |
-| 日本語 | ja | 主要利用言語 |
-| ドイツ語 | de | 印欧語、子音多め |
-| フランス語 | fr | 印欧語、母音強め |
-| 中国語 | zh-CN | 声調言語 |
-| スペイン語 | es | 印欧語、ロマンス |
-| 韓国語 | ko | 膠着語 |
-| アラビア語 | ar | 非印欧語 |
+| English | en | Standard / baseline |
+| Japanese | ja | Primary use language |
+| German | de | Indo-European, consonant-heavy |
+| French | fr | Indo-European, vowel-strong |
+| Chinese | zh-CN | Tonal language |
+| Spanish | es | Indo-European, Romance |
+| Korean | ko | Agglutinative |
+| Arabic | ar | Non-Indo-European |
 
-ECAPA-TDNN は VoxCeleb（多言語）で訓練されているため、原則として言語非依存だが、各言語での EER 検証で実機性能を確認する。
+ECAPA-TDNN is trained on VoxCeleb (multilingual), so it is in principle language-independent; per-language EER verifies real-world performance.
 
-### 補助多言語: Multilingual LibriSpeech (MLS)
+### Auxiliary multilingual: Multilingual LibriSpeech (MLS)
 
-audiobook 由来の高品質スタジオ録音。Common Voice より発話品質が均一で、評価結果のばらつきを抑えるのに向く。
+High-quality studio recordings from audiobooks. Utterance quality is more uniform than CommonVoice, useful for reducing evaluation variance.
 
-- **License**: CC0（パブリックドメイン、LibriVox + Project Gutenberg 由来）
-- **言語**: 8 言語（英語、ドイツ語、オランダ語、スペイン語、フランス語、イタリア語、ポルトガル語、ポーランド語）
-- **規模**: 英語 44.5K 時間、その他合計 6K 時間
-- **配布**: HuggingFace `facebook/multilingual_librispeech`
-- **PoC 用途**: test split から各言語 30-50 発話抽出
+- **License**: CC0 (public domain; derived from LibriVox + Project Gutenberg).
+- **Languages**: 8 (English, German, Dutch, Spanish, French, Italian, Portuguese, Polish).
+- **Scale**: English 44.5K hours; the rest combined 6K hours.
+- **Distribution**: HuggingFace `facebook/multilingual_librispeech`.
+- **PoC use**: extract 30–50 utterances per language from the test split.
 
-### ノイズデータセット
+### Noise datasets
 
 #### MUSAN (Apache 2.0)
 
-- **License**: Creative Commons (flexible)
-- **規模**: 約 60 GB
-- **構成**: speech / music / noise の 3 カテゴリ
-- **役割**: 多様なノイズ条件でのカスタム評価セット生成
-- **配布**: OpenSLR (http://www.openslr.org/17/)
+- **License**: Creative Commons (flexible).
+- **Scale**: ~60 GB.
+- **Composition**: speech / music / noise (3 categories).
+- **Role**: generate custom eval sets across diverse noise conditions.
+- **Distribution**: OpenSLR (http://www.openslr.org/17/).
 
 #### DEMAND (CC BY-SA 3.0)
 
-- **License**: CC BY-SA 3.0
-- **構成**: 18 種類のリアル環境録音（kitchen, office, park, traffic 等）
-- **役割**: VoiceBank+DEMAND として標準利用、リアルな環境ノイズ
-- **派生物 ShareAlike 義務あり**（最終出力データの公開時）
+- **License**: CC BY-SA 3.0.
+- **Composition**: 18 types of real-environment recordings (kitchen, office, park, traffic, etc.).
+- **Role**: standard use as VoiceBank+DEMAND, providing realistic environment noise.
+- **Derivative works require ShareAlike** (when publishing final outputs).
 
 #### DNS Challenge dataset (CC BY 4.0 / MIT)
 
-- **License**: コード MIT、データ CC BY 4.0
-- **規模**: fullband (48 kHz) 大規模
-- **役割**:
-  - DFN3 が訓練に使用したデータセットの一部
-  - DNS5 (ICASSP 2023) test set はパーソナライズタスク含む
-- **配布**: https://github.com/microsoft/DNS-Challenge
+- **License**: code MIT, data CC BY 4.0.
+- **Scale**: fullband (48 kHz), large-scale.
+- **Role**:
+  - Part of the dataset DFN3 was trained on.
+  - The DNS5 (ICASSP 2023) test set includes personalised tasks.
+- **Distribution**: https://github.com/microsoft/DNS-Challenge.
 
-### 多話者シナリオ: LibriMix
+### Multi-speaker scenarios: LibriMix
 
-- **License**: CC BY 4.0（LibriSpeech 由来）
-- **生成方法**: スクリプト公開、自前で生成可能
-- **構成**: 2話者・3話者混合
-- **WHAM! 不使用版**: `mix_clean` モードで WHAM! を使わずに生成可能 → 商用クリーン
-- **役割**: 同時発話・順番発話シナリオの定量評価
+- **License**: CC BY 4.0 (derived from LibriSpeech).
+- **Generation**: script published, can be generated locally.
+- **Composition**: 2-speaker / 3-speaker mixtures.
+- **WHAM!-free variant**: can be generated without WHAM! using `mix_clean` mode → commercially clean.
+- **Role**: quantitative evaluation of simultaneous-speech / alternating-speech scenarios.
 
-### 日本語の選択肢
+### Japanese options
 
-CommonVoice ja を主軸とするが、以下も参考データとして利用可能：
+CommonVoice ja is the primary, but the following are usable as reference data:
 
-| データセット | License | 商用利用 |
+| Dataset | License | Commercial use |
 |---|---|---|
-| **CommonVoice (ja)** | CC0 | ✅ 推奨 |
-| JSUT corpus | CC BY-SA 4.0 (text/labels), audio は要個別交渉 | △ TLO 経由 |
-| JVS corpus | 同上 | △ TLO 経由 |
-| ReazonSpeech | CDLA-Sharing-1.0 | ⚠️ 研究用途中心 |
+| **CommonVoice (ja)** | CC0 | ✅ recommended |
+| JSUT corpus | CC BY-SA 4.0 (text/labels); audio requires individual negotiation | △ via TLO |
+| JVS corpus | Same as above | △ via TLO |
+| ReazonSpeech | CDLA-Sharing-1.0 | ⚠️ research-focused |
 
-JSUT/JVS は東京大学 TLO 経由の個別契約が必要。本プロジェクトでは商用展開を見据え、**CommonVoice ja のみを採用**する。
+JSUT / JVS require an individual contract via the University of Tokyo TLO. With commercial deployment in mind, this project adopts **only CommonVoice ja**.
 
-### 採用しないデータセット
+### Datasets not adopted
 
-以下は前回の調査で除外：
+Excluded by prior investigation:
 
-- **WHAM!**: CC BY-NC 4.0、非商用のみ
-- **WSJ0**: LDC proprietary、有償
-- **VoxCeleb1/2**: ECAPA-TDNN の訓練データだが、BBC/YouTube 由来でグレーゾーン。評価専用利用に留める
+- **WHAM!**: CC BY-NC 4.0, non-commercial only.
+- **WSJ0**: LDC proprietary, paid.
+- **VoxCeleb1/2**: training data for ECAPA-TDNN, but BBC / YouTube-derived → grey zone. Use restricted to evaluation only.
 
-## 評価シナリオ
+## Evaluation scenarios
 
-### シナリオ 1: ソロ対象話者 + ノイズ
-
-```
-入力: 対象話者音声 + 環境ノイズ (MUSAN / DEMAND)
-期待: ゲート pass、ノイズ抑制された対象話者音声
-```
-
-評価指標:
-- PESQ, STOI, SI-SDR（NS 品質）
-- True Positive rate（gating）
-- Onset/Offset error（VAD 精度）
-
-### シナリオ 2: ソロ他話者 + ノイズ
+### Scenario 1: solo target speaker + noise
 
 ```
-入力: 他話者音声 + 環境ノイズ
-期待: ゲート mute、無音出力
+Input:    target-speaker audio + environment noise (MUSAN / DEMAND)
+Expected: gate passes; noise-suppressed target audio
 ```
 
-評価指標:
-- True Negative rate（gating）
-- False Positive rate（誤って pass する率）
+Metrics:
+- PESQ, STOI, SI-SDR (NS quality).
+- True Positive rate (gating).
+- Onset / Offset error (VAD accuracy).
 
-### シナリオ 3: 順番発話（対象 → 他者 → 対象）
-
-```
-入力: 対象話者発話 → 沈黙 → 他話者発話 → 沈黙 → 対象話者発話
-期待: 対象部分のみ pass、他者部分は mute
-```
-
-評価指標:
-- Frame-level accuracy
-- Attack time（pass への遷移時間）
-- Release time（mute への遷移時間）
-
-### シナリオ 4: 同時発話（対象 + 他者）
+### Scenario 2: solo other speaker + noise
 
 ```
-入力: 対象話者と他話者の同時発話
-期待: pass（FP 許容方針）、対象話者の明瞭度を保持
+Input:    other-speaker audio + environment noise
+Expected: gate mutes; silent output
 ```
 
-評価指標:
-- 主観評価（対象話者の聞き取りやすさ）
-- 客観 SI-SDR（対象話者音声の歪み）
+Metrics:
+- True Negative rate (gating).
+- False Positive rate (rate of incorrect passes).
 
-### シナリオ 5: 多言語ロバスト性
+### Scenario 3: alternating speech (target → other → target)
 
 ```
-入力: 各言語の対象話者音声 + ノイズ（言語横断）
-期待: 言語に関係なく安定した SV 判定
+Input:    target speaks → silence → other speaks → silence → target speaks
+Expected: only target segments pass; other segments mute
 ```
 
-評価指標:
-- 言語別 EER
-- 言語別 gating accuracy
-- 言語間ばらつきの統計（標準偏差）
+Metrics:
+- Frame-level accuracy.
+- Attack time (transition time to pass).
+- Release time (transition time to mute).
 
-#### 初回 baseline（PR #17, real pipeline, MLS+Emilia-YODAS, 6 言語）
+### Scenario 4: simultaneous speech (target + other)
 
-| Lang | TPR mean | FPR mean | 備考 |
+```
+Input:    target and other speaking simultaneously
+Expected: pass (FP-tolerant policy); preserve target intelligibility
+```
+
+Metrics:
+- Subjective rating (target intelligibility).
+- Objective SI-SDR (distortion of the target audio).
+
+### Scenario 5: multilingual robustness
+
+```
+Input:    per-language target audio + noise (cross-language)
+Expected: stable SV decisions regardless of language
+```
+
+Metrics:
+- Per-language EER.
+- Per-language gating accuracy.
+- Cross-language variation statistics (standard deviation).
+
+#### Initial baseline (PR #17, real pipeline, MLS + Emilia-YODAS, 6 languages)
+
+| Lang | TPR mean | FPR mean | Notes |
 |---|---|---|---|
 | de | 0.77 | 0.02 | ◎ |
 | en | 0.78 | 0.00 | ◎ |
 | fr | 0.80 | 0.00 | ◎ |
 | ko | 0.80 | 0.00 | ◎ |
-| ja | 0.67 | 0.07 | △ 低 SNR で TPR が落ちる (FN 偏り) |
-| zh-CN | 0.86 | 0.23 | △ 低 SNR で FPR 上昇 (FP 偏り) |
+| ja | 0.67 | 0.07 | △ TPR drops at low SNR (FN bias) |
+| zh-CN | 0.86 | 0.23 | △ FPR rises at low SNR (FP bias) |
 
-aggregate: TPR mean 0.78、cross-lang stddev 0.058 / FPR mean 0.05、stddev 0.084。
+Aggregate: TPR mean 0.78, cross-language stddev 0.058; FPR mean 0.05, stddev 0.084.
 
-ja/zh-CN の対称的失敗は **global θ_pass=0.30 では同時最適化不能** であることを示す。
-対応として `docs/decisions.md` D-010 で **AS-Norm** 採用を決定。
-`docs/gating.md`「AS-Norm（Adaptive S-Norm）によるスコア正規化」節も参照。
+The ja / zh-CN symmetric failures show that **no joint optimisation is possible with a single global `θ_pass = 0.30`**. In response, `docs/decisions.md` D-010 decided to adopt **AS-Norm**. See also `docs/gating.md`'s "Score normalisation with AS-Norm (Adaptive S-Norm)" section.
 
-#### Phase 2: AS-Norm 適用後の deltas（PR #19, default `theta_pass_as_norm=1.5`、cohort 30 embeddings）
+#### Phase 2: deltas after AS-Norm (PR #19, default `theta_pass_as_norm = 1.5`, cohort 30 embeddings)
 
-| Lang | Δ TPR | Δ FPR | 備考 |
+| Lang | Δ TPR | Δ FPR | Notes |
 |---|---|---|---|
-| de | **−0.08** | +0.02 | SNR=0 で TPR 0.48 まで落ちる新規 regression |
-| en | +0.02 | 0 | わずかに改善 |
-| fr | +0.03 | +0.03 | TPR 微改善、FPR ほぼ据え置き |
-| ja | **+0.18** | +0.05 | ✅ 主目的の取りこぼし問題解消 |
-| ko | +0.06 | 0 | 改善 |
-| zh-CN | +0.01 | **+0.19** | ❌ FPR 大幅悪化、SNR=0 で 0.54 |
+| de | **−0.08** | +0.02 | New regression; TPR drops to 0.48 at SNR = 0 |
+| en | +0.02 | 0 | Slight improvement |
+| fr | +0.03 | +0.03 | TPR slightly up, FPR roughly unchanged |
+| ja | **+0.18** | +0.05 | ✅ Resolves the primary drop problem |
+| ko | +0.06 | 0 | Improved |
+| zh-CN | +0.01 | **+0.19** | ❌ FPR worsens significantly, 0.54 at SNR = 0 |
 
-aggregate: TPR mean **+0.04** / FPR mean **+0.05** / FPR cross-lang stddev **+0.06**。
+Aggregate: TPR mean **+0.04** / FPR mean **+0.05** / FPR cross-language stddev **+0.06**.
 
-ja は劇的改善、zh-CN は悪化。default `theta_pass_as_norm=1.5` がヒューリスティック
-過ぎることを示している。`docs/decisions.md` D-010「Phase 2 実観測」と Phase 3 計画
-（calibrate.py 拡張で data 駆動キャリブ）参照。
+ja improves dramatically; zh-CN worsens. This shows the default `theta_pass_as_norm = 1.5` is too heuristic. See `docs/decisions.md` D-010 "Phase 2 observation" and the Phase 3 plan (data-driven calibration via the calibrate.py extension).
 
-### シナリオ 6: 経時変化への対応（自動学習効果）
+### Scenario 6: adaptation to time-varying changes (auto-learning effect)
 
 ```
-入力: 同一話者の異なる声質変化（風邪・疲労を模擬、感情の異なる発話）
-期待: 自動学習プールが更新され、判定精度を維持
+Input:    same speaker with different voice-quality changes
+          (cold / fatigue emulation, different-emotion utterances)
+Expected: auto-learn pool updates; decision accuracy maintained
 ```
 
-評価指標:
-- 時間経過での gating accuracy 推移
-- Anchor 距離（drift 検知）
+Metrics:
+- Gating-accuracy trend over time.
+- Anchor distance (drift detection).
 
-## ミニマル評価セット（PoC 段階）
+## Minimal eval set (PoC stage)
 
-PoC では実行時間 < 1 時間 を目標とした最小構成：
+Minimum configuration targeting < 1 hour runtime in PoC:
 
-### サンプル数
+### Sample counts
 
-| データセット | サンプル数 | 用途 |
+| Dataset | Samples | Purpose |
 |---|---|---|
-| VoiceBank+DEMAND test | 100 utterances（ランダム選択） | NS 品質ベース評価（シナリオ 1 の一部） |
-| CommonVoice 5言語 | 各 50 utterances = 250 | 多言語ロバスト性（シナリオ 5） |
-| MLS 5言語 | 各 30 utterances = 150 | 高品質多言語補助 |
-| MUSAN | 各カテゴリ 10 noises = 30 | カスタム混合用ノイズ |
-| LibriMix mix_clean test | 100 mixtures | 多話者シナリオ（シナリオ 2/3/4） |
+| VoiceBank+DEMAND test | 100 utterances (random) | NS quality baseline (part of Scenario 1) |
+| CommonVoice 5 languages | 50 utterances each = 250 | Multilingual robustness (Scenario 5) |
+| MLS 5 languages | 30 utterances each = 150 | High-quality multilingual auxiliary |
+| MUSAN | 10 noises per category = 30 | Noise for custom mixtures |
+| LibriMix mix_clean test | 100 mixtures | Multi-speaker scenarios (Scenarios 2 / 3 / 4) |
 
-合計 約 630 評価サンプル
+Total: ~630 evaluation samples.
 
-### 評価実行構成
+### Evaluation run composition
 
-PoC 段階では：
+In PoC stage:
 
-1. **シナリオ 1（ソロ + ノイズ）**: VoiceBank+DEMAND を主軸、MUSAN を補助
-2. **シナリオ 2/3/4（多話者）**: LibriMix を主軸
-3. **シナリオ 5（多言語）**: CommonVoice + MLS をクロス利用
-4. **シナリオ 6（自動学習）**: 自前収録音声で長時間試験
+1. **Scenario 1 (solo + noise)**: VoiceBank+DEMAND primary, MUSAN auxiliary.
+2. **Scenarios 2 / 3 / 4 (multi-speaker)**: LibriMix primary.
+3. **Scenario 5 (multilingual)**: cross-use CommonVoice + MLS.
+4. **Scenario 6 (auto-learning)**: long-duration test with self-recorded audio.
 
-評価実行はバッチで一括実行可能とし、CSV 形式で結果を出力する：
+Evaluation runs in batch; results are written as CSV:
 
 ```
 benchmark_results/
@@ -303,73 +298,73 @@ benchmark_results/
 └── summary.json
 ```
 
-## 比較対象
+## Comparison targets
 
-ハードゲーティング型の性能を相対化するため、以下と比較：
+To put the hard-gating performance into perspective, compare against the following.
 
-### ベースライン
+### Baselines
 
-1. **何も処理しない原音声**: 下限ベースライン
-2. **DFN3 単体**: NS のみ、SV なし。NS 効果の純粋測定
-3. **オラクル VAD（ground truth）**: 完全な VAD 情報を与えた場合の上限
+1. **Unprocessed raw audio**: lower-bound baseline.
+2. **DFN3 standalone**: NS only, no SV — pure measurement of the NS effect.
+3. **Oracle VAD (ground truth)**: upper bound when given perfect VAD info.
 
-### 既存手法との比較
+### Comparison with existing methods
 
-| 手法 | 用途 | 想定結果 |
+| Method | Use | Expected result |
 |---|---|---|
-| ConVoiFilter（オフライン） | 真の TSE のリファレンス | より高い分離精度を達成するが 5 秒遅延 |
-| ESPnet TD-SpeakerBeam | causal 寄りの TSE | 性能と遅延のトレードオフ評価 |
+| ConVoiFilter (offline) | Reference for true TSE | Achieves higher separation accuracy but with 5 s latency |
+| ESPnet TD-SpeakerBeam | Near-causal TSE | Performance / latency trade-off evaluation |
 
-これらは「リアルタイム可能な TSE と同等の精度をハードゲーティング型で達成できているか」の参照点。
+These serve as reference points for "is the hard-gating type achieving accuracy comparable to a real-time-capable TSE?"
 
-## ベンチマーク用ツール
+## Benchmark tools
 
-実装で使用する評価ライブラリ：
+Evaluation libraries used in the implementation:
 
-| 用途 | ライブラリ | License |
+| Use | Library | License |
 |---|---|---|
 | PESQ | `pesq` (PyPI) | MIT |
 | STOI | `pystoi` (PyPI) | MIT |
-| SI-SDR | `torchmetrics` または自前計算 | Apache 2.0 |
-| DNSMOS | Microsoft の P.835 ONNX モデル | MIT |
-| UTMOS | UTokyo の MOS predictor | BSD-3 |
-| SV (EER 計算) | `speechbrain.utils.metric_stats` | Apache 2.0 |
+| SI-SDR | `torchmetrics` or hand-rolled | Apache 2.0 |
+| DNSMOS | Microsoft's P.835 ONNX model | MIT |
+| UTMOS | UTokyo's MOS predictor | BSD-3 |
+| SV (EER computation) | `speechbrain.utils.metric_stats` | Apache 2.0 |
 
-## ベンチマーク実行の自動化
+## Benchmark-execution automation
 
-`bench/` ディレクトリに以下を配置（実装段階で構築）：
+Place the following under the `bench/` directory (built at the implementation stage):
 
 ```
 bench/
-├── datasets/                # データダウンロードスクリプト
+├── datasets/                # dataset-download scripts
 │   ├── download_vbd.sh
 │   ├── download_commonvoice.py
 │   ├── download_mls.py
 │   ├── download_musan.sh
 │   └── generate_librimix_clean.py
-├── scenarios/               # シナリオ別評価スクリプト
+├── scenarios/               # per-scenario evaluation scripts
 │   ├── scenario_1_solo_noise.py
 │   ├── scenario_2_other_speaker.py
 │   ├── scenario_3_alternating.py
 │   ├── scenario_4_simultaneous.py
 │   ├── scenario_5_multilingual.py
 │   └── scenario_6_drift.py
-├── metrics/                 # 評価指標計算
+├── metrics/                 # metric computation
 │   ├── ns_quality.py        # PESQ, STOI, SI-SDR, DNSMOS
 │   ├── vad_accuracy.py
 │   ├── sv_eer.py
 │   └── gating_accuracy.py
 ├── runners/
-│   └── run_all.py           # 全シナリオ一括実行
-└── results/                 # 出力先
+│   └── run_all.py           # run all scenarios in one go
+└── results/                 # output target
     └── (CSV, JSON, plots)
 ```
 
-## 推奨実行順序
+## Recommended execution order
 
-1. **Phase 1 PoC 完了後すぐ**: シナリオ 1 + シナリオ 5（NS 品質と多言語ロバスト性）
-2. **Phase 2 自動学習実装後**: シナリオ 6（drift 検証）
-3. **Phase 3 Rust 移植後**: 全シナリオ + レイテンシ・CPU 実測
-4. **Phase 4 モバイル展開後**: モバイル実機でのレイテンシ・バッテリー測定
+1. **Immediately after Phase 1 PoC completion**: Scenarios 1 + 5 (NS quality and multilingual robustness).
+2. **After Phase 2 auto-learning implementation**: Scenario 6 (drift validation).
+3. **After Phase 3 Rust port**: all scenarios + measured latency / CPU.
+4. **After Phase 4 mobile deployment**: on-device latency / battery measurement on mobile.
 
-各 Phase で次に進む前のゲート条件として、対応するシナリオの最低基準クリアを設定する。具体的な閾値は Phase 1 の初期測定後に確定する。
+For each phase, the gate condition before progression is to clear the minimum criterion of the corresponding scenarios. Concrete thresholds are fixed after the Phase 1 initial measurement.
