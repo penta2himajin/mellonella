@@ -269,14 +269,16 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
    後述の理由により **見送り** (cohort 規模に起因する run-to-run variance が
    CI hard-fail を不安定にするため)。
 4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + actions/cache 化
-5. **Phase 5** ✅ (本 PR): cohort 決定化 — `mls.prepare` / `emilia.prepare`
+5. **Phase 5** ✅ (PR #27): cohort 決定化 — `mls.prepare` / `emilia.prepare`
    の streaming-arrival 依存ラベル割当を撤廃し、speaker は upstream id
-   lex 順、clip は audio sha1 順で選択。同じ split に対して常に
+   lex 順、clip は `(-len, sha1)` 順で選択。同じ split に対して常に
    bit-identical な manifest を出力し、Phase 4 cache の "miss 時に別 cohort"
-   弱点を塞ぐ。
+   弱点を塞ぐ。post-merge baseline で TPR mean 0.825 / FPR mean 0.114 /
+   0/48 row failures を確定し、threshold を `--tpr-min 0.5 --fpr-max 0.65`
+   に引き締め (Phase 3 後段で見送った tightening を closeout)。
 6. **Phase 6** (任意): cohort 拡大 (per-language 8 → 50-100、top-K 10 → 20-30)、
-   `--fpr-max` 引き締め、別 scenario への AS-Norm 横展開 — 規模拡大が
-   実現してから再開
+   別 scenario への AS-Norm 横展開、theta_pass_as_norm の data 駆動再
+   calibration — 規模拡大が実現してから再開
 
 ### Phase 2 の設計ノート
 
@@ -539,6 +541,53 @@ audio 長が tied な 4 話者から lex 上位 2 が選ばれることを asser
   cohort" の弱点が消える。
 - これで cohort 規模拡大 (Phase 4 当初目標) や `--fpr-max` 引き締め
   (Phase 3 後段で見送り) を、再現可能な baseline の上で再開できる。
+
+### Phase 5 後段: post-merge baseline + threshold 引き締め
+
+PR #27 が main にマージされた直後の scenario_5 (real pipeline、MLS+
+Emilia-YODAS、6 言語、`theta_pass_as_norm=1.5`) を計測した結果、
+Phase 3 後段で観測した run-to-run の揺れが完全に消滅し、これまでで
+最も良い baseline を確定:
+
+| Lang | TPR mean | TPR min | FPR mean | FPR max |
+|---|---|---|---|---|
+| de | 0.859 | 0.808 | 0.212 | **0.484** |
+| en | 0.854 | 0.796 | 0.017 | 0.068 |
+| fr | 0.786 | 0.720 | 0.231 | 0.396 |
+| ja | 0.767 | **0.656** | 0.134 | 0.236 |
+| ko | 0.813 | 0.660 | 0.090 | 0.100 |
+| zh-CN | 0.870 | 0.868 | 0.000 | 0.000 |
+| **mean** | **0.825** | — | **0.114** | — |
+| **stddev** | **0.039** | — | 0.088 | — |
+
+PR #23-25 baseline (TPR mean ~0.77、FPR mean ~0.13、TPR stddev ~0.06)
+と比べて TPR / FPR / cross-lang stddev 全てで明確に改善。fr TPR が
+0.47 → 0.79、ko TPR が 0.60 → 0.81 と大きく持ち直したのは clip
+selection を `(-clip_length, sha1)` に切り替えた効果が大きい (Emilia
+の 1-2 秒 YouTube snippet ではなく長い clip が ECAPA concat に
+入るようになった)。
+
+**threshold 引き締め** (`scenario_5.yml`):
+
+- `--tpr-min 0.30 → 0.60` (margin: 観測最低 0.656 から 5.6pp バッファ)
+- `--fpr-max 0.95 → 0.55` (margin: 観測最大 0.484 から 6.6pp バッファ)
+- 不変条件として `--fpr-max < --tpr-min` を満たすように選んだ。
+  「target を通すよりも impostor を通さない方が厳しい」を sanity
+  invariant として CI で表現できるようになる。
+
+Phase 3 後段で「cohort variance が落ち着くまで tightening 見送り」と
+書いた条件は Phase 5 で消えたので、観測 baseline ぎりぎりまで詰めた。
+~6pp 残しているバッファは:
+
+1. cache miss 時の cohort rebuild で HF streaming が拾う "first 5000
+   samples" が変わると、`(-clip_count, lex)` 経路で選ばれる top-N
+   が微妙に変わりうる (Emilia の thousands-of-speakers 環境)。
+2. real-pipeline は ECAPA / DFN3 / silero-vad の minor version 更新で
+   embedding 値が ±数 pp 動く実績がある。
+
+これらを吸収して "本当の regression" だけを CI で赤にする緩衝。Phase
+6 で cohort を 50-100 spk/lang まで拡大して観測値を再計測した時点で、
+もう一段引き締める余地がある。
 
 ### 参考文献
 

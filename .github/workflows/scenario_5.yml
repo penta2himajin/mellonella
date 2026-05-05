@@ -166,22 +166,27 @@ jobs:
               ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
             done
           fi
-          # NOTE: --fpr-max temporarily relaxed to 0.95 (was 0.7) at the
-          # D-010 Phase 4 cohort-disjoint fix landing. The previous broken
-          # cohort included the test target/other speakers themselves,
-          # which artificially suppressed FPR via spurious top-K hits.
-          # With cohort/test now properly disjoint the underlying cohort
-          # bias surfaces. PR #22 saw zh-CN per-language FPR drift between
-          # 0.76 and 0.85 across consecutive CI runs (cache-invalidated
-          # streaming pulls different speakers, which feeds back into the
-          # AS-Norm μ/σ); per-row max can exceed 0.85. 0.95 is a stopgap
-          # that catches catastrophic regressions but accepts the current
-          # post-disjoint baseline. Phase 3 (calibrate.py --use-as-norm)
-          # will refit theta_pass_as_norm and tighten this back down.
+          # Hard-fail thresholds tightened at D-010 Phase 5 closeout.
+          # Phase 4 had relaxed --fpr-max from 0.7 to 0.95 because a
+          # broken cohort + run-to-run cohort variance made tighter
+          # values flake catastrophically. With Phase 5 cohort
+          # determinism merged (PR #27, fully bit-identical manifest +
+          # cohort across cache hits, deterministic-given-same-stream
+          # across cache rebuilds) the per-run baseline collapsed to a
+          # narrow band: TPR mean 0.825, FPR mean 0.114, per-row min
+          # TPR 0.656 (ja SNR=0), per-row max FPR 0.484 (de SNR=0).
+          # The chosen thresholds satisfy --fpr-max < --tpr-min as a
+          # sanity invariant (the gate must be more selective against
+          # impostors than it is against target speech). Buffer over
+          # the observed worst case is ~6 pp, which absorbs the small
+          # drift expected when the GitHub Actions cache misses and
+          # the cohort gets rebuilt from a different HF streaming
+          # window. See docs/decisions.md D-010 Phase 5 後段 for the
+          # full baseline table.
           python scripts/scenario_5_from_manifest.py \
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
-            --tpr-min 0.3 --fpr-max 0.95 \
+            --tpr-min 0.60 --fpr-max 0.55 \
             --real-pipeline \
             --as-norm-cohort data/cohorts/scenario5_cohort.npz
 
