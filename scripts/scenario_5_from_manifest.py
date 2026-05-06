@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -338,7 +340,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    work_dir = args.output / "_workdir"
+    # Keep intermediate per-speaker wavs out of args.output so the directory
+    # stays artifact-friendly (only csv / json results land there).
+    work_root = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
+    work_dir = Path(tempfile.mkdtemp(prefix="scenario5_workdir_", dir=str(work_root)))
 
     items = build_items(
         args.manifest,
