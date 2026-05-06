@@ -121,28 +121,38 @@ class GatingConfig:
     :class:`PipelineComponents` is built; ignored when
     :attr:`use_as_norm` is False."""
 
-    theta_pass_as_norm: float = 1.5
+    theta_pass_as_norm: float = 2.25
     """Output gate threshold when :attr:`use_as_norm` is True (z-score scale).
 
-    Confirmed as the CI-validated baseline at D-010 Phase 3 closeout
-    (PR #23/#24). On the Phase 4-5 scenario_5 setup (6-language cohort,
-    48 embeddings, top-K=10) this default reached TPR mean ≈ 0.77 and
-    FPR mean ≈ 0.13, matching the heuristic literature value of "target
-    embedding is ~1.5 σ above the top-K impostor distribution".
+    Set data-drivenly at D-010 Phase 6 Part 2 step 1 (PR #43 + follow-up
+    propagation): ``scripts/calibrate.py --use-as-norm --cohort
+    data/cohorts/scenario5_cohort.npz`` against the v10 cohort
+    (300 embeddings, 6 langs × 50 spk, top-K=20) recommended θ = 2.25
+    under the FP-tolerant policy (``MAX_MEAN_FPR_AS_NORM = 0.10``,
+    ``MIN_TPR_FLOOR_AS_NORM = 0.50``). At θ = 2.25 the calibration sweep
+    observed TPR mean ≈ 0.755 / FPR mean ≈ 0.085 — the smallest θ whose
+    grand-mean FPR stays at or below the 0.10 budget.
 
-    D-010 Phase 6 scales the cohort to 300 embeddings (50 spk/lang) +
-    top-K=20. The heuristic 1.5 σ value is kept for now; a data-driven
-    re-calibration via ``scripts/calibrate.py --use-as-norm`` is the
-    Phase 6 follow-up task (it needs one stable post-scale-up CI
-    baseline observation first, same deferral pattern as Phase 5
-    threshold-tightening).
+    The previous heuristic 1.5σ default (Phase 3 closeout) was anchored
+    on the Phase 4-5 cohort (48 embeddings, top-K=10). Scaling the
+    cohort + top-K shifts the impostor-tail distribution and therefore
+    the optimal θ; see ``calibration_as_norm_summary.json`` in the
+    PR #43 ``scenario-5-results`` artifact for the per-θ sweep.
     """
 
-    theta_learn_as_norm: float = 2.5
+    theta_learn_as_norm: float = 3.25
     """Auto-learn admission threshold under AS-Norm (z-score scale). Higher
     than :attr:`theta_pass_as_norm` so only confidently-target frames feed
     the pool, mirroring the ``theta_learn > theta_pass`` invariant from
-    the legacy mixed-score path."""
+    the legacy mixed-score path.
+
+    Bumped from 2.5 to 3.25 alongside the Phase 6 Part 2 step 1
+    re-calibration of :attr:`theta_pass_as_norm` (1.5 → 2.25) to
+    preserve the +1.0σ heuristic gap between pass and auto-learn
+    admission. This value remains heuristic — ``scripts/calibrate.py``
+    only sweeps the pass threshold (its grid maxes at 3.0); a future
+    pass should fit the auto-learn admission rate against post-pool
+    impostor leakage rather than at-frame FPR."""
 
     def __post_init__(self) -> None:
         if self.theta_pass >= self.theta_learn:

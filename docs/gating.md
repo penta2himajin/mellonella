@@ -265,8 +265,8 @@ Phase 5 (optional): extensions C / D / E (Language-Dependent AS-Norm, etc.) are 
   - `use_as_norm: bool = False`
   - `as_norm_cohort_path: str | None = None`
   - `as_norm_top_k: int = 10`
-  - `theta_pass_as_norm: float = 1.5` (z-score scale)
-  - `theta_learn_as_norm: float = 2.5`
+  - `theta_pass_as_norm: float = 2.25` (z-score scale; data-driven from D-010 Phase 6 Part 2 step 1, was 1.5 heuristic)
+  - `theta_learn_as_norm: float = 3.25` (preserves +1.0σ heuristic gap above pass)
 - `PipelineComponents` loads the cohort once at build time; `process_offline` references it per-frame (no per-call reload).
 - On the AS-Norm path, the per-frame score formula switches from `α·cs + β·f0_match` to `as_norm(cs vs cohort)`. F0 is still used at the auto-learn admission gate via `theta_f0`.
 - When `use_as_norm = False`, the legacy path is bit-identical (default `False`).
