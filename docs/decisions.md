@@ -254,7 +254,7 @@ S_norm = (S_target - μ_top-K(S_impostor)) / σ_top-K(S_impostor)
 3. **Phase 3** ✅ (PR #24 + follow-up PR): add the AS-Norm extension to `scripts/calibrate.py`, fix `theta_pass_as_norm` data-drivenly via a per-language sweep, and document the baseline with CI observations. Tightening `scenario_5.yml --fpr-max` is **deferred** for the reason described below (run-to-run variance from the cohort scale would make the CI hard-fail flaky).
 4. **Phase 4** ✅ (PR #22 + #23): cohort-disjoint fix + `actions/cache`-isation.
 5. **Phase 5** ✅ (PR #27 + PR #28): cohort determinisation + pinning the HF stream input. PR #27 determinises the `mls.prepare` / `emilia.prepare` selection logic (speakers by upstream-id lex order; clips by `(-len, sha1)` order). PR #28 pins the HF stream input itself: `load_dataset(..., revision=<commit_sha>)` plus, for Emilia, fetch the shard list via `HfApi`, lex-sort it, and pass it explicitly via `data_files=`. The manifest is now bit-identical regardless of cache state. **Threshold tightening is split into a separate PR**: with the post-pin stable baseline observed once, set values under the `--fpr-max < --tpr-min` invariant.
-6. **Phase 6** (in progress): cohort scale-up. **Part 1** (this PR): scale per-language 8 → 25, top-K 10 → 15 in code (`DEFAULT_TOP_SPEAKERS = 30`, `max_stream = 10_000` in mls/emilia.prepare; `--per-language 25` in scenario_5.yml; `as_norm_top_k = 15` in GatingConfig; cache key v5 → v7 — v6 was the first attempt at `top_speakers = 60` which CI revealed exceeds the MLS test split limit). **Part 1.5** (deferred): MLS train-split sourcing (dual manifests) to break past the 30-speaker MLS test cap and reach the literature 50–100 spk/lang. **Part 2** (gated on hosted-runner restoration): `theta_pass_as_norm` data-driven re-calibration on the v7 cohort, scenario_5 threshold tightening (combined with Phase 5 closeout follow-up), extending AS-Norm to scenarios 1 / 4 / 6. See "Phase 6: cohort scale-up" below.
+6. **Phase 6** (in progress): cohort scale-up. **Part 1** (this PR): scale per-language 8 → 15, top-K stays at 10 in code (`DEFAULT_TOP_SPEAKERS = 18`, `max_stream = 5_000` in mls/emilia.prepare; `--per-language 15` in scenario_5.yml; `as_norm_top_k = 10` in GatingConfig; cache key v5 → v8 — v6 attempted top_speakers = 60 which CI failed on MLS de test = 30 spk; v7 attempted top_speakers = 30 which CI failed on MLS fr test = 18 spk; v8 saturates the smallest MLS test split at 18 spk). **Part 1.5** (separate PR, scheduled next): MLS train-split sourcing (dual manifests, train for cohort, test for target / other) to break past the 18-spk MLS test cap and reach the literature 50–100 spk/lang. **Part 2** (gated on hosted-runner restoration): `theta_pass_as_norm` data-driven re-calibration on the part 1.5 cohort, scenario_5 threshold tightening (combined with Phase 5 closeout follow-up), extending AS-Norm to scenarios 1 / 4 / 6. See "Phase 6: cohort scale-up" below.
 
 ### Phase 2 design notes
 
@@ -442,39 +442,53 @@ PR #28's original `--tpr-min 0.60 --fpr-max 0.55` (with the `fpr_max < tpr_min` 
 
 Phase 4 carved test target / other out of the cohort (cohort-disjoint) and Phase 5 made the manifest + cohort bit-identical across cache rebuilds. Both fixes were prerequisites to scaling the cohort up; on a non-disjoint or non-deterministic cohort, scaling would have just amplified the existing structural bugs. With those out of the way, Phase 6 moves the cohort from the Phase 4-5 working size (6 langs × 8 spk = 48 embeddings, top-K = 10 = 21 % of cohort) toward the literature recommendation (50–100 spk/lang, top-K 20–30) — see Thienpondt 2020 and the AS-Norm survey in Park 2025.
 
-**MLS test split limit (discovered by the v6 CI run)**: The first Phase 6 attempt targeted 50 spk/lang (`DEFAULT_TOP_SPEAKERS = 60`, `--per-language 50`). CI failed with `MLS(german, test) yielded only 30 speaker(s) after 3394 samples; need 60` — the MLS HF test split for German has exactly 30 unique speakers / 3 394 samples in total. French and Italian test splits are similarly bounded. **Reaching 50+ spk/lang requires switching MLS sourcing from `test` to `train` split, or building dual manifests (test for target / other, train for cohort). Both options change the manifest layout and are deferred to Phase 6 part 1.5.**
+**MLS test split limit (discovered by two failed CI runs)**:
 
-**Chosen target for Phase 6 part 1**: 6 langs × 25 spk = 150 embeddings, top-K = 15 (= 10 % of cohort). This saturates the MLS test split (30 speakers - 2-speaker carve-out for target / other = 28 selectable; 25 hits within that) while still tripling the Phase 4-5 cohort size and halving the top-K / cohort ratio. The lower ratio collapses μ/σ variance on the impostor tail (the dominant noise term in PR #19's per-language regression on de TPR / zh-CN FPR) while still leaving 15 samples per call to estimate (μ, σ) — well above the 5–10 minimum the AS-Norm formulation needs to be statistically sound.
+| cache | `DEFAULT_TOP_SPEAKERS` | `--per-language` | CI outcome |
+|-------|------------------------|------------------|------------|
+| v6    | 60                     | 50               | failed: `MLS(german, test) yielded only 30 speaker(s) after 3394 samples; need 60` |
+| v7    | 30                     | 25               | failed: `MLS(french, test) yielded only 18 speaker(s) after 2426 samples; need 30` |
+| v8 (this PR) | 18              | 15               | saturates MLS fr test (the smallest split) |
 
-**Code changes (this PR — Part 1)**:
+The MLS HF `test` split is small by design — it's a held-out evaluation set, not a source for impostor cohorts. Per-language sizes scenario_5 currently uses: German = 30 spk / 3 394 samples; French = 18 spk / 2 426 samples. **18 is the binding limit. Reaching 50+ spk/lang requires switching MLS cohort sourcing from `test` to `train` split (4 500+ spk/lang), or building dual manifests (test for target / other, train for cohort). Deferred to Phase 6 part 1.5 (separate PR).**
 
-- `bench/mellonella_bench/datasets/mls.py` and `.../emilia.py`: bump `DEFAULT_TOP_SPEAKERS` from 10 → 30 (saturates MLS test split: 25 + 2-speaker test carve-out + 3-speaker buffer for selection variability across cache rebuilds), and bump `max_stream` from 5_000 → 10_000 (defensive headroom for non-de MLS langs; for de it doesn't matter because the iterator exhausts at 3 394 samples either way).
-- `.github/workflows/scenario_5.yml`: bump `--per-language 8 → 25` (passed to `scripts/build_impostor_cohort.py`), bump cache key v5 → v7 (v6 = the failed top_speakers=60 attempt; v7 = the corrected top_speakers=30 manifest).
-- `poc/mellonella_poc/config.py`: bump `as_norm_top_k = 10 → 15` (matches the new cohort scale; literature ratio 5–30 % of cohort).
+**Chosen target for Phase 6 part 1 (v8)**: 6 langs × 15 spk = 90 embeddings, top-K = 10 (= 11 % of cohort, within the literature 5–30 % range). The arithmetic: MLS fr test = 18 speakers; `--skip-top-n 2` carves 2 out for target / other; 18 - 2 = 16 selectable; we pick 15 with a 1-speaker buffer for selection variability across cache rebuilds. This is only a ~2× cohort growth over Phase 4-5 — modest but the most that MLS test split can support without architectural changes. Top-K stays at 10 (literature floor; below this, μ/σ estimation noise overwhelms the AS-Norm centering); the top-K / cohort ratio drops from 21 % (Phase 4-5) to 11 % (v8), which is the actual dial that reduces impostor-tail variance.
 
-**Phase 6 part 1.5 (deferred)**: break past the MLS test split's 30-speaker cap so the cohort can reach the literature 50–100 spk/lang target. The cleanest fix is to change MLS sourcing from `test` to `train` split for cohort-build manifests only — MLS train has 4 500+ speakers per language and is split-disjoint from test by construction (canonical LibriSpeech), so the cohort stays guaranteed-disjoint from scenario_5's target / other selection. Implementation: dual-prepare path in `mls.py` (`prepare_cohort_split()` with `split="train"` and a separate output dir), plus a parallel cache lane in `scenario_5.yml`. Emilia-YODAS does not have this problem (per-language shards have hundreds of speakers); only MLS needs the extra wiring.
+**Code changes (this PR — Part 1, v8)**:
 
-**Deferred to Phase 6 follow-up part 2** (needs CI baseline observation):
+- `bench/mellonella_bench/datasets/mls.py` and `.../emilia.py`: bump `DEFAULT_TOP_SPEAKERS` from 10 → 18 (saturates MLS fr test: 15 + 2-speaker test carve-out + 1-speaker buffer). Keep `max_stream` at 5_000 — the binding constraint is "how many distinct speakers exist in MLS test split", not "did we scan enough samples"; the iterator exhausts in 2 400–3 400 samples for the small splits regardless.
+- `.github/workflows/scenario_5.yml`: bump `--per-language 8 → 15` (passed to `scripts/build_impostor_cohort.py`), bump cache key v5 → v8 (skipping v6/v7 which never produced a valid cache).
+- `poc/mellonella_poc/config.py`: keep `as_norm_top_k = 10` (cohort ratio drops 21 % → 11 % via cohort growth alone; the absolute K stays the same so μ/σ stability isn't compromised).
 
-1. **`theta_pass_as_norm` data-driven re-calibration**. The heuristic 1.5 σ default was empirically validated on the Phase 4-5 cohort (48 embeddings, top-K 10). The new cohort (150 embeddings, top-K 15) has a different impostor-tail distribution, so re-running `scripts/calibrate.py --use-as-norm` on the post-scale-up cohort is required before the heuristic can be replaced with a fitted value. This is the same deferral pattern as Phase 3 → Phase 5 closeout: heuristic shipped, data-driven update gated on one stable baseline observation.
-2. **Threshold tightening** (`scenario_5.yml --tpr-min` / `--fpr-max`). Inherits the Phase 5 closeout deferral. Once the v7 cache is populated and we have one bit-identical CI baseline, both Phase 5 and Phase 6 follow-ups can land in the same PR.
+**Phase 6 part 1.5 (separate PR, scheduled next)**: break past the MLS test split's 18-speaker cap so the cohort can reach the literature 50–100 spk/lang target. The cleanest fix is to change MLS sourcing from `test` to `train` split for cohort-build manifests only — MLS train has 4 500+ speakers per language and is split-disjoint from test by construction (canonical LibriSpeech), so the cohort stays guaranteed-disjoint from scenario_5's target / other selection. Implementation sketch:
+
+- `bench/mellonella_bench/datasets/mls.py`: add a `split` arg path through `prepare()` so a second invocation can produce a `train`-split manifest at a separate output dir (e.g. `data/mls_cohort/<lang>/manifest.csv` vs the existing `data/mls/<lang>/manifest.csv`).
+- `.github/workflows/scenario_5.yml`: prep both `test` (target / other) and `train` (cohort) manifests for de / fr; pass the `train` manifest to `scripts/build_impostor_cohort.py`. Emilia-YODAS keeps a single manifest (per-language shards already have hundreds of speakers, so no dual lane is needed).
+- Cache key v8 → v9 — the manifest layout changes, so the v8 artifact cannot be reused.
+- Bump `--per-language` to 50 (the literature target lower bound) and `as_norm_top_k` to 20 (= 6.7 % of the new 300-emb cohort, well within 5–30 % range).
+- Cost: MLS train streaming is the new wall-clock unknown. Train splits are large (German train ≈ 1.97 M samples), but `max_stream` caps the scan, and we only need 50 speakers per language with 16 clips each (much shallower than test). Budget 10–15 min cold-cache prep per MLS train language; total scenario_5 cold-cache prep ≈ 30–40 min vs 10–15 min for v8. Within the 45 min job timeout but tight; if Emilia HF resolution gets slow, lift the timeout to 60 min before scaling further.
+
+**Deferred to Phase 6 follow-up part 2** (needs CI baseline observation, gated on hosted-runner restoration):
+
+1. **`theta_pass_as_norm` data-driven re-calibration**. The heuristic 1.5 σ default was empirically validated on the Phase 4-5 cohort (48 embeddings, top-K 10). After v8 the cohort grows to 90 embeddings with the same top-K 10 — the impostor-tail distribution shifts because the per-call top-10 is now selected from a wider candidate pool. Re-running `scripts/calibrate.py --use-as-norm` on the post-scale-up cohort is required before the heuristic can be replaced with a fitted value. This is the same deferral pattern as Phase 3 → Phase 5 closeout: heuristic shipped, data-driven update gated on one stable baseline observation. Better to wait until part 1.5 lands so the calibration runs on the literature-sized cohort, not the part-1 stop-gap.
+2. **Threshold tightening** (`scenario_5.yml --tpr-min` / `--fpr-max`). Inherits the Phase 5 closeout deferral. Once the v8 (or v9 after part 1.5) cache is populated and we have one bit-identical CI baseline, both Phase 5 and Phase 6 follow-ups can land in the same PR.
 3. **Extending AS-Norm to other scenarios** (scenario_1 / 4 / 6). Currently only scenario_5 wires the cohort through; the gating layer already supports it via `GatingConfig.use_as_norm` so the change is mostly per-scenario YAML wiring + per-scenario θ. Better done after the threshold landed because the new threshold is the shared default.
 
-**Cost projection**:
+**Cost projection (v8)**:
 
-- Manifest prep (cold cache): scanning 10 000 streamed samples × 6 language streams ≈ 10–15 min on the Hosted runner (vs ~5–10 min at the Phase 5 budget). For MLS de specifically the iterator exhausts at 3 394 samples regardless. Comfortably within the 45 min job timeout.
-- Cohort build (cold cache): 150 ECAPA passes ≈ 3 min vs the previous 1 min for 48 passes. Negligible.
-- Warm cache (the steady state once main has cached the v7 artifacts): no measurable change vs v5.
-- Cohort `.npz` size: 150 × 192 × 4 B ≈ 115 KB (vs 38 KB for v5). Still negligible for the artifact upload.
+- Manifest prep (cold cache): MLS de exhausts at 3 394 samples, MLS fr at 2 426 samples — both well under any `max_stream` we'd set; prep is dominated by Emilia-YODAS shard fetch, which is unchanged from Phase 5. Total cold-cache prep ≈ 10–15 min on the Hosted runner. Comfortably within the 45 min job timeout.
+- Cohort build (cold cache): 90 ECAPA passes ≈ 2 min vs the previous 1 min for 48 passes. Negligible.
+- Warm cache (the steady state once main has cached the v8 artifacts): no measurable change vs v5.
+- Cohort `.npz` size: 90 × 192 × 4 B ≈ 70 KB (vs 38 KB for v5). Still negligible for the artifact upload.
 
 **Phase 6 closeout: remaining tasks** (gated on the same hosted-runner restoration as Phase 5 closeout):
 
-- Once a Phase 6 push-event run completes successfully, observe the per-row TPR / FPR baseline with the v7 cohort.
+- Once a Phase 6 push-event run completes successfully, observe the per-row TPR / FPR baseline with the v8 cohort.
 - Run the same commit twice; bit-identical guarantee should still hold (Phase 5 fixes apply unchanged).
-- Run `scripts/calibrate.py --use-as-norm --cohort data/cohorts/scenario5_cohort.npz` against the v7 cohort, propagate the recommended `theta_pass_as_norm` into `GatingConfig` default.
+- Open Phase 6 part 1.5 (MLS train-split sourcing) — the part 1.5 cohort will be a strict superset of v8 in spk/lang count so any threshold-tightening landed against v8 will still hold.
+- After part 1.5 lands: run `scripts/calibrate.py --use-as-norm --cohort data/cohorts/scenario5_cohort.npz` against the v9 cohort, propagate the recommended `theta_pass_as_norm` into `GatingConfig` default.
 - Tighten `scenario_5.yml` thresholds under the `--fpr-max < --tpr-min` invariant (combined Phase 5 + Phase 6 follow-up).
 - Add `use_as_norm = True` to scenario_1 / 4 / 6 with the new global θ.
-- Open Phase 6 part 1.5 (MLS train-split sourcing) once the part-1 baseline is healthy — the part 1.5 cohort will be a strict superset of the part 1 cohort so the threshold-tightening PR can ride on the same baseline if it lands first.
 
 ### References
 

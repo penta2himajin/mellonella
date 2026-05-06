@@ -30,16 +30,17 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-# D-010 Phase 6 cohort scale-up: bumped from 10 → 30 to support
-# scenario_5's `--per-language 25` AS-Norm cohort + `--skip-top-n 2`
-# carve-out + a 3-speaker buffer for selection variability across cache
-# rebuilds. The literature recommendation is 50–100 spk/lang, but
-# **MLS test split exhausts at ~30 unique speakers per language**
-# (German test = 30 speakers / 3 394 samples; French test similar).
-# Going above 30 would require switching cohort sourcing to MLS train
-# split or building dual manifests (test for target/other, train for
-# cohort) — deferred to Phase 6 part 1.5.
-DEFAULT_TOP_SPEAKERS = 30
+# D-010 Phase 6 cohort scale-up (Part 1, take 3): bumped from 10 → 18 to
+# saturate the MLS test split's smallest language. MLS test split sizes
+# discovered via failed CI runs:
+#   - German test:  30 speakers (3 394 samples)  ← v6 failed at 60
+#   - French test:  18 speakers (2 426 samples)  ← v7 failed at 30
+# 18 is the binding limit. With `--skip-top-n 2` carve-out and a 1-speaker
+# buffer for selection variability, scenario_5 picks `--per-language 15`
+# from this. Reaching the literature 50–100 spk/lang target requires
+# switching MLS sourcing from `test` to `train` split (4 500+ spk/lang) —
+# deferred to Phase 6 part 1.5 (separate PR).
+DEFAULT_TOP_SPEAKERS = 18
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
 # We over-collect per speaker (up to OVERSAMPLE_FACTOR × clips_per_speaker)
@@ -127,11 +128,13 @@ def prepare(
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
     split: str = DEFAULT_SPLIT,
-    # Phase 6 cohort scale-up bumped 5_000 → 10_000 alongside top_speakers
-    # 10 → 30. MLS test split is small (~3 400 samples for German), so the
-    # iterator usually exhausts well below this cap — the bump is mostly
-    # for languages with a slightly larger test split.
-    max_stream: int = 10_000,
+    # Phase 6 cohort scale-up: kept at 5_000 since the binding constraint
+    # is "how many distinct speakers exist in MLS test split" (de = 30,
+    # fr = 18 — both well under any window we'd set), not "did we scan
+    # enough samples". The iterator exhausts in 2 400–3 400 samples for
+    # the small splits anyway. The previous 20_000 / 10_000 bumps were
+    # unnecessary on this code path.
+    max_stream: int = 5_000,
 ) -> Path:
     """Stream MLS for ``language``, materialise top-K speakers + manifest.csv.
 
