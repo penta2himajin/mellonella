@@ -235,39 +235,34 @@ jobs:
             # at cohort load.
             ARGS+=("--as-norm-cohort" "data/cohorts/scenario5_cohort.npz")
           fi
-          # Phase 5 closeout + Phase 6 Part 2 step 2 (combined): threshold
-          # tightening anchored on three θ=2.25 baseline observations
-          # (run 25431310778 on main, run 25432567972 on PR #45,
-          #  run 25439461512 on PR #46).
+          # Phase 6 Part 2 step 2 closeout: per-language-mean check
+          # (replaces per-row check). Per-row metrics on scenario_5 are
+          # unreproducible across runner CPU classes — for the SAME
+          # `zh-CN_speaker02_vs_speaker20` sample with a SHA256-identical
+          # cohort, gate_fpr at snr=15 mode=other landed at 0.087 / 0.136
+          # / 0.200 / 0.400 across four observations (D-010 Phase 6 Part 2
+          # decisions.md). Per-language mean over (item, snr) pairs is far
+          # more stable. Observed per-language ranges across the same
+          # four runs:
+          #   zh-CN: TPR mean 0.503-0.659, FPR mean 0.084-0.184
+          #   ko:    TPR mean 0.692-0.782, FPR mean 0.000-0.098
+          #   de:    TPR mean 0.707-0.798, FPR mean 0.000-0.068
+          #   en:    TPR mean 0.623-0.700, FPR mean 0.000
+          #   fr:    TPR mean 0.787-0.819, FPR mean 0.000
+          #   ja:    TPR mean 0.821-0.872, FPR mean 0.000-0.017
           #
-          # Per-row worst rows differ between runs because the v10 cohort
-          # is bit-identical (SHA256-verified — Phase 5 determinism holds)
-          # but ECAPA + DFN3's float32 SIMD path is sensitive to runner
-          # CPU class. The third sample (PR #46) widened the observed
-          # variance significantly. Observed inter-run worst rows:
-          #   zh-CN @ snr=0  target TPR: 0.140 / 0.276 / 0.376  (range 0.236)
-          #   zh-CN @ snr=15 other  FPR: 0.087 / 0.136 / 0.200  (range 0.113)
+          # Thresholds:
+          #   --tpr-mean-min 0.40  (worst language-mean observed 0.503,
+          #                         ~25% margin; catches catastrophic
+          #                         per-language regressions)
+          #   --fpr-mean-max 0.30  (worst observed 0.184, ~63% margin)
           #
-          # Thresholds set to absorb the full observed range with margin:
-          #   --tpr-min 0.10  (worst observed 0.140 − 0.04 ≈ 30% margin)
-          #   --fpr-max 0.30  (worst observed 0.200 + 0.10 ≈ 50% margin)
-          #
-          # FPR ceiling drops 0.95 → 0.30 vs the legacy placeholder
-          # (still meaningful — the legacy caught nothing). The TPR floor
-          # has to drop further than the initial 0.20 from PR #45 because
-          # the third runner-CPU sample produced a worst-row TPR of 0.140,
-          # well below the 2-sample range used for PR #45's calibration.
-          #
-          # The `--fpr-max < --tpr-min` invariant (Phase 5 closeout goal)
-          # is NOT met here (0.30 > 0.10). Closing the invariant gap
-          # requires either pinning the runner to a single CPU class or
-          # moving the per-row check to a per-language-mean check
-          # (~0.02 mean FPR is well below any reasonable tpr_min).
-          # Deferred to a future Phase 6 part 3 / Phase 7.
+          # The `--fpr-mean-max < --tpr-mean-min` invariant (Phase 5
+          # closeout goal) is now satisfied (0.30 < 0.40).
           python scripts/scenario_5_from_manifest.py \
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
-            --tpr-min 0.10 --fpr-max 0.30 \
+            --tpr-mean-min 0.40 --fpr-mean-max 0.30 \
             --real-pipeline
 
       # Stage the cohort summary alongside the scenario outputs so it lands
