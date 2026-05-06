@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      capture_as_norm_baseline:
+        description: "Capture the AS-Norm ci_baseline (D-010 Phase 6 Part 2 step 3b). Restores the v10 cohort cache from scenario_5, runs ci_accuracy with --as-norm-cohort + --update-baseline, and uploads the resulting ci_baseline_as_norm.json as an artifact."
+        required: false
+        default: false
+        type: boolean
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -52,3 +59,85 @@ jobs:
 
       - name: Run ci-accuracy (compares against docs/benchmarks/ci_baseline.json)
         run: python scripts/ci_accuracy.py
+
+  ci-accuracy-as-norm-baseline:
+    name: ci-accuracy AS-Norm baseline capture (workflow_dispatch only)
+    if: github.event_name == 'workflow_dispatch' && inputs.capture_as_norm_baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system audio deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libsndfile1 ffmpeg
+          version: 1.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+
+      - name: Install poc[models] + bench (CPU torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e "poc[models]"
+          pip install -e bench
+
+      - name: Cache HF / SpeechBrain / DFN3 / librosa downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/mellonella
+            ~/.cache/librosa
+            ~/.cache/DeepFilterNet
+          key: accuracy-models-v1-${{ runner.os }}-${{ hashFiles('poc/pyproject.toml') }}
+          restore-keys: |
+            accuracy-models-v1-${{ runner.os }}-
+
+      # Restore-only: consume the v10 cohort that scenario_5.yml built and
+      # cached. We deliberately do NOT save back here — the cohort is
+      # owned by scenario_5.yml, this job is just a reader.
+      - name: Restore v10 AS-Norm cohort cache from scenario_5
+        id: cohort-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/mls/de/manifest.csv
+            data/mls/fr/manifest.csv
+            data/mls/de/clips
+            data/mls/fr/clips
+            data/emilia_yodas
+            data/cohorts
+          key: scenario5-data-v10-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
+          restore-keys: |
+            scenario5-data-v10-${{ runner.os }}-
+
+      - name: Verify cohort presence
+        run: |
+          set -euo pipefail
+          if [ ! -f data/cohorts/scenario5_cohort.npz ]; then
+            echo "::error::data/cohorts/scenario5_cohort.npz not found in restored cache" >&2
+            echo "::error::run scenario_5.yml on main first to populate the cache" >&2
+            exit 1
+          fi
+          ls -la data/cohorts/
+
+      - name: Capture ci_baseline_as_norm.json
+        run: |
+          python scripts/ci_accuracy.py \
+            --as-norm-cohort data/cohorts/scenario5_cohort.npz \
+            --update-baseline
+
+      - name: Upload ci_baseline_as_norm.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-baseline-as-norm
+          path: docs/benchmarks/ci_baseline_as_norm.json
+          retention-days: 30
