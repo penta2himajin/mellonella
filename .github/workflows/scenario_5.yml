@@ -275,6 +275,12 @@ jobs:
           if [ -f data/cohorts/scenario5_cohort.json ]; then
             cp data/cohorts/scenario5_cohort.json benchmark_results/scenario_5/cohort_summary.json
           fi
+          # The .npz itself is what accuracy.yml's AS-Norm baseline-capture
+          # job consumes (it cross-downloads this artifact instead of relying
+          # on cache scoping). Tiny — ~230 KB for 300 × 192-D embeddings.
+          if [ -f data/cohorts/scenario5_cohort.npz ]; then
+            cp data/cohorts/scenario5_cohort.npz benchmark_results/scenario_5/scenario5_cohort.npz
+          fi
           # Phase 6 Part 2 step 1: include the v10 AS-Norm calibration
           # observation alongside scenario_5 outputs so reviewers can read
           # `recommended_theta_pass` directly from the artifact.
