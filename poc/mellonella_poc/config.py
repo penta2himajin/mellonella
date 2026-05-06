@@ -90,17 +90,30 @@ class GatingConfig:
     fresh calibration are wired up.
     """
 
-    as_norm_top_k: int = 10
+    as_norm_top_k: int = 20
     """Number of top-scoring impostor cohort entries used in the AS-Norm
     z-score numerator/denominator. Standard literature picks 10–50; we
-    default to 10 — the floor of that range — because D-010 Phase 6
-    part 1 is bounded by MLS fr test split (18 speakers per language),
-    yielding a 6 langs × 15 spk = 90-embedding cohort. Top-K = 10 is
-    11 % of cohort (within the literature 5-30 % ratio) and the absolute
-    minimum for a stable μ/σ estimate. Reaching the literature 50–100
-    spk/lang cohort with top-K 20–30 requires MLS train-split sourcing
-    — MLS test split's smallest language has only 18 speakers. Deferred
-    to Phase 6 part 1.5 (separate PR)."""
+    default to 20 after D-010 Phase 6 part 1.5 scaled the scenario_5
+    cohort to 6 langs × 50 spk = 300 embeddings (top-K 20 = 6.7 % of
+    cohort, within the literature 5-30 % range). Top-K = 20 is the
+    midpoint of the literature 10-50 band — stable enough that μ/σ
+    estimation noise no longer dominates the AS-Norm centering, and
+    low enough relative to cohort size that the impostor tail (top
+    20 of 300) actually represents the discriminative regime the
+    centering is supposed to suppress.
+
+    Phase 6 history: v8 (cohort 90 emb, top-K 10 = 11 %) was the
+    largest scale achievable with MLS test-split sourcing (bound by
+    MLS fr test = 18 spk/lang); v9 attempted MLS train-split sourcing
+    but that path is too slow under HF parquet streaming's per-row
+    iteration rate (~20 samples/s) combined with MLS train's
+    per-speaker locality (~937 clips / spk); v10 (this revision,
+    cohort 300 emb, top-K 20 = 6.7 %) routes the de / fr cohort
+    through Emilia-YODAS DE / FR shards — cross-source-disjoint from
+    MLS test by construction (different upstream universes), high
+    speaker density (5 000-sample scan surfaces 52 spk in seconds).
+    Future Phase 6 part 2 may re-tune top-K together with a
+    calibration run — see docs/decisions.md."""
 
     as_norm_cohort_path: str | None = None
     """Filesystem path to the impostor cohort ``.npz`` produced by
