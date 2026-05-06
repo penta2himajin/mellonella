@@ -235,19 +235,38 @@ jobs:
             # at cohort load.
             ARGS+=("--as-norm-cohort" "data/cohorts/scenario5_cohort.npz")
           fi
-          # NOTE: --fpr-max held at 0.95 (was 0.7) since Phase 4. An attempt
-          # to tighten to 0.55 in PR #28 surfaced that the post-PR-#27
-          # cohort still drifts on cache miss (HF *.tar shard glob was
-          # unsorted; revision unpinned). Now that PR #28 also lands the
-          # revision pin + sorted shard list, the manifest is genuinely
-          # idempotent — but we have not yet observed a stable post-pin
-          # baseline. Threshold tightening (with --fpr-max < --tpr-min
-          # invariant) deferred to a follow-up once one merge to main has
-          # populated the v5 cache and CI has demonstrated reproducibility.
+          # Phase 5 closeout + Phase 6 Part 2 step 2 (combined): threshold
+          # tightening anchored on two θ=2.25 baseline observations
+          # (run 25431310778 on main, run 25432567972 on PR #45).
+          #
+          # Per-row worst rows differ between runs because the v10 cohort
+          # is bit-identical (SHA256-verified — Phase 5 determinism holds)
+          # but ECAPA + DFN3's float32 SIMD path is sensitive to runner
+          # CPU class. Observed inter-run variance on the binding rows:
+          #   zh-CN @ snr=0  target TPR: 0.276 ↔ 0.376  (±0.05)
+          #   zh-CN @ snr=15 other  FPR: 0.136 ↔ 0.200  (±0.03)
+          #
+          # Thresholds set to absorb ~3× the observed variance:
+          #   --tpr-min 0.20  (lower bound 0.276 − 0.076 ≈ 2.5× var)
+          #   --fpr-max 0.30  (upper bound 0.200 + 0.100 ≈ 3× var)
+          #
+          # FPR ceiling drops 0.95 → 0.30 (3× tighter; the legacy
+          # placeholder caught nothing). The TPR floor moves DOWN from
+          # 0.30 because θ=2.25 is a stricter pass gate than the previous
+          # 1.5σ heuristic, so at-edge target TPR drops in lockstep.
+          #
+          # The `--fpr-max < --tpr-min` invariant (Phase 5 closeout goal)
+          # is NOT met here (0.30 > 0.20). The runner-CPU variance on
+          # zh-CN @ snr=15's worst-row FPR alone forces fpr_max >= 0.30
+          # to avoid flakes; closing the invariant gap requires either
+          # pinning the runner to a single CPU class or moving the
+          # per-row check to a per-language-mean check (~0.02 mean FPR
+          # is well below any reasonable tpr_min). Deferred to a future
+          # Phase 6 part 3 / Phase 7.
           python scripts/scenario_5_from_manifest.py \
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
-            --tpr-min 0.30 --fpr-max 0.95 \
+            --tpr-min 0.20 --fpr-max 0.30 \
             --real-pipeline
 
       # Stage the cohort summary alongside the scenario outputs so it lands
