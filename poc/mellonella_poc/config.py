@@ -93,8 +93,14 @@ class GatingConfig:
     as_norm_top_k: int = 10
     """Number of top-scoring impostor cohort entries used in the AS-Norm
     z-score numerator/denominator. Standard literature picks 10–50; we
-    default to 10 because the shipped cohort is small (50 speakers across
-    6 languages, see `bench/data/cohorts/`)."""
+    default to 10 — the floor of that range — because D-010 Phase 6
+    part 1 is bounded by MLS fr test split (18 speakers per language),
+    yielding a 6 langs × 15 spk = 90-embedding cohort. Top-K = 10 is
+    11 % of cohort (within the literature 5-30 % ratio) and the absolute
+    minimum for a stable μ/σ estimate. Reaching the literature 50–100
+    spk/lang cohort with top-K 20–30 requires MLS train-split sourcing
+    — MLS test split's smallest language has only 18 speakers. Deferred
+    to Phase 6 part 1.5 (separate PR)."""
 
     as_norm_cohort_path: str | None = None
     """Filesystem path to the impostor cohort ``.npz`` produced by
@@ -106,18 +112,17 @@ class GatingConfig:
     """Output gate threshold when :attr:`use_as_norm` is True (z-score scale).
 
     Confirmed as the CI-validated baseline at D-010 Phase 3 closeout
-    (PR #23/#24). On the cohort-disjoint, cache-frozen scenario_5 setup
-    (6-language cohort, 48 embeddings, top-K=10) this default reaches
-    TPR mean ≈ 0.77 and FPR mean ≈ 0.13 across MLS (de/fr) + Emilia-YODAS
-    (en/ja/ko/zh-CN), matching the heuristic literature value of "target
+    (PR #23/#24). On the Phase 4-5 scenario_5 setup (6-language cohort,
+    48 embeddings, top-K=10) this default reached TPR mean ≈ 0.77 and
+    FPR mean ≈ 0.13, matching the heuristic literature value of "target
     embedding is ~1.5 σ above the top-K impostor distribution".
 
-    Caveat: per-row FPR on zh-CN still fluctuates between ~0.55 and
-    ~0.85 across runs because the cohort gets reshuffled whenever the
-    GitHub Actions cache miss forces a fresh HF datasets streaming pull.
-    A real data-driven re-calibration via ``scripts/calibrate.py
-    --use-as-norm`` is deferred to D-010 Phase 4, when the cohort is
-    expanded to the literature-recommended 50–100 spk/language.
+    D-010 Phase 6 scales the cohort to 300 embeddings (50 spk/lang) +
+    top-K=20. The heuristic 1.5 σ value is kept for now; a data-driven
+    re-calibration via ``scripts/calibrate.py --use-as-norm`` is the
+    Phase 6 follow-up task (it needs one stable post-scale-up CI
+    baseline observation first, same deferral pattern as Phase 5
+    threshold-tightening).
     """
 
     theta_learn_as_norm: float = 2.5

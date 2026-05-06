@@ -47,7 +47,12 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-DEFAULT_TOP_SPEAKERS = 10
+# D-010 Phase 6 cohort scale-up: bumped 10 → 18, matching mls.py.
+# Emilia-YODAS shards have hundreds of speakers per language so this
+# value isn't binding — we mirror MLS to keep per-language cohort depth
+# uniform across all 6 scenario_5 languages. The actual binding limit
+# is MLS fr test split (18 speakers); see mls.py for the scaling story.
+DEFAULT_TOP_SPEAKERS = 18
 DEFAULT_CLIPS_PER_SPEAKER = 4
 # Mirror MLS: over-collect per speaker so the post-stream deterministic
 # clip sort actually has material to choose from instead of rubber-stamping
@@ -135,6 +140,10 @@ def prepare(
     *,
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
+    # Phase 6 cohort scale-up: kept at 5_000. Emilia-YODAS speaker
+    # coverage per shard is dense; 5_000 is comfortably enough to
+    # surface 18 speakers with ≥ clips_per_speaker × OVERSAMPLE_FACTOR
+    # clips each. The previous 20_000 / 10_000 bumps were unnecessary.
     max_stream: int = 5_000,
     hf_token: str | None = None,
 ) -> Path:

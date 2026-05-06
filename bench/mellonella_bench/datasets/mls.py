@@ -30,13 +30,23 @@ from .common import default_data_dir
 from .commonvoice import CommonVoiceClip, write_manifest
 
 SAMPLE_RATE = 16_000
-DEFAULT_TOP_SPEAKERS = 10
+# D-010 Phase 6 cohort scale-up (Part 1, take 3): bumped from 10 → 18 to
+# saturate the MLS test split's smallest language. MLS test split sizes
+# discovered via failed CI runs:
+#   - German test:  30 speakers (3 394 samples)  ← v6 failed at 60
+#   - French test:  18 speakers (2 426 samples)  ← v7 failed at 30
+# 18 is the binding limit. With `--skip-top-n 2` carve-out and a 1-speaker
+# buffer for selection variability, scenario_5 picks `--per-language 15`
+# from this. Reaching the literature 50–100 spk/lang target requires
+# switching MLS sourcing from `test` to `train` split (4 500+ spk/lang) —
+# deferred to Phase 6 part 1.5 (separate PR).
+DEFAULT_TOP_SPEAKERS = 18
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
 # We over-collect per speaker (up to OVERSAMPLE_FACTOR × clips_per_speaker)
 # so the post-stream deterministic clip sort has real material to choose
 # from. 4× is enough to absorb streaming-order shuffle for most MLS test
-# splits without blowing memory on 5 000-sample windows.
+# splits without blowing memory on the streaming window.
 OVERSAMPLE_FACTOR = 4
 
 # MLS HF config names spell out the language. We expose short ISO codes
@@ -118,6 +128,12 @@ def prepare(
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
     split: str = DEFAULT_SPLIT,
+    # Phase 6 cohort scale-up: kept at 5_000 since the binding constraint
+    # is "how many distinct speakers exist in MLS test split" (de = 30,
+    # fr = 18 — both well under any window we'd set), not "did we scan
+    # enough samples". The iterator exhausts in 2 400–3 400 samples for
+    # the small splits anyway. The previous 20_000 / 10_000 bumps were
+    # unnecessary on this code path.
     max_stream: int = 5_000,
 ) -> Path:
     """Stream MLS for ``language``, materialise top-K speakers + manifest.csv.
