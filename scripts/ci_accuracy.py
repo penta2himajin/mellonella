@@ -79,7 +79,21 @@ SI_SDR_ABS_TOL_DB = 1.0
 OTHER_RMS_ABS_TOL_DB = 3.0  # output_rms_db growing by > 3 dB = mute weakening
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BASELINE_PATH = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline.json"
+BASELINE_PATH_LEGACY = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline.json"
+BASELINE_PATH_AS_NORM = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline_as_norm.json"
+
+
+def _baseline_path(use_as_norm: bool) -> Path:
+    """Pick which baseline file to read/write based on the active gating mode.
+
+    Legacy ``α·cs + β·f0`` and AS-Norm produce metric values on
+    different scales (one is a mixed cosine+pitch score, the other a
+    cohort-normalised z-score), so a single baseline file would mix
+    incompatible distributions. Each mode keeps its own file at
+    ``docs/benchmarks/ci_baseline{,_as_norm}.json`` so the regression
+    check stays meaningful in either path.
+    """
+    return BASELINE_PATH_AS_NORM if use_as_norm else BASELINE_PATH_LEGACY
 
 
 def _to_target_sr(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -286,7 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--update-baseline",
         action="store_true",
-        help="overwrite docs/benchmarks/ci_baseline.json with the current measurement",
+        help=(
+            "overwrite docs/benchmarks/ci_baseline.json with the current "
+            "measurement (or ci_baseline_as_norm.json when --as-norm-cohort "
+            "is set)"
+        ),
     )
     parser.add_argument(
         "--as-norm-cohort",
@@ -295,12 +313,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "path to an impostor cohort .npz "
             "(see scripts/build_impostor_cohort.py); enables AS-Norm in the "
-            "real pipeline (D-010 Phase 6 Part 2 step 3). The shipped "
-            "ci_baseline.json was captured on the legacy mixed-score path; "
-            "switching to AS-Norm requires re-running with --update-baseline."
+            "real pipeline (D-010 Phase 6 Part 2 step 3). When set, the "
+            "script reads / writes the AS-Norm baseline at "
+            "docs/benchmarks/ci_baseline_as_norm.json instead of the "
+            "legacy ci_baseline.json — the two metric distributions are "
+            "incompatible (mixed cosine+pitch vs cohort z-score)."
         ),
     )
     args = parser.parse_args(argv)
+
+    baseline_path = _baseline_path(args.as_norm_cohort is not None)
 
     print(
         f"[ci-accuracy] running mini scenario_1 at {SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; "
@@ -312,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(metrics, indent=2))
 
     if args.update_baseline:
-        BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
         defaults = Config()
         config_payload: dict[str, object] = {
             "sample_rate": SAMPLE_RATE,
@@ -340,19 +362,19 @@ def main(argv: list[str] | None = None) -> int:
             },
             "metrics": metrics,
         }
-        BASELINE_PATH.write_text(json.dumps(payload, indent=2) + "\n")
-        print(f"[ci-accuracy] wrote baseline to {BASELINE_PATH}")
+        baseline_path.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"[ci-accuracy] wrote baseline to {baseline_path}")
         return 0
 
-    if not BASELINE_PATH.exists():
+    if not baseline_path.exists():
         print(
-            f"[ci-accuracy] no baseline at {BASELINE_PATH}; "
+            f"[ci-accuracy] no baseline at {baseline_path}; "
             "re-run with --update-baseline to seed it.",
             file=sys.stderr,
         )
         return 1
 
-    baseline = json.loads(BASELINE_PATH.read_text())
+    baseline = json.loads(baseline_path.read_text())
     failures = _check_against_baseline(metrics, baseline.get("metrics", {}))
     if failures:
         print("\n[ci-accuracy] REGRESSION DETECTED:", file=sys.stderr)
