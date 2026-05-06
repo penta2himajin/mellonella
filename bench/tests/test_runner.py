@@ -101,8 +101,18 @@ def test_parser_defaults():
     )
     assert not args.quick
     assert not args.real_pipeline
+    assert args.as_norm_cohort is None
 
 
 def test_parser_scenarios_split():
     args = build_parser().parse_args(["--output", "/tmp/out", "--scenarios", "scenario_1"])
     assert args.scenarios == ("scenario_1",)
+
+
+def test_parser_as_norm_cohort_path_passes_through():
+    from pathlib import Path
+
+    args = build_parser().parse_args(
+        ["--output", "/tmp/out", "--as-norm-cohort", "/tmp/cohort.npz"]
+    )
+    assert args.as_norm_cohort == Path("/tmp/cohort.npz")
