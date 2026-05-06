@@ -252,5 +252,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scenario-5-results
-          path: benchmark_results/scenario_5/
+          path: |
+            benchmark_results/scenario_5/
+            !benchmark_results/scenario_5/_workdir/**
           retention-days: 30
