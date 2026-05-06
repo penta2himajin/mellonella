@@ -58,7 +58,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from mellonella_poc.config import Config
+from mellonella_poc.config import Config, GatingConfig
 from mellonella_poc.pipeline import (
     PipelineComponents,
     enroll_from_recording,
@@ -141,8 +141,15 @@ def _rms_db(audio: np.ndarray) -> float:
     return 20.0 * float(np.log10(rms + 1e-12))
 
 
-def measure() -> dict[str, dict[str, float]]:
-    """Run the pipeline at every SNR + simultaneous mix and aggregate metrics."""
+def measure(as_norm_cohort: Path | None = None) -> dict[str, dict[str, float]]:
+    """Run the pipeline at every SNR + simultaneous mix and aggregate metrics.
+
+    When ``as_norm_cohort`` points at an impostor cohort ``.npz`` (built
+    by :mod:`scripts/build_impostor_cohort`), the pipeline switches to
+    the AS-Norm gating path with the data-driven defaults
+    ``theta_pass_as_norm = 2.25`` / ``theta_learn_as_norm = 3.25``
+    (Phase 6 Part 2). Otherwise the legacy ``α·cs + β·f0`` path is used.
+    """
     import librosa  # lazy: only needed when the script actually runs
 
     target_path = librosa.example("libri1")
@@ -158,7 +165,15 @@ def measure() -> dict[str, dict[str, float]]:
     target_test = target_audio[half:]
 
     # Project defaults (post-calibration); see scripts/calibrate.py.
-    config = Config()
+    if as_norm_cohort is not None:
+        config = Config(
+            gating=GatingConfig(
+                use_as_norm=True,
+                as_norm_cohort_path=str(as_norm_cohort),
+            ),
+        )
+    else:
+        config = Config()
     components = PipelineComponents.build_default(config)
     pool = enroll_from_recording(enrollment_audio, SAMPLE_RATE, config, components)
 
@@ -273,31 +288,49 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite docs/benchmarks/ci_baseline.json with the current measurement",
     )
+    parser.add_argument(
+        "--as-norm-cohort",
+        type=Path,
+        default=None,
+        help=(
+            "path to an impostor cohort .npz "
+            "(see scripts/build_impostor_cohort.py); enables AS-Norm in the "
+            "real pipeline (D-010 Phase 6 Part 2 step 3). The shipped "
+            "ci_baseline.json was captured on the legacy mixed-score path; "
+            "switching to AS-Norm requires re-running with --update-baseline."
+        ),
+    )
     args = parser.parse_args(argv)
 
     print(
         f"[ci-accuracy] running mini scenario_1 at {SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; "
         f"sim4 ratios={SIM4_RATIOS_DB} dB"
+        + (f"; AS-Norm cohort={args.as_norm_cohort}" if args.as_norm_cohort else "")
     )
-    metrics = measure()
+    metrics = measure(as_norm_cohort=args.as_norm_cohort)
     print("[ci-accuracy] measurements:")
     print(json.dumps(metrics, indent=2))
 
     if args.update_baseline:
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
         defaults = Config()
+        config_payload: dict[str, object] = {
+            "sample_rate": SAMPLE_RATE,
+            "snrs_db": list(SNRS_DB),
+            "sim4_ratios_db": list(SIM4_RATIOS_DB),
+            "seed": SEED,
+            "theta_pass": defaults.gating.theta_pass,
+            "theta_learn": defaults.gating.theta_learn,
+            "alpha": defaults.gating.alpha,
+            "beta": defaults.gating.beta,
+        }
+        if args.as_norm_cohort is not None:
+            config_payload["use_as_norm"] = True
+            config_payload["theta_pass_as_norm"] = defaults.gating.theta_pass_as_norm
+            config_payload["theta_learn_as_norm"] = defaults.gating.theta_learn_as_norm
         payload = {
             "schema_version": 2,
-            "config": {
-                "sample_rate": SAMPLE_RATE,
-                "snrs_db": list(SNRS_DB),
-                "sim4_ratios_db": list(SIM4_RATIOS_DB),
-                "seed": SEED,
-                "theta_pass": defaults.gating.theta_pass,
-                "theta_learn": defaults.gating.theta_learn,
-                "alpha": defaults.gating.alpha,
-                "beta": defaults.gating.beta,
-            },
+            "config": config_payload,
             "tolerances": {
                 "tpr_relative": TPR_REL_TOL,
                 "fpr_relative": FPR_REL_TOL,

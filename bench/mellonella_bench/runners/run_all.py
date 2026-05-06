@@ -45,6 +45,13 @@ class RunnerConfig:
     use_real_pipeline: bool = False
     """When False, scenarios run with :class:`StubPipelineProvider`. The real
     provider depends on torch/speechbrain via ``mellonella_poc``."""
+    as_norm_cohort: Path | None = None
+    """Path to an impostor cohort ``.npz`` (see
+    :mod:`scripts/build_impostor_cohort`). When set together with
+    ``use_real_pipeline``, the underlying :class:`RealPipelineProvider`
+    switches the gating layer to the AS-Norm path with the data-driven
+    defaults from D-010 Phase 6 Part 2. Ignored when
+    ``use_real_pipeline`` is False."""
 
 
 @dataclass
@@ -80,17 +87,24 @@ def _build_eval_id() -> str:
     return time.strftime("eval_%Y%m%d_%H%M%S")
 
 
-def _resolve_provider(use_real: bool) -> PipelineProvider:
+def _resolve_provider(
+    use_real: bool, as_norm_cohort: Path | None = None
+) -> PipelineProvider:
     """Pick a :class:`PipelineProvider` based on the CLI flag.
 
     The real provider is only imported when explicitly requested so that
     the lightweight CI path stays free of torch/speechbrain.
+
+    When ``as_norm_cohort`` is set together with ``use_real``, the
+    real provider is constructed with the AS-Norm cohort path so every
+    scenario routes its gating decisions through the cohort-normalised
+    z-score (D-010 Phase 6 Part 2 step 3).
     """
     if not use_real:
         return StubPipelineProvider()
     from ..scenarios.pipeline_provider import RealPipelineProvider
 
-    return RealPipelineProvider()
+    return RealPipelineProvider(as_norm_cohort_path=as_norm_cohort)
 
 
 def run(config: RunnerConfig) -> RunSummary:
@@ -102,7 +116,7 @@ def run(config: RunnerConfig) -> RunSummary:
         system_info=_system_info(),
     )
 
-    provider = _resolve_provider(config.use_real_pipeline)
+    provider = _resolve_provider(config.use_real_pipeline, config.as_norm_cohort)
 
     if "scenario_1" in config.scenarios:
         from ..scenarios.scenario_1 import run as run_scenario_1
@@ -231,6 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use the real mellonella-poc pipeline (requires `pip install -e poc[models]`)",
     )
+    parser.add_argument(
+        "--as-norm-cohort",
+        type=Path,
+        default=None,
+        help=(
+            "path to an impostor cohort .npz "
+            "(see scripts/build_impostor_cohort.py); when set together "
+            "with --real-pipeline, scenarios run on the AS-Norm gating "
+            "path (D-010 Phase 6 Part 2 step 3). Ignored otherwise."
+        ),
+    )
     return parser
 
 
@@ -241,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         scenarios=args.scenarios,
         quick=args.quick,
         use_real_pipeline=args.real_pipeline,
+        as_norm_cohort=args.as_norm_cohort,
     )
     summary = run(config)
     print(json.dumps({"eval_id": summary.eval_id, "output": str(config.output_dir)}, indent=2))
