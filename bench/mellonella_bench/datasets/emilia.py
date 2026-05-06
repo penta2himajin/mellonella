@@ -50,17 +50,32 @@ SAMPLE_RATE = 16_000
 # D-010 Phase 6 cohort scale-up:
 #   Part 1 (v8) bumped DEFAULT_TOP_SPEAKERS 10 → 18 to match mls.py
 #   under the MLS fr test split's 18-speaker bound.
-#   Part 1.5 (v9) bumps 18 → 52 because Emilia-YODAS sources both
-#   target / other (top-2) AND the cohort (top-50, ranks 2-51 via
-#   `--skip-top-n 2`) from the *same* manifest. Unlike MLS, Emilia-YODAS
-#   has no train/test split — the universe is one large speech corpus,
-#   so the same prep call serves both roles. The cohort builder's
+#   Part 1.5 (v10) bumps 18 → 52 so each per-language Emilia-YODAS
+#   manifest covers both the scenario_5 target / other speakers
+#   (top-2) AND the AS-Norm cohort (top-50, ranks 2-51 via
+#   `--skip-top-n 2`) for languages that source from Emilia.
+#   Unlike MLS, Emilia-YODAS has no train / test split — the universe
+#   is one large speech corpus, so the same prep call serves both
+#   roles when both are routed through Emilia. The cohort builder's
 #   skip-top-n carve-out keeps cohort speakers disjoint from target /
-#   other inside that single manifest. Per-shard speaker density is
-#   high (hundreds per shard) so the existing 5 000-sample scan window
-#   easily surfaces 52 speakers above the per_speaker_cap; no
-#   max_speakers_seen bound is required (peak memory ≈ 52 × 16 ×
-#   ~640 KB ≈ 0.5 GB, well within the 7 GB CI runner budget).
+#   other inside that single manifest.
+#   Coverage: en / ja / ko / zh-CN have always been Emilia-only (no
+#   MLS coverage). de / fr are dual-source: target / other still come
+#   from MLS test (data/mls/<lang>/), but the AS-Norm cohort for de
+#   and fr now also runs through Emilia (data/emilia_yodas/<lang>/),
+#   because MLS test is too small (18 spk in fr) to scale the cohort
+#   past the v8 bound, and MLS train scanning is too slow under
+#   per-speaker locality (~937 clips / spk; surfacing 52 distinct
+#   speakers requires ~50 000 streaming samples, blowing the CI
+#   timeout). For de / fr the top-2 Emilia speakers are unused
+#   (target / other comes from MLS); --skip-top-n 2 still applies
+#   uniformly across all 6 languages, costing 2 of the 52 prepared
+#   Emilia speakers per de / fr language but avoiding per-language
+#   skip-top-n knobs in the cohort builder.
+#   Per-shard speaker density is high (hundreds per shard) so the
+#   existing 5 000-sample scan window easily surfaces 52 speakers
+#   above the per_speaker_cap; peak memory ≈ 52 × 16 × ~640 KB ≈
+#   0.5 GB, well within the 7 GB CI runner budget.
 DEFAULT_TOP_SPEAKERS = 52
 DEFAULT_CLIPS_PER_SPEAKER = 4
 # Mirror MLS: over-collect per speaker so the post-stream deterministic

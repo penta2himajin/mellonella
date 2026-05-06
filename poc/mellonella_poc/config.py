@@ -104,11 +104,16 @@ class GatingConfig:
 
     Phase 6 history: v8 (cohort 90 emb, top-K 10 = 11 %) was the
     largest scale achievable with MLS test-split sourcing (bound by
-    MLS fr test = 18 spk/lang); v9 (this revision, cohort 300 emb,
-    top-K 20 = 6.7 %) sources the MLS cohort from the train split
-    instead, breaking past that bound. Future Phase 6 part 2 may
-    re-tune top-K together with a calibration run — see
-    docs/decisions.md."""
+    MLS fr test = 18 spk/lang); v9 attempted MLS train-split sourcing
+    but that path is too slow under HF parquet streaming's per-row
+    iteration rate (~20 samples/s) combined with MLS train's
+    per-speaker locality (~937 clips / spk); v10 (this revision,
+    cohort 300 emb, top-K 20 = 6.7 %) routes the de / fr cohort
+    through Emilia-YODAS DE / FR shards — cross-source-disjoint from
+    MLS test by construction (different upstream universes), high
+    speaker density (5 000-sample scan surfaces 52 spk in seconds).
+    Future Phase 6 part 2 may re-tune top-K together with a
+    calibration run — see docs/decisions.md."""
 
     as_norm_cohort_path: str | None = None
     """Filesystem path to the impostor cohort ``.npz`` produced by

@@ -33,19 +33,12 @@ SAMPLE_RATE = 16_000
 # D-010 Phase 6 cohort scale-up:
 #   Part 1 (v8) bumped DEFAULT_TOP_SPEAKERS 10 → 18 to saturate the MLS
 #   test split's smallest language (French test = 18 unique speakers /
-#   2 426 samples; German test = 30 / 3 394). 18 was the binding limit
-#   for the test path.
-#   Part 1.5 (v9, this revision) keeps DEFAULT_TOP_SPEAKERS = 18 for the
-#   test-split call site (target / other selection — still bound by MLS
-#   fr test = 18 spk) and adds a parallel CLI invocation that targets
-#   the MLS *train* split with `--top-speakers 52` for cohort use only.
-#   MLS train has 4 500+ speakers per language and is split-disjoint
-#   from test by canonical LibriSpeech construction, so the resulting
-#   cohort is guaranteed disjoint from scenario_5's target / other
-#   selection without needing the `--skip-top-n` carve-out (we still
-#   pass `--skip-top-n 2` uniformly to keep the cohort builder's API
-#   simple — costs us 2 of the 52 prepared train speakers per language
-#   but avoids per-manifest config knobs).
+#   2 426 samples; German test = 30 / 3 394). 18 is the binding limit
+#   for the test split — it cannot grow further without architectural
+#   changes (see Phase 6 part 1.5: we kept MLS test for de / fr target /
+#   other and routed the AS-Norm cohort for de / fr through Emilia-YODAS
+#   DE / FR shards instead, which is cross-source-disjoint by construction
+#   and has plenty of speaker density).
 DEFAULT_TOP_SPEAKERS = 18
 DEFAULT_CLIPS_PER_SPEAKER = 4
 DEFAULT_SPLIT = "test"
@@ -134,29 +127,7 @@ def prepare(
     top_speakers: int = DEFAULT_TOP_SPEAKERS,
     clips_per_speaker: int = DEFAULT_CLIPS_PER_SPEAKER,
     split: str = DEFAULT_SPLIT,
-    # Phase 6 cohort scale-up: kept at 5_000 for the test-split path —
-    # the binding constraint there is "how many distinct speakers exist
-    # in MLS test split" (de = 30, fr = 18 — both well under any window
-    # we'd set), not "did we scan enough samples". The Phase 6 part 1.5
-    # train-split path bumps this via the CLI to 30_000 (callers pass
-    # `--max-stream` explicitly) so the streaming iterator covers enough
-    # of the train set to surface 52 speakers each at the per-speaker
-    # cap; train-split clip density per speaker is moderate so 30_000
-    # is a defensive upper bound (typical fill is 5 000-15 000 samples).
     max_stream: int = 5_000,
-    # Phase 6 part 1.5 memory bound for the train-split path. When set,
-    # the streaming loop stops accepting *new* speakers once it has
-    # `max_speakers_seen` distinct ones in the bucket; previously-seen
-    # speakers can still grow up to `per_speaker_cap`. Without this cap,
-    # MLS train (≥ 3 000 speakers per language) can push memory past
-    # the 7 GB CI runner budget — accepted speakers each retain up to
-    # `clips_per_speaker × OVERSAMPLE_FACTOR = 16` audio buffers of
-    # ~960 KB each. Determinism is preserved: with DATASET_REVISION
-    # pinned + parquet shard order fixed, "the first N distinct speakers
-    # we encounter" is the same across runs. Defaults to None (no cap)
-    # for the test-split path, which never sees enough speakers to
-    # matter.
-    max_speakers_seen: int | None = None,
 ) -> Path:
     """Stream MLS for ``language``, materialise top-K speakers + manifest.csv.
 
@@ -209,15 +180,6 @@ def prepare(
         if speaker_raw is None:
             continue
         spk = str(speaker_raw)
-        # Memory bound for train-split scans: refuse to register new
-        # speakers once we already have `max_speakers_seen` in the
-        # bucket. Existing speakers can still grow up to per_speaker_cap.
-        if (
-            max_speakers_seen is not None
-            and spk not in by_speaker
-            and len(by_speaker) >= max_speakers_seen
-        ):
-            continue
         bucket = by_speaker.setdefault(spk, [])
         if len(bucket) >= per_speaker_cap:
             continue
@@ -300,44 +262,19 @@ def main(argv: list[str] | None = None) -> int:
         choices=["train", "validation", "test"],
         help=f"MLS split to stream (default: {DEFAULT_SPLIT})",
     )
-    p_prep.add_argument(
-        "--max-stream",
-        type=int,
-        default=None,
-        help=(
-            "max samples to pull from the streaming iterator before "
-            "ranking; the test path's default (5 000) is enough for the "
-            "small test split, the train path's cohort use case calls "
-            "this with 30 000+"
-        ),
-    )
-    p_prep.add_argument(
-        "--max-speakers-seen",
-        type=int,
-        default=None,
-        help=(
-            "memory bound for the train path: refuse to register new "
-            "speakers once we have this many distinct ones (existing "
-            "speakers still grow to per_speaker_cap). Required when "
-            "--split train is used against MLS."
-        ),
-    )
 
     args = parser.parse_args(argv)
 
     if args.cmd == "prepare":
         root = args.data_dir if args.data_dir is not None else default_data_dir() / "mls"
         output_dir = root / args.language
-        prepare_kwargs: dict = {
-            "top_speakers": args.top_speakers,
-            "clips_per_speaker": args.clips_per_speaker,
-            "split": args.split,
-        }
-        if args.max_stream is not None:
-            prepare_kwargs["max_stream"] = args.max_stream
-        if args.max_speakers_seen is not None:
-            prepare_kwargs["max_speakers_seen"] = args.max_speakers_seen
-        prepare(args.language, output_dir, **prepare_kwargs)
+        prepare(
+            args.language,
+            output_dir,
+            top_speakers=args.top_speakers,
+            clips_per_speaker=args.clips_per_speaker,
+            split=args.split,
+        )
         print(f"  output: {output_dir}")
         print(f"  manifest: {output_dir / 'manifest.csv'}")
         return 0
