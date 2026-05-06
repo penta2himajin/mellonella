@@ -87,9 +87,7 @@ def _build_eval_id() -> str:
     return time.strftime("eval_%Y%m%d_%H%M%S")
 
 
-def _resolve_provider(
-    use_real: bool, as_norm_cohort: Path | None = None
-) -> PipelineProvider:
+def _resolve_provider(use_real: bool, as_norm_cohort: Path | None = None) -> PipelineProvider:
     """Pick a :class:`PipelineProvider` based on the CLI flag.
 
     The real provider is only imported when explicitly requested so that
