@@ -235,19 +235,21 @@ jobs:
             # at cohort load.
             ARGS+=("--as-norm-cohort" "data/cohorts/scenario5_cohort.npz")
           fi
-          # NOTE: --fpr-max held at 0.95 (was 0.7) since Phase 4. An attempt
-          # to tighten to 0.55 in PR #28 surfaced that the post-PR-#27
-          # cohort still drifts on cache miss (HF *.tar shard glob was
-          # unsorted; revision unpinned). Now that PR #28 also lands the
-          # revision pin + sorted shard list, the manifest is genuinely
-          # idempotent — but we have not yet observed a stable post-pin
-          # baseline. Threshold tightening (with --fpr-max < --tpr-min
-          # invariant) deferred to a follow-up once one merge to main has
-          # populated the v5 cache and CI has demonstrated reproducibility.
+          # Phase 5 closeout + Phase 6 Part 2 step 2 (combined): threshold
+          # tightening anchored on the post-#44 v10 + theta_pass_as_norm=2.25
+          # baseline observed on main (run 25431310778, 2026-05-06).
+          # Per-row worst observed: TPR 0.276 (zh-CN @ snr=0), FPR 0.136
+          # (zh-CN @ snr=15). Setting --tpr-min 0.20 (worst row + 0.076
+          # margin) and --fpr-max 0.18 (worst row + 0.044 margin) keeps
+          # the --fpr-max < --tpr-min invariant while shrinking the FPR
+          # ceiling 5x vs the legacy --fpr-max 0.95 placeholder. The TPR
+          # floor moves DOWN from 0.30 because theta_pass_as_norm = 2.25
+          # is a stricter pass gate than the previous 1.5σ heuristic, so
+          # the at-edge TPR (low-SNR, multilingual) drops in lockstep.
           python scripts/scenario_5_from_manifest.py \
             "${ARGS[@]}" \
             --output benchmark_results/scenario_5 \
-            --tpr-min 0.30 --fpr-max 0.95 \
+            --tpr-min 0.20 --fpr-max 0.18 \
             --real-pipeline
 
       # Stage the cohort summary alongside the scenario outputs so it lands
