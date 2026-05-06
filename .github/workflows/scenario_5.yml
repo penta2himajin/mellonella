@@ -203,6 +203,20 @@ jobs:
 
       # ---- Build the --manifest argument list dynamically and run scenario_5 ----
 
+      - name: Calibrate theta_pass_as_norm against the v10 cohort (Phase 6 Part 2 step 1, observation only)
+        if: steps.hf.outputs.have_token == 'true'
+        run: |
+          set -euo pipefail
+          # Sweep AS-Norm theta on the librosa libri1/2/3 default speakers
+          # against the v10 cohort (300 embeddings, 6 langs × 50 spk).
+          # Outputs land in docs/benchmarks/calibration_as_norm_*.{csv,json}
+          # and are staged into the artifact below for diff-against-prior runs.
+          # Goal: observe `recommended_theta_pass` so the heuristic 1.5σ default
+          # in GatingConfig can be replaced data-drivenly in a follow-up PR.
+          python scripts/calibrate.py \
+            --use-as-norm \
+            --cohort data/cohorts/scenario5_cohort.npz
+
       - name: Run scenario_5 against all available manifests (with AS-Norm)
         run: |
           set -euo pipefail
@@ -239,12 +253,21 @@ jobs:
       # Stage the cohort summary alongside the scenario outputs so it lands
       # in the same artifact zip the user already downloads. Helps diff cohort
       # composition between runs (D-010 Phase 2 variance investigation).
-      - name: Stage cohort summary into scenario_5 results dir
+      - name: Stage cohort + calibration summaries into scenario_5 results dir
         if: always()
         run: |
           mkdir -p benchmark_results/scenario_5
           if [ -f data/cohorts/scenario5_cohort.json ]; then
             cp data/cohorts/scenario5_cohort.json benchmark_results/scenario_5/cohort_summary.json
+          fi
+          # Phase 6 Part 2 step 1: include the v10 AS-Norm calibration
+          # observation alongside scenario_5 outputs so reviewers can read
+          # `recommended_theta_pass` directly from the artifact.
+          if [ -f docs/benchmarks/calibration_as_norm_summary.json ]; then
+            cp docs/benchmarks/calibration_as_norm_summary.json benchmark_results/scenario_5/calibration_as_norm_summary.json
+          fi
+          if [ -f docs/benchmarks/calibration_as_norm_results.csv ]; then
+            cp docs/benchmarks/calibration_as_norm_results.csv benchmark_results/scenario_5/calibration_as_norm_results.csv
           fi
 
       - name: Upload scenario_5 outputs (always)
