@@ -14,7 +14,14 @@ jobs:
   scenario-5:
     name: scenario_5 (multilingual robustness; MLS + Emilia-YODAS)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # D-010 Phase 6 part 1.5 (v9) bumped from 45 → 60 minutes to budget
+    # for the new MLS train-split cohort prep step. Cold-cache cost on
+    # the train path: ~5-10 min per language × 2 (de + fr); test-split
+    # prep + Emilia + cohort build still ~10-15 min combined. Total
+    # cold-cache ≈ 20-35 min, comfortably within the new 60-min budget
+    # but past the old 45-min one. Warm cache (steady state) is
+    # unchanged from v8.
+    timeout-minutes: 60
     # Fork PRs do not see secrets — skip there so contributors aren't blocked
     # by an obviously-failing required check. Push to main + same-repo PRs run
     # the full thing.
@@ -75,26 +82,59 @@ jobs:
       # than the new manifest produces); v6 was the first Phase 6 attempt
       # (top_speakers = 60) — failed, MLS de test has only 30 speakers;
       # v7 was the second attempt (top_speakers = 30, per-language = 25)
-      # — failed, MLS fr test has only 18 speakers; v8 saturates the
-      # smallest MLS test split (top_speakers = 18, per-language = 15).
-      # Reaching the literature 50–100 spk/lang requires MLS train-split
-      # sourcing (Phase 6 part 1.5, separate PR).
+      # — failed, MLS fr test has only 18 speakers; v8 saturated the
+      # smallest MLS test split (top_speakers = 18, per-language = 15);
+      # v9 (Phase 6 part 1.5) splits the MLS prep into a test-split lane
+      # (target / other, top_speakers = 18, output: data/mls/<lang>/) and
+      # a train-split lane (cohort, top_speakers = 52, output:
+      # data/mls_cohort/<lang>/), bumps Emilia top_speakers 18 → 52, and
+      # bumps cohort --per-language 15 → 50 — total cohort = 6 langs ×
+      # 50 spk = 300 embeddings (vs 90 in v8), reaching the literature
+      # 50-100 spk/lang lower bound.
       - name: Cache MLS + Emilia subset materials + AS-Norm cohort
         uses: actions/cache@v4
         with:
           path: data
-          key: scenario5-data-v8-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
+          key: scenario5-data-v9-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
           restore-keys: |
-            scenario5-data-v8-${{ runner.os }}-
+            scenario5-data-v9-${{ runner.os }}-
 
       # ---- Prepare per-language subsets ----
       # MLS is ungated — always runs. Emilia-YODAS is gated; only runs when
       # HF_TOKEN is configured. Either path's manifest is reused on warm cache.
 
-      - name: Prepare MLS subsets (de, fr — en was dropped from MLS at parquet migration)
+      - name: Prepare MLS test-split subsets (de, fr — target / other; en was dropped from MLS at parquet migration)
         run: |
           python -m mellonella_bench.datasets.mls prepare --language de
           python -m mellonella_bench.datasets.mls prepare --language fr
+
+      # D-010 Phase 6 part 1.5: parallel MLS train-split prep, written to
+      # a sibling output dir. The train split has 4 500+ speakers per
+      # language and is split-disjoint from test by canonical LibriSpeech
+      # construction, so the resulting cohort is guaranteed disjoint from
+      # the target / other speakers picked by scenario_5_from_manifest.py.
+      # `--top-speakers 52` covers the cohort target (50) plus the
+      # `--skip-top-n 2` carve-out the cohort builder applies uniformly.
+      # `--max-stream 30000` is a defensive upper bound on the streaming
+      # window; typical fill is well below this, but train-split clip
+      # density per speaker varies. `--max-speakers-seen 60` caps memory
+      # at ≤ 60 × 16 clips × ~960 KB/clip ≈ 0.92 GB so the prep stays
+      # well inside the 7 GB CI runner budget regardless of how many
+      # distinct speakers appear in the streaming window.
+      - name: Prepare MLS train-split subsets (de, fr — AS-Norm cohort)
+        run: |
+          python -m mellonella_bench.datasets.mls prepare \
+            --language de --split train \
+            --top-speakers 52 \
+            --max-stream 30000 \
+            --max-speakers-seen 60 \
+            --data-dir "${MELLONELLA_DATA_DIR}/mls_cohort"
+          python -m mellonella_bench.datasets.mls prepare \
+            --language fr --split train \
+            --top-speakers 52 \
+            --max-stream 30000 \
+            --max-speakers-seen 60 \
+            --data-dir "${MELLONELLA_DATA_DIR}/mls_cohort"
 
       - name: Check HF_TOKEN availability
         id: hf
@@ -131,12 +171,17 @@ jobs:
       #
       # `--skip-top-n 2` matches scenario_5_from_manifest.py's default
       # `--top-speakers 2` so the speakers used as test target / other are
-      # carved out of the cohort. D-010 Phase 6 part 1: `--per-language 15`
-      # takes ranks 2-16 → 6 langs × 15 spk = 90 cohort embeddings,
-      # top-K = 10 = 11 % of cohort (within literature 5-30 % range).
-      # The bound is MLS fr test split (18 speakers); reaching the
-      # literature 50–100 spk/lang target requires MLS train-split
-      # sourcing — deferred to Phase 6 part 1.5 (separate PR).
+      # carved out of the cohort. For Emilia-YODAS the carve-out is real
+      # (target / other and cohort share one manifest; ranks 0-1 vs 2-51).
+      # For MLS de / fr the cohort already comes from the train split
+      # (data/mls_cohort/<lang>/...), which is split-disjoint from the
+      # test split feeding target / other — `--skip-top-n 2` then just
+      # drops the lex-first 2 train speakers per language; harmless,
+      # avoids per-manifest skip-top-n config in the cohort builder.
+      # D-010 Phase 6 part 1.5: `--per-language 50` — 6 langs × 50 spk =
+      # 300 cohort embeddings, top-K = 20 = 6.7 % of cohort (within the
+      # literature 5-30 % range; lower ratio than v8's 11 %, which is the
+      # actual variance-reduction lever for the AS-Norm μ/σ tail).
 
       - name: Build AS-Norm impostor cohort (skip if cached)
         run: |
@@ -151,8 +196,10 @@ jobs:
           fi
           mkdir -p data/cohorts
           ARGS=()
+          # Phase 6 part 1.5: de / fr cohort comes from the train-split
+          # manifest, NOT the test-split one used for target / other.
           for lang in de fr; do
-            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls_cohort/${lang}/manifest.csv")
           done
           if [ "${{ steps.hf.outputs.have_token }}" = "true" ]; then
             for lang in en ja ko zh-CN; do
@@ -162,7 +209,7 @@ jobs:
           python scripts/build_impostor_cohort.py \
             "${ARGS[@]}" \
             --skip-top-n 2 \
-            --per-language 15 \
+            --per-language 50 \
             --output data/cohorts/scenario5_cohort.npz
 
       # ---- Build the --manifest argument list dynamically and run scenario_5 ----
