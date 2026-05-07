@@ -65,6 +65,7 @@ from calibrate import (  # noqa: E402
 
 SAMPLE_RATE = 16_000
 DEFAULT_TOP_SPEAKERS_PER_LANG = 3  # matches libri1/2/3 cell count
+DEFAULT_MAX_SECONDS_PER_SPEAKER = 6.0  # matches libri1/2/3 typical audio length
 DEFAULT_GLOBAL_THETA = 2.25  # current GatingConfig default
 DEFAULT_SPREAD_DECISION_THRESHOLD = 0.5
 
@@ -107,12 +108,47 @@ def _select_top_speakers(
     return dict(items[:n])
 
 
+def _trim_speakers(
+    speakers: dict[str, np.ndarray], max_seconds: float
+) -> dict[str, np.ndarray]:
+    """Trim each speaker buffer to ``max_seconds`` so per-cell pipeline cost
+    matches the libri1/2/3 footprint scripts/calibrate.py was originally sized
+    for.
+
+    ``measure_cells`` half-splits each speaker (enroll = audio[:half],
+    test = audio[half:]) and runs ``process_offline`` on the test half
+    once per (enroll, test, noise, snr) cell. Pipeline cost scales with
+    audio length, so a 40 s manifest concat (4 clips × ~10 s, current
+    Phase 6 v10 dataset prep default) is ~8× the libri1/2/3 ~5 s
+    samples — enough that the global calibrate.py budget (~6:26 per run
+    on 108 cells) explodes to multi-hour territory at 6 languages and
+    blows the 60-min job-level timeout.
+
+    Trimming to ``max_seconds`` (default 6 s, matching libri1/2/3
+    typical) keeps the per-cell cost comparable. The accuracy cost is
+    bounded — the sweep only measures TPR / FPR rates that already
+    converge well at the libri1/2/3 audio scale; longer buffers just
+    give marginally more stable rate estimates per cell.
+    """
+    n_max = int(max_seconds * SAMPLE_RATE)
+    if n_max <= 0:
+        raise ValueError("max_seconds must be > 0")
+    out: dict[str, np.ndarray] = {}
+    for name, audio in speakers.items():
+        if audio.size > n_max:
+            out[name] = audio[:n_max]
+        else:
+            out[name] = audio
+    return out
+
+
 def sweep_one_language(
     manifest_path: Path,
     language: str,
     *,
     cohort_path: Path,
     top_speakers: int,
+    max_seconds_per_speaker: float,
 ) -> dict:
     """Run the AS-Norm sweep for one language and return its per-θ + recommended."""
     raw = load_speakers_from_manifest(manifest_path, SAMPLE_RATE)
@@ -127,6 +163,7 @@ def sweep_one_language(
             f"{len(raw)} speaker(s); need >= {top_speakers}"
         )
     speakers = _select_top_speakers(raw, top_speakers)
+    speakers = _trim_speakers(speakers, max_seconds_per_speaker)
 
     rows = measure_cells(
         speakers=speakers,
@@ -236,6 +273,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--max-seconds-per-speaker",
+        type=float,
+        default=DEFAULT_MAX_SECONDS_PER_SPEAKER,
+        help=(
+            f"trim each per-speaker buffer to this many seconds before the "
+            f"sweep (default: {DEFAULT_MAX_SECONDS_PER_SPEAKER} — matches the "
+            "libri1/2/3 footprint calibrate.py was sized for; raising it "
+            "makes per-cell cost grow linearly and blows the 60-min job-level "
+            "timeout at 6 languages)"
+        ),
+    )
+    parser.add_argument(
         "--global-theta",
         type=float,
         default=DEFAULT_GLOBAL_THETA,
@@ -265,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
             spec.language,
             cohort_path=args.cohort,
             top_speakers=args.top_speakers,
+            max_seconds_per_speaker=args.max_seconds_per_speaker,
         )
 
     spread = _spread_analysis(
@@ -282,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_mean_fpr": MAX_MEAN_FPR_AS_NORM,
             "min_tpr_floor": MIN_TPR_FLOOR_AS_NORM,
             "top_speakers_per_lang": args.top_speakers,
+            "max_seconds_per_speaker": args.max_seconds_per_speaker,
             "cohort_path": str(args.cohort),
         },
         "per_language": per_lang,
