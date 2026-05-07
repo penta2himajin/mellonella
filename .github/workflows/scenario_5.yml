@@ -203,8 +203,39 @@ jobs:
 
       # ---- Build the --manifest argument list dynamically and run scenario_5 ----
 
-      - name: Calibrate theta_pass_as_norm against the v10 cohort (Phase 6 Part 2 step 1, observation only)
+      # AS-Norm calibration is a pure function of (cohort.npz contents,
+      # calibrate.py logic, score-emitting pipeline source). On a warm-cache
+      # CI run the calibrate step itself has been ~6:26 (≈59% of the
+      # ~11 min total job, observed in main run 25480110590, commit
+      # 5a33585a) and its output is observation-only — it is staged
+      # into the artifact for diff but does not gate any failure. So we
+      # cache the two output files keyed by sha256(cohort.npz) +
+      # hashFiles(scripts/calibrate.py + the gating/pipeline modules
+      # whose code paths feed score_per_frame). The 3 source SHAs and
+      # the cohort SHA fully determine the calibration result; if any
+      # changes, the key flips and the calibrate step re-runs and
+      # repopulates the cache. Saves ~6 min per typical PR push.
+      - name: Compute calibrate cache key
+        id: calibrate-key
         if: steps.hf.outputs.have_token == 'true'
+        run: |
+          set -euo pipefail
+          cohort_sha=$(sha256sum data/cohorts/scenario5_cohort.npz | awk '{print $1}')
+          src_sha="${{ hashFiles('scripts/calibrate.py', 'poc/mellonella_poc/gating.py', 'poc/mellonella_poc/pipeline.py') }}"
+          echo "key=calibrate-as-norm-v1-${{ runner.os }}-${cohort_sha:0:16}-${src_sha:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore calibrate output cache
+        id: calibrate-cache
+        if: steps.hf.outputs.have_token == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            docs/benchmarks/calibration_as_norm_results.csv
+            docs/benchmarks/calibration_as_norm_summary.json
+          key: ${{ steps.calibrate-key.outputs.key }}
+
+      - name: Calibrate theta_pass_as_norm against the v10 cohort (Phase 6 Part 2 step 1, observation only)
+        if: steps.hf.outputs.have_token == 'true' && steps.calibrate-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           # Sweep AS-Norm theta on the librosa libri1/2/3 default speakers
