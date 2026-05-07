@@ -101,32 +101,43 @@ jobs:
           restore-keys: |
             accuracy-models-v1-${{ runner.os }}-
 
-      # Restore-only: consume the v10 cohort that scenario_5.yml built and
-      # cached. We deliberately do NOT save back here — the cohort is
-      # owned by scenario_5.yml, this job is just a reader.
-      - name: Restore v10 AS-Norm cohort cache from scenario_5
-        id: cohort-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            data/mls/de/manifest.csv
-            data/mls/fr/manifest.csv
-            data/mls/de/clips
-            data/mls/fr/clips
-            data/emilia_yodas
-            data/cohorts
-          key: scenario5-data-v10-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
-          restore-keys: |
-            scenario5-data-v10-${{ runner.os }}-
-
-      - name: Verify cohort presence
+      # We tried `actions/cache/restore@v4` against scenario_5.yml's cohort
+      # cache key first, but the same key that scenario_5.yml was actively
+      # restoring on main produced "Cache not found" from a workflow_dispatch
+      # job on the same commit (runs 25442641541 + 25443677600). Cache
+      # cross-job visibility is fragile enough that we switched to the
+      # artifact route: scenario_5.yml stages `scenario5_cohort.npz` into
+      # the existing `scenario-5-results` artifact, and we fetch it from
+      # the latest successful scenario_5 main run via `gh run download`.
+      - name: Fetch v10 cohort from latest scenario_5 main artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ ! -f data/cohorts/scenario5_cohort.npz ]; then
-            echo "::error::data/cohorts/scenario5_cohort.npz not found in restored cache" >&2
-            echo "::error::run scenario_5.yml on main first to populate the cache" >&2
+          mkdir -p data/cohorts
+          run_id=$(gh run list \
+            --workflow scenario_5.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "::error::no successful scenario_5 main run found to download from" >&2
             exit 1
           fi
+          echo "downloading scenario-5-results from run_id=$run_id"
+          gh run download "$run_id" \
+            --name scenario-5-results \
+            --dir /tmp/scenario5-art \
+            --repo "${GITHUB_REPOSITORY}"
+          if [ ! -f /tmp/scenario5-art/scenario5_cohort.npz ]; then
+            echo "::error::scenario5_cohort.npz missing from artifact (latest run_id=$run_id)" >&2
+            echo "::error::scenario_5.yml staging step needs to include the .npz; rerun scenario_5 on main." >&2
+            ls -la /tmp/scenario5-art/ >&2 || true
+            exit 1
+          fi
+          cp /tmp/scenario5-art/scenario5_cohort.npz data/cohorts/scenario5_cohort.npz
           ls -la data/cohorts/
 
       - name: Capture ci_baseline_as_norm.json
