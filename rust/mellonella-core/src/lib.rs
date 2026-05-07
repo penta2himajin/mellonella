@@ -12,6 +12,7 @@ pub mod embedding {
     //! function. Backed by `ort` once added.
 }
 
+pub mod f0;
 pub mod gating;
 
 pub mod enrollment {
