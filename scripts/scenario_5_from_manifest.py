@@ -58,8 +58,8 @@ from mellonella_bench.scenarios.scenario_5 import (  # noqa: E402
 )
 
 SAMPLE_RATE = 16_000
-DEFAULT_TPR_MIN = 0.5
-DEFAULT_FPR_MAX = 0.5
+DEFAULT_TPR_MEAN_MIN = 0.40
+DEFAULT_FPR_MEAN_MAX = 0.30
 DEFAULT_TOP_SPEAKERS = 2
 
 
@@ -212,44 +212,54 @@ def build_items(
 
 
 def collect_failures(
-    sweep_entries: list,
+    metrics: dict[str, float],
     *,
-    tpr_min: float,
-    fpr_max: float,
+    tpr_mean_min: float,
+    fpr_mean_max: float,
 ) -> list[dict]:
-    """Return one dict per (item, snr, mode) that violated a threshold."""
+    """Return one dict per *language* whose per-language mean violated a threshold.
+
+    Replaces the previous per-row check (an entry per ``(item, snr, mode)``
+    row hard-failed when its individual TPR / FPR breached a single
+    threshold). Per-row metrics on scenario_5 turned out to be
+    unreproducible across runner CPU classes — the ``zh-CN`` worst-row
+    FPR for the *same* `speaker02_vs_speaker20` sample varied 0.087 ↔
+    0.400 across four observations on bit-identical input + cohort
+    (D-010 Phase 6 Part 2 step 2 closeout, decisions.md). The
+    per-language mean over ``(item, snr)`` pairs is far more stable
+    (mean FPR observed range 0.017–0.062) and still catches the
+    catastrophic regressions the threshold is meant to detect.
+
+    Expected ``metrics`` keys: ``gate_tpr_mean__<lang>`` /
+    ``gate_fpr_mean__<lang>`` (produced by
+    :func:`mellonella_bench.scenarios.scenario_5._aggregate_by_language`).
+    Other keys (e.g. the grand-mean ``gate_tpr_mean``) are ignored.
+    """
     failures: list[dict] = []
-    for entry in sweep_entries:
-        if entry.notes == "mode=target" and entry.gate_tpr is not None:
-            if entry.gate_tpr < tpr_min:
+    for key in sorted(metrics):
+        value = metrics[key]
+        if key.startswith("gate_tpr_mean__"):
+            lang = key[len("gate_tpr_mean__"):]
+            if value < tpr_mean_min:
                 failures.append(
                     {
-                        "language": entry.language,
-                        "sample_id": entry.sample_id,
-                        "target_speaker": entry.target_speaker,
-                        "other_speaker": entry.other_speaker,
-                        "snr_db": entry.snr_db,
-                        "mode": "target",
-                        "metric": "gate_tpr",
-                        "value": entry.gate_tpr,
-                        "threshold": tpr_min,
-                        "violation": "below_tpr_min",
+                        "language": lang,
+                        "metric": "gate_tpr_mean",
+                        "value": round(value, 4),
+                        "threshold": tpr_mean_min,
+                        "violation": "below_tpr_mean_min",
                     }
                 )
-        elif entry.notes == "mode=other" and entry.gate_fpr is not None:
-            if entry.gate_fpr > fpr_max:
+        elif key.startswith("gate_fpr_mean__"):
+            lang = key[len("gate_fpr_mean__"):]
+            if value > fpr_mean_max:
                 failures.append(
                     {
-                        "language": entry.language,
-                        "sample_id": entry.sample_id,
-                        "target_speaker": entry.target_speaker,
-                        "other_speaker": entry.other_speaker,
-                        "snr_db": entry.snr_db,
-                        "mode": "other",
-                        "metric": "gate_fpr",
-                        "value": entry.gate_fpr,
-                        "threshold": fpr_max,
-                        "violation": "above_fpr_max",
+                        "language": lang,
+                        "metric": "gate_fpr_mean",
+                        "value": round(value, 4),
+                        "threshold": fpr_mean_max,
+                        "violation": "above_fpr_mean_max",
                     }
                 )
     return failures
@@ -305,16 +315,25 @@ def main(argv: list[str] | None = None) -> int:
         help=f"comma-separated SNR list in dB (default: {','.join(map(str, DEFAULT_SNRS_DB))})",
     )
     parser.add_argument(
-        "--tpr-min",
+        "--tpr-mean-min",
         type=float,
-        default=DEFAULT_TPR_MIN,
-        help=f"per-row minimum target TPR; rows below count as failures (default: {DEFAULT_TPR_MIN})",
+        default=DEFAULT_TPR_MEAN_MIN,
+        help=(
+            "per-language minimum mean TPR; languages whose "
+            f"gate_tpr_mean__<lang> drops below this fail (default: {DEFAULT_TPR_MEAN_MIN}). "
+            "Per-row checks were retired at D-010 Phase 6 Part 2 step 2 "
+            "closeout because runner-CPU FP variance made per-row "
+            "thresholds unreproducible."
+        ),
     )
     parser.add_argument(
-        "--fpr-max",
+        "--fpr-mean-max",
         type=float,
-        default=DEFAULT_FPR_MAX,
-        help=f"per-row maximum other FPR; rows above count as failures (default: {DEFAULT_FPR_MAX})",
+        default=DEFAULT_FPR_MEAN_MAX,
+        help=(
+            "per-language maximum mean FPR; languages whose "
+            f"gate_fpr_mean__<lang> exceeds this fail (default: {DEFAULT_FPR_MEAN_MAX})."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -367,29 +386,35 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
     )
 
+    thresholds_payload = {
+        "tpr_mean_min": args.tpr_mean_min,
+        "fpr_mean_max": args.fpr_mean_max,
+    }
     summary = {
         "n_items": result.n_samples,
         "languages": sorted({s.language for s in args.manifest}),
         "snrs_db": list(args.snrs_db),
         "metrics": result.metrics,
-        "thresholds": {"tpr_min": args.tpr_min, "fpr_max": args.fpr_max},
+        "thresholds": thresholds_payload,
     }
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    sweep_entries = result.sweep.entries if result.sweep is not None else []
     failures = collect_failures(
-        sweep_entries, tpr_min=args.tpr_min, fpr_max=args.fpr_max
+        result.metrics,
+        tpr_mean_min=args.tpr_mean_min,
+        fpr_mean_max=args.fpr_mean_max,
     )
+    n_languages = sum(1 for k in result.metrics if k.startswith("gate_tpr_mean__"))
     failures_payload = {
-        "thresholds": {"tpr_min": args.tpr_min, "fpr_max": args.fpr_max},
+        "thresholds": thresholds_payload,
         "n_failures": len(failures),
-        "n_total_rows": len(sweep_entries),
+        "n_languages": n_languages,
         "failures": failures,
     }
     (args.output / "failures.json").write_text(json.dumps(failures_payload, indent=2))
 
     print(json.dumps(summary, indent=2))
-    print(f"failures: {len(failures)} / {len(sweep_entries)} rows")
+    print(f"failures: {len(failures)} / {n_languages} languages")
 
     if failures:
         return 1

@@ -149,56 +149,54 @@ def test_build_items_rejects_single_speaker_manifest(tmp_path):
         )
 
 
-def test_collect_failures_flags_below_tpr_min():
-    """A row in target mode with TPR below the minimum is reported."""
+def test_collect_failures_flags_language_below_tpr_mean_min():
+    """A language whose per-language TPR mean is below the floor is reported."""
     mod = _import_script()
-    from mellonella_bench.scenarios.base import SnrSweepEntry
-
-    entries = [
-        SnrSweepEntry(
-            sample_id="x",
-            language="ja",
-            snr_db=0.0,
-            gate_tpr=0.10,
-            notes="mode=target",
-        ),
-        SnrSweepEntry(
-            sample_id="x",
-            language="ja",
-            snr_db=10.0,
-            gate_tpr=0.95,
-            notes="mode=target",
-        ),
-    ]
-    failures = mod.collect_failures(entries, tpr_min=0.5, fpr_max=0.5)
+    metrics = {
+        "gate_tpr_mean__ja": 0.30,
+        "gate_fpr_mean__ja": 0.05,
+        "gate_tpr_mean__en": 0.85,
+        "gate_fpr_mean__en": 0.02,
+        "gate_tpr_mean": 0.575,  # grand mean — must be ignored
+    }
+    failures = mod.collect_failures(metrics, tpr_mean_min=0.40, fpr_mean_max=0.30)
     assert len(failures) == 1
-    assert failures[0]["violation"] == "below_tpr_min"
-    assert failures[0]["snr_db"] == 0.0
+    assert failures[0]["language"] == "ja"
+    assert failures[0]["violation"] == "below_tpr_mean_min"
+    assert failures[0]["metric"] == "gate_tpr_mean"
 
 
-def test_collect_failures_flags_above_fpr_max():
+def test_collect_failures_flags_language_above_fpr_mean_max():
     mod = _import_script()
-    from mellonella_bench.scenarios.base import SnrSweepEntry
-
-    entries = [
-        SnrSweepEntry(
-            sample_id="x",
-            language="en",
-            snr_db=5.0,
-            gate_fpr=0.95,
-            notes="mode=other",
-        ),
-    ]
-    failures = mod.collect_failures(entries, tpr_min=0.5, fpr_max=0.5)
+    metrics = {
+        "gate_tpr_mean__zh-CN": 0.60,
+        "gate_fpr_mean__zh-CN": 0.45,
+        "gate_tpr_mean__en": 0.85,
+        "gate_fpr_mean__en": 0.02,
+    }
+    failures = mod.collect_failures(metrics, tpr_mean_min=0.40, fpr_mean_max=0.30)
     assert len(failures) == 1
-    assert failures[0]["violation"] == "above_fpr_max"
+    assert failures[0]["language"] == "zh-CN"
+    assert failures[0]["violation"] == "above_fpr_mean_max"
+
+
+def test_collect_failures_ignores_grand_mean_keys():
+    mod = _import_script()
+    metrics = {
+        "gate_tpr_mean": 0.10,  # grand mean below floor — ignored
+        "gate_fpr_mean": 0.99,  # grand mean above ceiling — ignored
+        "gate_tpr_mean__en": 0.85,
+        "gate_fpr_mean__en": 0.02,
+    }
+    failures = mod.collect_failures(metrics, tpr_mean_min=0.40, fpr_mean_max=0.30)
+    assert failures == []
 
 
 def test_main_end_to_end_with_stub_provider(tmp_path):
-    """The default stub passes everything → TPR=1, FPR=1.
+    """The default stub passes everything → per-language FPR mean = 1.
 
-    With ``--fpr-max=0.5`` every other-mode row is a failure, so the script
-    should write summary/failures and exit 1.
+    With ``--fpr-mean-max=0.5`` every language's FPR mean exceeds the
+    ceiling, so each language is one failure → exit 1.
     """
     mod = _import_script()
     ja = _write_synthetic_manifest(tmp_path / "ja_subset", language="ja")
@@ -214,24 +212,25 @@ def test_main_end_to_end_with_stub_provider(tmp_path):
             str(output),
             "--snrs-db",
             "10.0",
-            "--tpr-min",
+            "--tpr-mean-min",
             "0.5",
-            "--fpr-max",
+            "--fpr-mean-max",
             "0.5",
         ]
     )
-    assert rc == 1  # FPR=1 with stub → every other-mode row violates fpr_max
+    assert rc == 1  # FPR=1 per language with stub → both langs violate fpr_mean_max
     assert (output / "scenario_5.csv").exists()
     summary = json.loads((output / "summary.json").read_text())
     assert summary["n_items"] == 2
     assert set(summary["languages"]) == {"ja", "en"}
     failures = json.loads((output / "failures.json").read_text())
-    assert failures["n_failures"] >= 2
-    assert all(f["violation"] == "above_fpr_max" for f in failures["failures"])
+    assert failures["n_failures"] == 2
+    assert {f["language"] for f in failures["failures"]} == {"ja", "en"}
+    assert all(f["violation"] == "above_fpr_mean_max" for f in failures["failures"])
 
 
 def test_main_passes_when_thresholds_satisfied(tmp_path):
-    """With permissive thresholds (fpr_max=1.1) the stub passes → exit 0."""
+    """With permissive thresholds (fpr_mean_max=1.1) the stub passes → exit 0."""
     mod = _import_script()
     ja = _write_synthetic_manifest(tmp_path / "ja_subset", language="ja")
     output = tmp_path / "out"
@@ -243,9 +242,9 @@ def test_main_passes_when_thresholds_satisfied(tmp_path):
             str(output),
             "--snrs-db",
             "10.0",
-            "--tpr-min",
+            "--tpr-mean-min",
             "0.0",
-            "--fpr-max",
+            "--fpr-mean-max",
             "1.1",
         ]
     )
