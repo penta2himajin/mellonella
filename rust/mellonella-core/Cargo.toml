@@ -7,5 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Single-target speaker hard-gating filter — core library (Phase 3 WIP)"
 
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

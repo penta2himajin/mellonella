@@ -11,6 +11,10 @@ rust-version = "1.75"
 license = "Apache-2.0"
 repository = "https://github.com/penta2himajin/mellonella"
 
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
