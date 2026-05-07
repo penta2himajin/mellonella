@@ -1,20 +1,23 @@
 //! Gating logic ported from `poc/mellonella_poc/gating.py`.
 //!
-//! Pure-math primitives operating on already-computed embeddings — no
-//! dependency on the ECAPA ONNX wrapper. Mirrors:
+//! Pure-math primitives operating on already-computed embeddings:
 //!
 //! * [`cos_similarity`] / [`cos_sim_max`] — cosine similarity helpers
 //! * [`f0_match`]                          — Gaussian F0 match
 //! * [`as_norm_score`]                     — Adaptive S-Norm z-score
 //! * [`target_score_as_norm`]              — pool-vs-cohort integrated score
 //!
-//! Stateful pieces (gate hangover, attack/release envelope, auto-learn
-//! admission) are intentionally not yet ported — they will follow once the
-//! streaming buffer model in [`crate::pipeline`] (TBD) is settled.
+//! Stateful streaming pieces:
+//!
+//! * [`GateConfig`]      — thresholds & timing constants
+//! * [`GateState`]       — binary gate with hangover
+//! * [`EnvelopeState`]   — attack/release follower
+//! * [`apply_envelope`]  — gain ramp applied to a buffer
 
-// `usize → f32` for top-K mean / variance: cohort top-K is bounded by
-// literature 10–50, far below f32's 2^23 mantissa, so the loss clippy
-// warns about cannot occur in practice.
+// `usize → f32` for top-K mean / variance and sample-rate / time math:
+// cohort top-K is bounded by literature 10–50 and sample rates fit
+// comfortably in f32's 2^23 mantissa, so the loss clippy warns about
+// cannot occur in practice.
 #![allow(clippy::cast_precision_loss)]
 
 const EPS: f32 = 1e-12;
@@ -156,7 +159,214 @@ pub fn target_score_as_norm<P: AsRef<[f32]>, C: AsRef<[f32]>>(
     as_norm_score(embedding, cs, cohort, as_norm_top_k)
 }
 
+// ---------------------------------------------------------------------
+// Stateful streaming primitives
+// ---------------------------------------------------------------------
+
+/// Thresholds and timing constants for the binary gate + envelope.
+/// Mirrors the relevant fields of `mellonella_poc.config.GatingConfig`;
+/// other PoC fields (auto-learn admission, anchor distances, alpha/beta
+/// mix) live on dedicated configs in their own modules.
+#[derive(Debug, Clone, Copy)]
+pub struct GateConfig {
+    /// Pass threshold for the legacy `α·cs + β·f0` mixed score.
+    pub theta_pass: f32,
+    /// Pass threshold under Adaptive S-Norm (z-score scale).
+    pub theta_pass_as_norm: f32,
+    /// When `true`, [`GateState::update`] compares against
+    /// `theta_pass_as_norm`; otherwise against `theta_pass`.
+    pub use_as_norm: bool,
+    /// How long the gate stays ON after the score drops below threshold.
+    pub hangover_ms: f32,
+    /// Envelope attack time in milliseconds.
+    pub attack_ms: f32,
+    /// Envelope release time in milliseconds.
+    pub release_ms: f32,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        // Mirrors `mellonella_poc.config.GatingConfig` defaults for the
+        // gate / envelope fields. Source: poc/mellonella_poc/config.py.
+        Self {
+            theta_pass: 0.30,
+            theta_pass_as_norm: 2.25,
+            use_as_norm: false,
+            hangover_ms: 300.0,
+            attack_ms: 15.0,
+            release_ms: 100.0,
+        }
+    }
+}
+
+/// Mutable hangover state for the binary gate. `update` returns the
+/// binary decision (`true` == pass).
+#[derive(Debug, Clone, Copy)]
+pub struct GateState {
+    config: GateConfig,
+    is_on: bool,
+    elapsed_off_ms: f32,
+}
+
+impl GateState {
+    #[must_use]
+    pub fn new(config: GateConfig) -> Self {
+        Self {
+            config,
+            is_on: false,
+            elapsed_off_ms: 0.0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.is_on
+    }
+
+    fn theta_pass(&self) -> f32 {
+        if self.config.use_as_norm {
+            self.config.theta_pass_as_norm
+        } else {
+            self.config.theta_pass
+        }
+    }
+
+    /// Step the gate forward by `dt_ms` with the latest `score`. Returns
+    /// the binary decision the caller should feed into the envelope.
+    pub fn update(&mut self, score: f32, dt_ms: f32) -> bool {
+        if score >= self.theta_pass() {
+            self.is_on = true;
+            self.elapsed_off_ms = 0.0;
+            return true;
+        }
+        if self.is_on {
+            self.elapsed_off_ms += dt_ms;
+            if self.elapsed_off_ms < self.config.hangover_ms {
+                return true;
+            }
+            self.is_on = false;
+            return false;
+        }
+        false
+    }
+}
+
+/// Attack/release envelope follower. Each [`advance`](Self::advance)
+/// emits an `n_samples` gain ramp in `[0, 1]` to multiply against audio.
+#[derive(Debug, Clone, Copy)]
+pub struct EnvelopeState {
+    config: GateConfig,
+    sample_rate: u32,
+    value: f32,
+}
+
+impl EnvelopeState {
+    #[must_use]
+    pub fn new(config: GateConfig, sample_rate: u32) -> Self {
+        Self {
+            config,
+            sample_rate,
+            value: 0.0,
+        }
+    }
+
+    /// Current envelope value (the last emitted gain). Useful for tests
+    /// that need to seed the follower with a non-zero starting point.
+    #[must_use]
+    pub fn value(&self) -> f32 {
+        self.value
+    }
+
+    pub fn set_value(&mut self, v: f32) {
+        self.value = v;
+    }
+
+    fn coef(&self, ms: f32) -> f32 {
+        if ms <= 0.0 {
+            return 1.0;
+        }
+        let tau_samples = ms * self.sample_rate as f32 / 1000.0;
+        1.0 - (-1.0 / tau_samples).exp()
+    }
+
+    /// Step `n_samples` toward `target_on` ∈ {`true`, `false`}.
+    pub fn advance(&mut self, target_on: bool, n_samples: usize) -> Vec<f32> {
+        let coef = self.coef(if target_on {
+            self.config.attack_ms
+        } else {
+            self.config.release_ms
+        });
+        let target = if target_on { 1.0 } else { 0.0 };
+        let mut out = Vec::with_capacity(n_samples);
+        let mut v = self.value;
+        for _ in 0..n_samples {
+            v += coef * (target - v);
+            out.push(v);
+        }
+        self.value = v;
+        out
+    }
+}
+
+/// Error returned by [`apply_envelope`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyEnvelopeError {
+    /// `decisions` was empty or did not start at sample 0.
+    DecisionsMustStartAtZero,
+}
+
+impl std::fmt::Display for ApplyEnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DecisionsMustStartAtZero => f.write_str("decisions must start with sample 0"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyEnvelopeError {}
+
+/// Apply the attack/release envelope to `audio` given the gate
+/// `decisions` produced by [`GateState::update`].
+///
+/// `decisions` is a list of `(start_sample, is_on)` tuples in increasing
+/// order. The first tuple's `start_sample` must be 0; every entry's
+/// region runs to the next entry's start (or the end of the buffer).
+///
+/// # Errors
+/// Returns [`ApplyEnvelopeError::DecisionsMustStartAtZero`] when the
+/// invariant on the first decision is violated.
+pub fn apply_envelope(
+    audio: &[f32],
+    decisions: &[(usize, bool)],
+    sample_rate: u32,
+    config: GateConfig,
+) -> Result<Vec<f32>, ApplyEnvelopeError> {
+    if decisions.is_empty() || decisions[0].0 != 0 {
+        return Err(ApplyEnvelopeError::DecisionsMustStartAtZero);
+    }
+    let mut env = EnvelopeState::new(config, sample_rate);
+    let n = audio.len();
+    let mut out = vec![0.0_f32; n];
+    let mut boundaries: Vec<usize> = decisions.iter().map(|d| d.0).collect();
+    boundaries.push(n);
+    for (i, &(start, is_on)) in decisions.iter().enumerate() {
+        let end = boundaries[i + 1];
+        if end < start || end > n {
+            // Out-of-order decisions are caller bugs; clamp to keep us
+            // memory-safe and let the test detect the misuse via the
+            // mis-shaped output.
+            continue;
+        }
+        let gain = env.advance(is_on, end - start);
+        for (k, &g) in gain.iter().enumerate() {
+            out[start + k] = audio[start + k] * g;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
 
@@ -339,6 +549,119 @@ mod tests {
         assert!(
             approx_eq(out, expected, 1e-5),
             "out={out} expected={expected}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stateful streaming primitives (mirrors poc/tests/test_gating.py)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn gate_state_pass_above_threshold() {
+        let mut gate = GateState::new(GateConfig::default());
+        assert!(gate.update(0.9, 20.0));
+        assert!(gate.is_on());
+    }
+
+    #[test]
+    fn gate_state_hangover_keeps_pass() {
+        let mut gate = GateState::new(GateConfig {
+            hangover_ms: 200.0,
+            ..GateConfig::default()
+        });
+        gate.update(0.9, 20.0);
+        assert!(gate.update(0.0, 100.0));
+        assert!(gate.update(0.0, 99.0));
+        assert!(!gate.update(0.0, 10.0));
+    }
+
+    #[test]
+    fn gate_state_no_hangover_when_off() {
+        let mut gate = GateState::new(GateConfig::default());
+        assert!(!gate.update(0.0, 20.0));
+        assert!(!gate.update(0.0, 20.0));
+    }
+
+    #[test]
+    fn envelope_attack_release_monotonic() {
+        let cfg = GateConfig {
+            attack_ms: 15.0,
+            release_ms: 100.0,
+            ..GateConfig::default()
+        };
+        let sr: u32 = 48_000;
+        let mut env = EnvelopeState::new(cfg, sr);
+        let n_attack = (0.1 * f64::from(sr)) as usize;
+        let on = env.advance(true, n_attack);
+        assert!(on[0] < *on.last().unwrap());
+        assert!(*on.last().unwrap() > 0.95);
+        let n_release = (0.5 * f64::from(sr)) as usize;
+        let off = env.advance(false, n_release);
+        assert!(off[0] > *off.last().unwrap());
+        assert!(*off.last().unwrap() < 0.05);
+    }
+
+    #[test]
+    fn envelope_attack_faster_than_release() {
+        let cfg = GateConfig {
+            attack_ms: 15.0,
+            release_ms: 100.0,
+            ..GateConfig::default()
+        };
+        let sr: u32 = 48_000;
+        let mut env_a = EnvelopeState::new(cfg, sr);
+        let mut env_b = EnvelopeState::new(cfg, sr);
+        let attack_curve = env_a.advance(true, sr as usize);
+        env_b.set_value(1.0);
+        let release_curve = env_b.advance(false, sr as usize);
+        let to_half_attack = attack_curve
+            .iter()
+            .position(|&v| v >= 0.5)
+            .expect("attack must cross 0.5");
+        let to_half_release = release_curve
+            .iter()
+            .position(|&v| v <= 0.5)
+            .expect("release must cross 0.5");
+        assert!(to_half_attack > 0);
+        assert!(to_half_release > 0);
+        assert!(to_half_attack < to_half_release);
+    }
+
+    #[test]
+    fn apply_envelope_alignment() {
+        let cfg = GateConfig {
+            attack_ms: 15.0,
+            release_ms: 100.0,
+            ..GateConfig::default()
+        };
+        let sr: u32 = 48_000;
+        let n = sr as usize;
+        let audio = vec![1.0_f32; n];
+        let decisions = [(0, true), (n / 2, false)];
+        let out = apply_envelope(&audio, &decisions, sr, cfg).unwrap();
+        assert_eq!(out.len(), audio.len());
+        let mid = n / 2;
+        assert!(out[mid - 100] > 0.95);
+        assert!(out[n - 100] < 0.05);
+    }
+
+    #[test]
+    fn apply_envelope_requires_zero_start() {
+        let audio = vec![1.0_f32; 10];
+        let res = apply_envelope(&audio, &[(1, true)], 48_000, GateConfig::default());
+        assert_eq!(
+            res.unwrap_err(),
+            ApplyEnvelopeError::DecisionsMustStartAtZero
+        );
+    }
+
+    #[test]
+    fn apply_envelope_rejects_empty_decisions() {
+        let audio = vec![1.0_f32; 10];
+        let res = apply_envelope(&audio, &[], 48_000, GateConfig::default());
+        assert_eq!(
+            res.unwrap_err(),
+            ApplyEnvelopeError::DecisionsMustStartAtZero
         );
     }
 }
