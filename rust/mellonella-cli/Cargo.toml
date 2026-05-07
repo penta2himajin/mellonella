@@ -1,0 +1,18 @@
+[package]
+name = "mellonella-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mellonella desktop CLI (Phase 3 WIP)"
+
+[[bin]]
+name = "mellonella"
+path = "src/main.rs"
+
+[dependencies]
+mellonella-core = { path = "../mellonella-core" }
+
+[lints]
+workspace = true
