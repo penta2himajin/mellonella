@@ -12,10 +12,6 @@ pub mod embedding {
     //! function. Backed by `ort` once added.
 }
 
+pub mod enrollment;
 pub mod f0;
 pub mod gating;
-
-pub mod enrollment {
-    //! Enrollment / auto-learn pool with anchor protection and drift
-    //! detection. Mirrors `poc/mellonella_poc/enrollment.py`.
-}
