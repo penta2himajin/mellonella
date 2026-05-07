@@ -66,7 +66,18 @@ from calibrate import (  # noqa: E402
 
 SAMPLE_RATE = 16_000
 DEFAULT_TOP_SPEAKERS_PER_LANG = 3  # matches libri1/2/3 cell count
-DEFAULT_MAX_SECONDS_PER_SPEAKER = 6.0  # matches libri1/2/3 typical audio length
+# 16 s = 8 s test after the half-split, matching scenario_5_from_manifest.py's
+# `--max-seconds-per-speaker 8.0` test footprint. Phase 7 step 3 follow-up
+# determined empirically that the originally chosen 6 s (= 3 s test) was too
+# short for ECAPA's statistics pooling to converge on non-libri1/2/3
+# languages — at 6 s, ja's TPR_median was floor-clamped (0.18-0.40) at every
+# theta and recommend_theta fell back to "smallest theta meeting just the
+# FPR budget". With 16 s the pooling stabilises (ja TPR_median rises to
+# 0.728 at theta=2.25 and 0.822 at theta=0.25, matching scenario_5's
+# observed TPR mean of 0.852 for ja). Sweep cost stays inside the 60-min
+# job timeout: 6 langs × 108 cells × ~3.5 s/cell × ~3 (audio length scale)
+# ≈ 38 min, vs the prior ~12 min at 6 s.
+DEFAULT_MAX_SECONDS_PER_SPEAKER = 16.0
 DEFAULT_GLOBAL_THETA = 2.25  # current GatingConfig default
 DEFAULT_SPREAD_DECISION_THRESHOLD = 0.5
 

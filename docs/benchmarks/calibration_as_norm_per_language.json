@@ -31,7 +31,11 @@
     "max_mean_fpr": 0.1,
     "min_tpr_floor": 0.5,
     "top_speakers_per_lang": 3,
-    "max_seconds_per_speaker": 6.0,
+    "max_seconds_per_speaker": 16.0,
+    "noise_types_used": [
+      "white",
+      "pink"
+    ],
     "cohort_path": "data/cohorts/scenario5_cohort.npz"
   },
   "per_language": {
@@ -47,84 +51,84 @@
       "per_theta": {
         "0.000": {
           "tpr_median": 1.0,
-          "tpr_mean": 0.9968625000000001,
-          "fpr_median": 0.5699,
-          "fpr_mean": 0.6236562499999999
+          "tpr_mean": 0.9796666666666667,
+          "fpr_median": 0.436,
+          "fpr_mean": 0.57275
         },
         "0.250": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.56765,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.11536666666666667
+          "tpr_median": 0.782,
+          "tpr_mean": 0.766,
+          "fpr_median": 0.20800000000000002,
+          "fpr_mean": 0.31075
         },
         "0.500": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.56765,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.10775000000000001
+          "tpr_median": 0.782,
+          "tpr_mean": 0.7578333333333335,
+          "fpr_median": 0.168,
+          "fpr_mean": 0.28875
         },
         "0.750": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.56765,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.10394166666666667
+          "tpr_median": 0.766,
+          "tpr_mean": 0.7525000000000001,
+          "fpr_median": 0.136,
+          "fpr_mean": 0.2591666666666667
         },
         "1.000": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.5645125,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.09878958333333332
+          "tpr_median": 0.766,
+          "tpr_mean": 0.7513333333333333,
+          "fpr_median": 0.084,
+          "fpr_mean": 0.2261666666666667
         },
         "1.250": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.5645125,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.09699791666666667
+          "tpr_median": 0.766,
+          "tpr_mean": 0.7461666666666668,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.18583333333333332
         },
         "1.500": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.5577916666666667,
+          "tpr_median": 0.766,
+          "tpr_mean": 0.7436666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.09184583333333333
+          "fpr_mean": 0.15716666666666668
         },
         "1.750": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.5577916666666667,
+          "tpr_median": 0.76,
+          "tpr_mean": 0.7386666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.09184583333333333
+          "fpr_mean": 0.1285
         },
         "2.000": {
-          "tpr_median": 0.5591,
-          "tpr_mean": 0.5430083333333333,
+          "tpr_median": 0.6819999999999999,
+          "tpr_mean": 0.7235,
           "fpr_median": 0.0,
-          "fpr_mean": 0.090725
+          "fpr_mean": 0.10766666666666667
         },
         "2.250": {
-          "tpr_median": 0.543,
-          "tpr_mean": 0.5358416666666667,
+          "tpr_median": 0.674,
+          "tpr_mean": 0.7120000000000001,
           "fpr_median": 0.0,
-          "fpr_mean": 0.08893333333333332
+          "fpr_mean": 0.08900000000000001
         },
         "2.500": {
-          "tpr_median": 0.543,
-          "tpr_mean": 0.5358416666666667,
+          "tpr_median": 0.672,
+          "tpr_mean": 0.6908333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.08534791666666668
+          "fpr_mean": 0.07516666666666667
         },
         "2.750": {
-          "tpr_median": 0.543,
-          "tpr_mean": 0.5358416666666667,
+          "tpr_median": 0.672,
+          "tpr_mean": 0.6736666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.07862708333333333
+          "fpr_mean": 0.06316666666666666
         },
         "3.000": {
-          "tpr_median": 0.51075,
-          "tpr_mean": 0.4946291666666666,
+          "tpr_median": 0.672,
+          "tpr_mean": 0.6581666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.06339583333333333
+          "fpr_mean": 0.05175
         }
       },
-      "recommended_theta_pass": 1.0
+      "recommended_theta_pass": 2.25
     },
     "fr": {
       "speakers_used": [
@@ -138,84 +142,84 @@
       "per_theta": {
         "0.000": {
           "tpr_median": 1.0,
-          "tpr_mean": 0.9767000000000001,
-          "fpr_median": 0.5161,
-          "fpr_mean": 0.5414479166666667
+          "tpr_mean": 0.9513333333333333,
+          "fpr_median": 0.33999999999999997,
+          "fpr_mean": 0.35541666666666666
         },
         "0.250": {
-          "tpr_median": 0.5860000000000001,
-          "tpr_mean": 0.5555500000000001,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.029120833333333332
+          "tpr_median": 0.76,
+          "tpr_mean": 0.7698333333333333,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.12258333333333334
         },
         "0.500": {
-          "tpr_median": 0.5860000000000001,
-          "tpr_mean": 0.5519666666666666,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.010752083333333334
+          "tpr_median": 0.76,
+          "tpr_mean": 0.762,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.09858333333333336
         },
         "0.750": {
-          "tpr_median": 0.5860000000000001,
-          "tpr_mean": 0.5483791666666668,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "tpr_median": 0.756,
+          "tpr_mean": 0.754,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.07708333333333334
         },
         "1.000": {
-          "tpr_median": 0.5215000000000001,
-          "tpr_mean": 0.5331458333333333,
+          "tpr_median": 0.756,
+          "tpr_mean": 0.7526666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.05616666666666667
         },
         "1.250": {
-          "tpr_median": 0.5161,
-          "tpr_mean": 0.5197083333333333,
+          "tpr_median": 0.756,
+          "tpr_mean": 0.7498333333333332,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.044250000000000005
         },
         "1.500": {
-          "tpr_median": 0.5161,
-          "tpr_mean": 0.5058208333333334,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.7446666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.03233333333333333
         },
         "1.750": {
-          "tpr_median": 0.5161,
-          "tpr_mean": 0.4986541666666667,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.735,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.02391666666666667
         },
         "2.000": {
-          "tpr_median": 0.5161,
-          "tpr_mean": 0.4919291666666667,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.7273333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.017666666666666667
         },
         "2.250": {
-          "tpr_median": 0.5161,
-          "tpr_mean": 0.47759166666666664,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.7198333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.012000000000000002
         },
         "2.500": {
-          "tpr_median": 0.51075,
-          "tpr_mean": 0.4704249999999999,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.7105,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.009916666666666667
         },
         "2.750": {
-          "tpr_median": 0.51075,
-          "tpr_mean": 0.4399583333333334,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.6923333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.007083333333333334
         },
         "3.000": {
-          "tpr_median": 0.47314999999999996,
-          "tpr_mean": 0.403225,
+          "tpr_median": 0.736,
+          "tpr_mean": 0.6829999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.005666666666666667
         }
       },
-      "recommended_theta_pass": 0.25
+      "recommended_theta_pass": 0.5
     },
     "en": {
       "speakers_used": [
@@ -229,81 +233,81 @@
       "per_theta": {
         "0.000": {
           "tpr_median": 1.0,
-          "tpr_mean": 0.9556458333333334,
-          "fpr_median": 0.4409,
-          "fpr_mean": 0.4569916666666667
+          "tpr_mean": 0.9708333333333332,
+          "fpr_median": 0.212,
+          "fpr_mean": 0.26699999999999996
         },
         "0.250": {
-          "tpr_median": 0.5913999999999999,
-          "tpr_mean": 0.5690083333333333,
+          "tpr_median": 0.836,
+          "tpr_mean": 0.8085,
           "fpr_median": 0.0,
-          "fpr_mean": 0.011425
+          "fpr_mean": 0.06858333333333333
         },
         "0.500": {
-          "tpr_median": 0.5913999999999999,
-          "tpr_mean": 0.5640833333333334,
+          "tpr_median": 0.836,
+          "tpr_mean": 0.8035,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0038083333333333333
+          "fpr_mean": 0.06158333333333333
         },
         "0.750": {
-          "tpr_median": 0.5913999999999999,
-          "tpr_mean": 0.5618416666666667,
+          "tpr_median": 0.836,
+          "tpr_mean": 0.7959999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.05725
         },
         "1.000": {
-          "tpr_median": 0.5913999999999999,
-          "tpr_mean": 0.5555666666666667,
+          "tpr_median": 0.836,
+          "tpr_mean": 0.7871666666666668,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.05166666666666667
         },
         "1.250": {
-          "tpr_median": 0.58065,
-          "tpr_mean": 0.5452625,
+          "tpr_median": 0.836,
+          "tpr_mean": 0.778,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.046000000000000006
         },
         "1.500": {
-          "tpr_median": 0.5699,
-          "tpr_mean": 0.5345041666666667,
+          "tpr_median": 0.834,
+          "tpr_mean": 0.7638333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.041
         },
         "1.750": {
-          "tpr_median": 0.5645,
-          "tpr_mean": 0.5161333333333333,
+          "tpr_median": 0.824,
+          "tpr_mean": 0.7558333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.034833333333333334
         },
         "2.000": {
-          "tpr_median": 0.53225,
-          "tpr_mean": 0.4914958333333333,
+          "tpr_median": 0.776,
+          "tpr_mean": 0.7314999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.02775
         },
         "2.250": {
-          "tpr_median": 0.53225,
-          "tpr_mean": 0.47760416666666666,
+          "tpr_median": 0.776,
+          "tpr_mean": 0.7094999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.02291666666666667
         },
         "2.500": {
-          "tpr_median": 0.5054000000000001,
-          "tpr_mean": 0.46326666666666666,
+          "tpr_median": 0.754,
+          "tpr_mean": 0.6833333333333332,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.020916666666666667
         },
         "2.750": {
-          "tpr_median": 0.47850000000000004,
-          "tpr_mean": 0.4301083333333333,
+          "tpr_median": 0.748,
+          "tpr_mean": 0.6403333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.016
         },
         "3.000": {
-          "tpr_median": 0.40325,
-          "tpr_mean": 0.3767958333333333,
+          "tpr_median": 0.748,
+          "tpr_mean": 0.5986666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.01391666666666667
         }
       },
       "recommended_theta_pass": 0.25
@@ -319,82 +323,82 @@
       "n_rows": 1404,
       "per_theta": {
         "0.000": {
-          "tpr_median": 0.957,
-          "tpr_mean": 0.9413,
-          "fpr_median": 0.44625000000000004,
-          "fpr_mean": 0.5996958333333333
+          "tpr_median": 1.0,
+          "tpr_mean": 0.9845,
+          "fpr_median": 0.308,
+          "fpr_mean": 0.29424999999999996
         },
         "0.250": {
-          "tpr_median": 0.3978,
-          "tpr_mean": 0.4000791666666667,
+          "tpr_median": 0.822,
+          "tpr_mean": 0.7871666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.01008125
+          "fpr_mean": 0.05491666666666667
         },
         "0.500": {
-          "tpr_median": 0.38705,
-          "tpr_mean": 0.35975833333333335,
+          "tpr_median": 0.822,
+          "tpr_mean": 0.7846666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.041833333333333333
         },
         "0.750": {
-          "tpr_median": 0.3763,
-          "tpr_mean": 0.3409416666666667,
+          "tpr_median": 0.798,
+          "tpr_mean": 0.7781666666666668,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.03625
         },
         "1.000": {
-          "tpr_median": 0.37095,
-          "tpr_mean": 0.32302083333333337,
+          "tpr_median": 0.78,
+          "tpr_mean": 0.7591666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.028666666666666663
         },
         "1.250": {
-          "tpr_median": 0.3656,
-          "tpr_mean": 0.31227083333333333,
+          "tpr_median": 0.778,
+          "tpr_mean": 0.7579999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.020333333333333335
         },
         "1.500": {
-          "tpr_median": 0.3387,
-          "tpr_mean": 0.29121250000000004,
+          "tpr_median": 0.758,
+          "tpr_mean": 0.7426666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.017499999999999998
         },
         "1.750": {
-          "tpr_median": 0.2688,
-          "tpr_mean": 0.25716666666666665,
+          "tpr_median": 0.758,
+          "tpr_mean": 0.7261666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.014750000000000001
         },
         "2.000": {
-          "tpr_median": 0.1828,
-          "tpr_mean": 0.22535833333333333,
+          "tpr_median": 0.756,
+          "tpr_mean": 0.6971666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.009333333333333334
         },
         "2.250": {
-          "tpr_median": 0.1828,
-          "tpr_mean": 0.199375,
+          "tpr_median": 0.728,
+          "tpr_mean": 0.6654999999999999,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.009333333333333334
         },
         "2.500": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.11917499999999999,
+          "tpr_median": 0.6859999999999999,
+          "tpr_mean": 0.6041666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.007916666666666667
         },
         "2.750": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.10035833333333333,
+          "tpr_median": 0.6499999999999999,
+          "tpr_mean": 0.5683333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.0065
         },
         "3.000": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.07482083333333334,
+          "tpr_median": 0.554,
+          "tpr_mean": 0.47933333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.004666666666666667
         }
       },
       "recommended_theta_pass": 0.25
@@ -411,84 +415,84 @@
       "per_theta": {
         "0.000": {
           "tpr_median": 1.0,
-          "tpr_mean": 0.9870041666666666,
-          "fpr_median": 0.51075,
-          "fpr_mean": 0.534725
+          "tpr_mean": 0.9836666666666667,
+          "fpr_median": 0.382,
+          "fpr_mean": 0.38808333333333334
         },
         "0.250": {
-          "tpr_median": 0.5699,
-          "tpr_mean": 0.5685416666666666,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.035616666666666665
+          "tpr_median": 0.8,
+          "tpr_mean": 0.7958333333333334,
+          "fpr_median": 0.1,
+          "fpr_mean": 0.13475
         },
         "0.500": {
-          "tpr_median": 0.5484,
-          "tpr_mean": 0.5456958333333334,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.021729166666666664
+          "tpr_median": 0.8,
+          "tpr_mean": 0.7919999999999999,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.10358333333333332
         },
         "0.750": {
-          "tpr_median": 0.5376,
-          "tpr_mean": 0.5349458333333333,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.012320833333333331
+          "tpr_median": 0.774,
+          "tpr_mean": 0.783,
+          "fpr_median": 0.034,
+          "fpr_mean": 0.077
         },
         "1.000": {
-          "tpr_median": 0.53225,
-          "tpr_mean": 0.5206125,
+          "tpr_median": 0.772,
+          "tpr_mean": 0.7755,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.06166666666666667
         },
         "1.250": {
-          "tpr_median": 0.5269,
-          "tpr_mean": 0.5103083333333334,
+          "tpr_median": 0.746,
+          "tpr_mean": 0.7596666666666666,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.043583333333333335
         },
         "1.500": {
-          "tpr_median": 0.5269,
-          "tpr_mean": 0.473125,
+          "tpr_median": 0.74,
+          "tpr_mean": 0.7406666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.034333333333333334
         },
         "1.750": {
-          "tpr_median": 0.46240000000000003,
-          "tpr_mean": 0.4207,
+          "tpr_median": 0.732,
+          "tpr_mean": 0.6926666666666668,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.020333333333333335
         },
         "2.000": {
-          "tpr_median": 0.4409,
-          "tpr_mean": 0.3835125,
+          "tpr_median": 0.706,
+          "tpr_mean": 0.6401666666666667,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.0155
         },
         "2.250": {
-          "tpr_median": 0.3548,
-          "tpr_mean": 0.34900833333333336,
+          "tpr_median": 0.698,
+          "tpr_mean": 0.5648333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.009833333333333335
         },
         "2.500": {
-          "tpr_median": 0.2688,
-          "tpr_mean": 0.28404583333333333,
+          "tpr_median": 0.65,
+          "tpr_mean": 0.5118333333333334,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.004166666666666667
         },
         "2.750": {
-          "tpr_median": 0.2258,
-          "tpr_mean": 0.25626666666666664,
+          "tpr_median": 0.634,
+          "tpr_mean": 0.47783333333333333,
           "fpr_median": 0.0,
-          "fpr_mean": 0.0
+          "fpr_mean": 0.0020833333333333333
         },
         "3.000": {
-          "tpr_median": 0.1828,
-          "tpr_mean": 0.2517875,
+          "tpr_median": 0.558,
+          "tpr_mean": 0.44416666666666665,
           "fpr_median": 0.0,
           "fpr_mean": 0.0
         }
       },
-      "recommended_theta_pass": 0.25
+      "recommended_theta_pass": 0.75
     },
     "zh-CN": {
       "speakers_used": [
@@ -502,110 +506,109 @@
       "per_theta": {
         "0.000": {
           "tpr_median": 1.0,
-          "tpr_mean": 0.9224833333333334,
-          "fpr_median": 0.84945,
-          "fpr_mean": 0.7970416666666665
+          "tpr_mean": 0.9808333333333333,
+          "fpr_median": 0.912,
+          "fpr_mean": 0.7966666666666667
         },
         "0.250": {
-          "tpr_median": 0.42474999999999996,
-          "tpr_mean": 0.4717875,
-          "fpr_median": 0.37629999999999997,
-          "fpr_mean": 0.33153958333333333
+          "tpr_median": 0.868,
+          "tpr_mean": 0.8406666666666668,
+          "fpr_median": 0.706,
+          "fpr_mean": 0.5898333333333333
         },
         "0.500": {
-          "tpr_median": 0.42474999999999996,
-          "tpr_mean": 0.46461250000000004,
-          "fpr_median": 0.2688,
-          "fpr_mean": 0.2746395833333333
+          "tpr_median": 0.868,
+          "tpr_mean": 0.8306666666666667,
+          "fpr_median": 0.67,
+          "fpr_mean": 0.54875
         },
         "0.750": {
-          "tpr_median": 0.42474999999999996,
-          "tpr_mean": 0.44310416666666663,
-          "fpr_median": 0.1828,
-          "fpr_mean": 0.21191666666666667
+          "tpr_median": 0.868,
+          "tpr_mean": 0.8186666666666667,
+          "fpr_median": 0.566,
+          "fpr_mean": 0.4888333333333333
         },
         "1.000": {
-          "tpr_median": 0.3441,
-          "tpr_mean": 0.40904999999999997,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.15703333333333333
+          "tpr_median": 0.868,
+          "tpr_mean": 0.8106666666666668,
+          "fpr_median": 0.44,
+          "fpr_mean": 0.4340833333333333
         },
         "1.250": {
-          "tpr_median": 0.31720000000000004,
-          "tpr_mean": 0.35887916666666664,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.11133541666666665
+          "tpr_median": 0.862,
+          "tpr_mean": 0.7856666666666667,
+          "fpr_median": 0.35,
+          "fpr_mean": 0.36916666666666664
         },
         "1.500": {
-          "tpr_median": 0.2742,
-          "tpr_mean": 0.3234833333333333,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.09699999999999999
+          "tpr_median": 0.812,
+          "tpr_mean": 0.755,
+          "fpr_median": 0.266,
+          "fpr_mean": 0.3305833333333333
         },
         "1.750": {
-          "tpr_median": 0.2258,
-          "tpr_mean": 0.2791208333333333,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.07683749999999999
+          "tpr_median": 0.748,
+          "tpr_mean": 0.7106666666666666,
+          "fpr_median": 0.19,
+          "fpr_mean": 0.2824166666666667
         },
         "2.000": {
-          "tpr_median": 0.1828,
-          "tpr_mean": 0.24730833333333335,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.04637291666666666
+          "tpr_median": 0.658,
+          "tpr_mean": 0.6346666666666666,
+          "fpr_median": 0.1,
+          "fpr_mean": 0.2425833333333333
         },
         "2.250": {
-          "tpr_median": 0.0914,
-          "tpr_mean": 0.2069875,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.033377083333333335
+          "tpr_median": 0.608,
+          "tpr_mean": 0.5436666666666666,
+          "fpr_median": 0.068,
+          "fpr_mean": 0.20141666666666666
         },
         "2.500": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.14292083333333336,
-          "fpr_median": 0.0,
-          "fpr_mean": 0.030241666666666667
+          "tpr_median": 0.49,
+          "tpr_mean": 0.4326666666666667,
+          "fpr_median": 0.066,
+          "fpr_mean": 0.16283333333333333
         },
         "2.750": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.11245416666666667,
+          "tpr_median": 0.298,
+          "tpr_mean": 0.315,
           "fpr_median": 0.0,
-          "fpr_mean": 0.022177083333333333
+          "fpr_mean": 0.12141666666666667
         },
         "3.000": {
-          "tpr_median": 0.0,
-          "tpr_mean": 0.041666666666666664,
+          "tpr_median": 0.14200000000000002,
+          "tpr_mean": 0.1855,
           "fpr_median": 0.0,
-          "fpr_mean": 0.005152083333333333
+          "fpr_mean": 0.07566666666666666
         }
       },
-      "recommended_theta_pass": 1.5
+      "recommended_theta_pass": 3.0
     }
   },
   "spread_analysis": {
     "global_theta": 2.25,
     "decision_threshold": 0.5,
     "recommendations": {
-      "de": 1.0,
-      "fr": 0.25,
+      "de": 2.25,
+      "fr": 0.5,
       "en": 0.25,
       "ja": 0.25,
-      "ko": 0.25,
-      "zh-CN": 1.5
+      "ko": 0.75,
+      "zh-CN": 3.0
     },
     "min": 0.25,
-    "max": 1.5,
-    "range_width": 1.25,
+    "max": 3.0,
+    "range_width": 2.75,
     "deltas_from_global": {
-      "de": -1.25,
-      "fr": -2.0,
+      "de": 0.0,
+      "fr": -1.75,
       "en": -2.0,
       "ja": -2.0,
-      "ko": -2.0,
-      "zh-CN": -0.75
+      "ko": -1.5,
+      "zh-CN": 0.75
     },
     "outliers_vs_global": [
-      "de",
       "en",
       "fr",
       "ja",
