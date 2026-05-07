@@ -21,6 +21,10 @@ on:
         description: "Override noise types for per-language sweep (e.g. 'white' to drop pink). Empty = default (white,pink)."
         type: string
         default: ""
+      per_language_max_seconds_per_speaker:
+        description: "Override per-speaker audio length cap (seconds) for per-language sweep. Empty = default (6.0)."
+        type: string
+        default: ""
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -297,10 +301,15 @@ jobs:
           if [ -n "${{ inputs.per_language_noise_types }}" ]; then
             NOISE_FLAG=("--noise-types" "${{ inputs.per_language_noise_types }}")
           fi
+          MAXSEC_FLAG=()
+          if [ -n "${{ inputs.per_language_max_seconds_per_speaker }}" ]; then
+            MAXSEC_FLAG=("--max-seconds-per-speaker" "${{ inputs.per_language_max_seconds_per_speaker }}")
+          fi
           python scripts/calibrate_per_language.py \
             "${ARGS[@]}" \
             --cohort data/cohorts/scenario5_cohort.npz \
             "${NOISE_FLAG[@]}" \
+            "${MAXSEC_FLAG[@]}" \
             --output docs/benchmarks/calibration_as_norm_per_language.json
 
       - name: Run scenario_5 against all available manifests (with AS-Norm)
