@@ -2,6 +2,14 @@
 
 This document records the alternatives considered during design, their rejection reasons, and the major design decisions.
 
+> **Cross-session work**: long-running workstreams that span multiple Claude
+> sessions are coordinated via the
+> [Session Handoff Protocol](handoff-protocol.md), which uses GitHub issues
+> labelled `session-handoff` and the
+> [issue template](../.github/ISSUE_TEMPLATE/handoff.md). Decisions reached
+> inside a handoff issue and referenced in 2+ later sessions are promoted to
+> a new `D-NNN` entry below.
+
 ## D-001: Hard-gating instead of true TSE
 
 ### Alternatives considered
