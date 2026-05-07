@@ -12,11 +12,7 @@ pub mod embedding {
     //! function. Backed by `ort` once added.
 }
 
-pub mod gating {
-    //! Hard-gate decision: cosine target score + AS-Norm cohort
-    //! normalization + F0 sanity check. Mirrors
-    //! `poc/mellonella_poc/gating.py`.
-}
+pub mod gating;
 
 pub mod enrollment {
     //! Enrollment / auto-learn pool with anchor protection and drift
