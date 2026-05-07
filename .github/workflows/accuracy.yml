@@ -60,6 +60,92 @@ jobs:
       - name: Run ci-accuracy (compares against docs/benchmarks/ci_baseline.json)
         run: python scripts/ci_accuracy.py
 
+  ci-accuracy-as-norm:
+    name: ci-accuracy AS-Norm (mini scenario_1 vs as-norm baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Fork PRs do not see secrets and the cohort artifact download requires
+    # the repo's GITHUB_TOKEN with read access. Skip there so contributors
+    # are not blocked by an obviously-failing required check. Push to main
+    # + same-repo PRs run the full thing.
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system audio deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libsndfile1 ffmpeg
+          version: 1.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+
+      - name: Install poc[models] + bench (CPU torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e "poc[models]"
+          pip install -e bench
+
+      - name: Cache HF / SpeechBrain / DFN3 / librosa downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/mellonella
+            ~/.cache/librosa
+            ~/.cache/DeepFilterNet
+          key: accuracy-models-v1-${{ runner.os }}-${{ hashFiles('poc/pyproject.toml') }}
+          restore-keys: |
+            accuracy-models-v1-${{ runner.os }}-
+
+      # Same artifact-download path as the workflow_dispatch baseline-capture
+      # job below — the v10 cohort is owned by scenario_5.yml and we read
+      # it from its latest successful main artifact.
+      - name: Fetch v10 cohort from latest scenario_5 main artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/cohorts
+          run_id=$(gh run list \
+            --workflow scenario_5.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "::error::no successful scenario_5 main run found to download from" >&2
+            exit 1
+          fi
+          echo "downloading scenario-5-results from run_id=$run_id"
+          gh run download "$run_id" \
+            --name scenario-5-results \
+            --dir /tmp/scenario5-art \
+            --repo "${GITHUB_REPOSITORY}"
+          if [ ! -f /tmp/scenario5-art/scenario5_cohort.npz ]; then
+            echo "::error::scenario5_cohort.npz missing from artifact (latest run_id=$run_id)" >&2
+            echo "::error::scenario_5.yml staging step needs to include the .npz; rerun scenario_5 on main." >&2
+            ls -la /tmp/scenario5-art/ >&2 || true
+            exit 1
+          fi
+          cp /tmp/scenario5-art/scenario5_cohort.npz data/cohorts/scenario5_cohort.npz
+          ls -la data/cohorts/
+
+      - name: Run ci-accuracy in AS-Norm mode (compares against docs/benchmarks/ci_baseline_as_norm.json)
+        run: |
+          python scripts/ci_accuracy.py \
+            --as-norm-cohort data/cohorts/scenario5_cohort.npz
+
   ci-accuracy-as-norm-baseline:
     name: ci-accuracy AS-Norm baseline capture (workflow_dispatch only)
     if: github.event_name == 'workflow_dispatch' && inputs.capture_as_norm_baseline
