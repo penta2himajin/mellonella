@@ -182,12 +182,25 @@ pub struct GateConfig {
     pub attack_ms: f32,
     /// Envelope release time in milliseconds.
     pub release_ms: f32,
+    /// Auto-learn admission threshold for the legacy mixed score.
+    /// Strictly greater than [`Self::theta_pass`].
+    pub theta_learn: f32,
+    /// Auto-learn admission threshold under AS-Norm. Strictly greater
+    /// than [`Self::theta_pass_as_norm`].
+    pub theta_learn_as_norm: f32,
+    /// Minimum F0 match required before an embedding can join
+    /// auto-learn.
+    pub theta_f0: f32,
+    /// Minimum continuous speech run length (seconds) before auto-learn
+    /// admission. Mirrors `min_continuous_speech_sec` in Python.
+    pub min_continuous_speech_sec: f32,
 }
 
 impl Default for GateConfig {
     fn default() -> Self {
         // Mirrors `mellonella_poc.config.GatingConfig` defaults for the
-        // gate / envelope fields. Source: poc/mellonella_poc/config.py.
+        // gate / envelope / auto-learn fields. Source:
+        // poc/mellonella_poc/config.py.
         Self {
             theta_pass: 0.30,
             theta_pass_as_norm: 2.25,
@@ -195,6 +208,10 @@ impl Default for GateConfig {
             hangover_ms: 300.0,
             attack_ms: 15.0,
             release_ms: 100.0,
+            theta_learn: 0.80,
+            theta_learn_as_norm: 3.25,
+            theta_f0: 0.7,
+            min_continuous_speech_sec: 1.0,
         }
     }
 }
@@ -324,6 +341,33 @@ impl std::fmt::Display for ApplyEnvelopeError {
 }
 
 impl std::error::Error for ApplyEnvelopeError {}
+
+/// Auto-learn admission rule (mirrors `gating.should_admit_auto_learn`
+/// in the Python PoC). Returns `true` iff every guard is satisfied:
+///
+/// * `score >= theta_learn` (or `theta_learn_as_norm` under AS-Norm)
+/// * `f0_match_value >= config.theta_f0`
+/// * `continuous_speech_ms >= config.min_continuous_speech_sec * 1000`
+///
+/// Caller chains this with [`crate::enrollment::EmbeddingPool::can_auto_learn`]
+/// to also enforce the anchor-distance guard before adding the candidate
+/// to the auto-learn FIFO.
+#[must_use]
+pub fn should_admit_auto_learn(
+    score: f32,
+    f0_match_value: f32,
+    continuous_speech_ms: f32,
+    config: &GateConfig,
+) -> bool {
+    let theta_learn = if config.use_as_norm {
+        config.theta_learn_as_norm
+    } else {
+        config.theta_learn
+    };
+    score >= theta_learn
+        && f0_match_value >= config.theta_f0
+        && continuous_speech_ms >= config.min_continuous_speech_sec * 1000.0
+}
 
 /// Apply the attack/release envelope to `audio` given the gate
 /// `decisions` produced by [`GateState::update`].
@@ -663,5 +707,61 @@ mod tests {
             res.unwrap_err(),
             ApplyEnvelopeError::DecisionsMustStartAtZero
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-learn admission rule
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn should_admit_auto_learn_all_pass() {
+        let cfg = GateConfig::default();
+        assert!(should_admit_auto_learn(0.85, 0.75, 1500.0, &cfg));
+    }
+
+    #[test]
+    fn should_admit_auto_learn_low_score_blocked() {
+        let cfg = GateConfig::default();
+        assert!(!should_admit_auto_learn(0.79, 0.9, 2000.0, &cfg));
+    }
+
+    #[test]
+    fn should_admit_auto_learn_low_f0_match_blocked() {
+        let cfg = GateConfig::default();
+        assert!(!should_admit_auto_learn(0.85, 0.5, 2000.0, &cfg));
+    }
+
+    #[test]
+    fn should_admit_auto_learn_short_run_blocked() {
+        let cfg = GateConfig::default();
+        assert!(!should_admit_auto_learn(0.95, 0.9, 500.0, &cfg));
+    }
+
+    #[test]
+    fn should_admit_auto_learn_boundary_inclusive() {
+        let cfg = GateConfig {
+            theta_learn: 0.80,
+            theta_f0: 0.7,
+            min_continuous_speech_sec: 1.0,
+            ..GateConfig::default()
+        };
+        assert!(should_admit_auto_learn(0.80, 0.7, 1000.0, &cfg));
+        assert!(!should_admit_auto_learn(0.799, 0.7, 1000.0, &cfg));
+        assert!(!should_admit_auto_learn(0.80, 0.699, 1000.0, &cfg));
+        assert!(!should_admit_auto_learn(0.80, 0.7, 999.0, &cfg));
+    }
+
+    #[test]
+    fn should_admit_auto_learn_uses_as_norm_threshold() {
+        let cfg = GateConfig {
+            use_as_norm: true,
+            theta_pass_as_norm: 1.0,
+            theta_learn_as_norm: 3.0,
+            theta_f0: 0.5,
+            min_continuous_speech_sec: 0.1,
+            ..GateConfig::default()
+        };
+        assert!(should_admit_auto_learn(3.5, 0.9, 200.0, &cfg));
+        assert!(!should_admit_auto_learn(2.5, 0.9, 200.0, &cfg));
     }
 }
