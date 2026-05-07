@@ -1,0 +1,11 @@
+[package]
+name = "mellonella-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-target speaker hard-gating filter — core library (Phase 3 WIP)"
+
+[lints]
+workspace = true
