@@ -52,6 +52,7 @@ from mellonella_bench.datasets.commonvoice import (  # noqa: E402
 # Reuse the calibrate.py plumbing rather than duplicating the sweep
 # logic. The script is at module level (no package), so a sys.path
 # insert above and a flat import is the cleanest way in.
+import calibrate  # noqa: E402  (used for NOISE_TYPES monkey-patching below)
 from calibrate import (  # noqa: E402
     MAX_MEAN_FPR_AS_NORM,
     MIN_TPR_FLOOR_AS_NORM,
@@ -149,8 +150,15 @@ def sweep_one_language(
     cohort_path: Path,
     top_speakers: int,
     max_seconds_per_speaker: float,
+    noise_types: tuple[str, ...] | None = None,
 ) -> dict:
-    """Run the AS-Norm sweep for one language and return its per-θ + recommended."""
+    """Run the AS-Norm sweep for one language and return its per-θ + recommended.
+
+    ``noise_types`` (e.g. ``("white",)``) overrides ``calibrate.NOISE_TYPES``
+    for the duration of this call so a diagnostic sweep can isolate the
+    contribution of one noise type. Default ``None`` keeps the module-level
+    setting (``("white", "pink")``).
+    """
     raw = load_speakers_from_manifest(manifest_path, SAMPLE_RATE)
     if not raw:
         raise RuntimeError(
@@ -165,12 +173,18 @@ def sweep_one_language(
     speakers = _select_top_speakers(raw, top_speakers)
     speakers = _trim_speakers(speakers, max_seconds_per_speaker)
 
-    rows = measure_cells(
-        speakers=speakers,
-        language=language,
-        use_as_norm=True,
-        cohort_path=cohort_path,
-    )
+    saved_noise_types = calibrate.NOISE_TYPES
+    if noise_types is not None:
+        calibrate.NOISE_TYPES = tuple(noise_types)
+    try:
+        rows = measure_cells(
+            speakers=speakers,
+            language=language,
+            use_as_norm=True,
+            cohort_path=cohort_path,
+        )
+    finally:
+        calibrate.NOISE_TYPES = saved_noise_types
     per_theta = aggregate(rows)
     recommended = recommend_theta(
         per_theta,
@@ -273,6 +287,21 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--noise-types",
+        type=str,
+        default=None,
+        help=(
+            "comma-separated noise types to mix during the sweep "
+            "(default: keep the calibrate.py module-level NOISE_TYPES, "
+            f"currently {NOISE_TYPES}). Diagnostic flag — set "
+            "to e.g. 'white' to isolate one noise type's contribution. "
+            "Phase 7 step 3 follow-up: ja was hitting recommend_theta's "
+            "fallback path (TPR_median < 0.5 floor at every theta) and we "
+            "wanted to test whether pink noise's low-frequency energy was "
+            "the cause."
+        ),
+    )
+    parser.add_argument(
         "--max-seconds-per-speaker",
         type=float,
         default=DEFAULT_MAX_SECONDS_PER_SPEAKER,
@@ -304,6 +333,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    noise_types_override: tuple[str, ...] | None = None
+    if args.noise_types is not None:
+        noise_types_override = tuple(
+            s.strip() for s in args.noise_types.split(",") if s.strip()
+        )
+        if not noise_types_override:
+            parser.error("--noise-types must list at least one type")
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     per_lang: dict[str, dict] = {}
@@ -315,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             cohort_path=args.cohort,
             top_speakers=args.top_speakers,
             max_seconds_per_speaker=args.max_seconds_per_speaker,
+            noise_types=noise_types_override,
         )
 
     spread = _spread_analysis(
@@ -333,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             "min_tpr_floor": MIN_TPR_FLOOR_AS_NORM,
             "top_speakers_per_lang": args.top_speakers,
             "max_seconds_per_speaker": args.max_seconds_per_speaker,
+            "noise_types_used": list(noise_types_override) if noise_types_override is not None else list(NOISE_TYPES),
             "cohort_path": str(args.cohort),
         },
         "per_language": per_lang,
