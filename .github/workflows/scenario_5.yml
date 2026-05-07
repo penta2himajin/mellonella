@@ -4,6 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Phase 7 step 3 manual hook: kick a per-language AS-Norm theta sweep
+  # against the v10 cohort. The sweep is observation-only — output is
+  # staged into the scenario-5-results artifact for review and does not
+  # gate any failure. Cost is ~6:26 × 6 languages = ~38 min on a warm
+  # cohort cache, hence the workflow_dispatch trigger (we don't want it
+  # to run on every PR). Trigger:
+  #   gh workflow run scenario_5.yml -f capture_per_language_theta=true
+  workflow_dispatch:
+    inputs:
+      capture_per_language_theta:
+        description: "Run per-language AS-Norm theta sweep (Phase 7 step 3)"
+        type: boolean
+        default: false
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -248,6 +261,36 @@ jobs:
             --use-as-norm \
             --cohort data/cohorts/scenario5_cohort.npz
 
+      # Phase 7 step 3 — per-language AS-Norm theta sweep. Manual trigger
+      # only (workflow_dispatch input capture_per_language_theta = true).
+      # Loops scripts/calibrate.py's measure_cells per language using the
+      # top-3 speakers from each language's prepared manifest, emits one
+      # combined per-language summary JSON into docs/benchmarks/, and
+      # the stage step below copies it into the scenario-5-results
+      # artifact. Output is observation-only — downstream propagation
+      # (GatingConfig per-language theta table, scenario_5 baseline
+      # re-capture) follows as separate PRs based on the spread analysis
+      # this step produces. Cost: ~6:26 × 6 = ~38 min on warm cohort
+      # cache.
+      - name: Per-language AS-Norm theta sweep (Phase 7 step 3, workflow_dispatch only)
+        if: |
+          steps.hf.outputs.have_token == 'true' &&
+          github.event_name == 'workflow_dispatch' &&
+          inputs.capture_per_language_theta
+        run: |
+          set -euo pipefail
+          ARGS=()
+          for lang in de fr; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
+          done
+          for lang in en ja ko zh-CN; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
+          done
+          python scripts/calibrate_per_language.py \
+            "${ARGS[@]}" \
+            --cohort data/cohorts/scenario5_cohort.npz \
+            --output docs/benchmarks/calibration_as_norm_per_language.json
+
       - name: Run scenario_5 against all available manifests (with AS-Norm)
         run: |
           set -euo pipefail
@@ -320,6 +363,12 @@ jobs:
           fi
           if [ -f docs/benchmarks/calibration_as_norm_results.csv ]; then
             cp docs/benchmarks/calibration_as_norm_results.csv benchmark_results/scenario_5/calibration_as_norm_results.csv
+          fi
+          # Phase 7 step 3: per-language AS-Norm theta sweep summary
+          # (only present on workflow_dispatch runs with
+          # capture_per_language_theta=true).
+          if [ -f docs/benchmarks/calibration_as_norm_per_language.json ]; then
+            cp docs/benchmarks/calibration_as_norm_per_language.json benchmark_results/scenario_5/calibration_as_norm_per_language.json
           fi
 
       - name: Upload scenario_5 outputs (always)
