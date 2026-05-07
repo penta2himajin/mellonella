@@ -58,9 +58,16 @@ NOISE_TYPES: tuple[str, ...] = ("white", "pink")
 SNRS_DB: tuple[float, ...] = (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0)
 THETA_GRID: tuple[float, ...] = tuple(round(0.20 + 0.025 * i, 3) for i in range(15))
 # AS-Norm sweep operates on a z-score scale (typical -3..3); D-010 Phase 3.
-# 0.5-3.0 step 0.25 = 11 points, covers conservative (3.0) → permissive (0.5).
+# 0.0-3.0 step 0.25 = 13 points, covers conservative (3.0) → permissive (0.0).
+# Extended downward from the original 0.5-3.0 grid (Phase 7 step 3 PR-A
+# observed 4/6 languages clamped to the 0.5 grid floor — en/fr/ko hit the
+# minimum, ja was in recommend_theta's fallback path because TPR_median
+# never reached the 0.5 floor in the entire grid). 0.0 is the natural
+# lower bound for AS-Norm: it means "pass when the z-score crosses the
+# cohort mean", below which we'd be saying target audio scores below
+# average impostor — pathological under any non-degenerate cohort.
 THETA_GRID_AS_NORM: tuple[float, ...] = tuple(
-    round(0.5 + 0.25 * i, 3) for i in range(11)
+    round(0.0 + 0.25 * i, 3) for i in range(13)
 )
 SEED = 0
 MIN_REPRESENTATIVE_SNR_DB = 5.0

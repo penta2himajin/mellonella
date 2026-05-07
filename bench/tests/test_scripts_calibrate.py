@@ -36,9 +36,17 @@ def test_legacy_theta_grid_lives_in_cosine_range():
 
 
 def test_as_norm_theta_grid_lives_in_z_score_range():
-    """AS-Norm sweep covers a sensible z-score range (literature 0.5-3.0)."""
+    """AS-Norm sweep covers a sensible z-score range.
+
+    Lower bound = 0.0 ("pass when z-score crosses the cohort mean") is the
+    natural floor — anything below would say target audio scores below
+    average impostor, which only happens with a degenerate cohort. Phase 7
+    step 3 PR-A's first sweep had 4/6 languages clamped at the previous 0.5
+    grid floor so the grid was extended down to 0.0; the assertion here
+    moves with it.
+    """
     mod = _import_script()
-    assert min(mod.THETA_GRID_AS_NORM) >= 0.5
+    assert min(mod.THETA_GRID_AS_NORM) >= 0.0
     assert max(mod.THETA_GRID_AS_NORM) <= 3.0
     # Coarse sanity: the grid is monotonic and has at least 5 entries.
     assert len(mod.THETA_GRID_AS_NORM) >= 5
