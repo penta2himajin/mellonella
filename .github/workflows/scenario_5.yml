@@ -37,10 +37,13 @@ jobs:
     # tighten back to 45 min in a follow-up.
     timeout-minutes: 60
     # Fork PRs do not see secrets — skip there so contributors aren't blocked
-    # by an obviously-failing required check. Push to main + same-repo PRs run
-    # the full thing.
+    # by an obviously-failing required check. Push to main + same-repo PRs +
+    # workflow_dispatch all run the full thing. (workflow_dispatch was added
+    # in Phase 7 step 3 PR-A for the per-language theta sweep; the job-level
+    # if must whitelist it explicitly or the entire job skips.)
     if: |
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
