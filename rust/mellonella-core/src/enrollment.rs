@@ -13,13 +13,22 @@
 //! * the pool's median anchor distance is monitored and a soft reset
 //!   clears the auto-learn FIFO when it exceeds `anchor_reset_threshold`
 //!
-//! Persistence (JSON round-trip) is intentionally deferred — `serde` /
-//! `serde_json` are not yet workspace deps and the algorithm path needs
-//! to stabilise before the on-disk schema is fixed.
+//! JSON persistence ([`EmbeddingPool::to_json`] / [`from_json`] /
+//! [`save`](Self::save) / [`load`](Self::load)) uses the same `version: 1`
+//! layout as `mellonella_poc.enrollment.EmbeddingPool.to_dict`, so a
+//! pool serialised by Python can be deserialised by Rust and vice versa.
 
 use std::collections::VecDeque;
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::gating::cos_similarity;
+
+/// Persistence-schema version. Incremented if the on-disk shape ever
+/// changes; readers reject any payload whose `version` field differs.
+pub const PERSISTENCE_VERSION: u32 = 1;
 
 /// Subset of the Python `GatingConfig` consumed by the pool. More fields
 /// will be added as stateful gating gets ported; until then the pool
@@ -47,9 +56,11 @@ impl Default for EmbeddingPoolConfig {
 }
 
 /// F0 statistics captured from the explicit enrollment recording.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct EnrollmentMetadata {
+    #[serde(default)]
     pub f0_mu: f32,
+    #[serde(default)]
     pub f0_sigma: f32,
 }
 
@@ -200,6 +211,130 @@ impl EmbeddingPool {
         }
         false
     }
+
+    // ---- JSON persistence ------------------------------------------
+
+    /// Serialise the pool to a JSON string. Schema mirrors Python's
+    /// `EmbeddingPool.to_dict` (version 1).
+    ///
+    /// # Errors
+    /// Returns [`PersistenceError::Json`] if `serde_json` rejects the
+    /// payload — should not happen for the in-memory shape, but the
+    /// error path is preserved for symmetry with [`Self::from_json`].
+    pub fn to_json(&self) -> Result<String, PersistenceError> {
+        let payload = PoolPayload::from_pool(self);
+        serde_json::to_string(&payload).map_err(PersistenceError::Json)
+    }
+
+    /// Deserialise a pool from a JSON string. The pool's `config` is
+    /// supplied by the caller — it controls drift thresholds and FIFO
+    /// capacity, neither of which is part of the on-disk payload.
+    ///
+    /// # Errors
+    /// * [`PersistenceError::Json`]            — malformed JSON
+    /// * [`PersistenceError::UnsupportedVersion`] — `version` field
+    ///   does not equal [`PERSISTENCE_VERSION`]
+    pub fn from_json(s: &str, config: EmbeddingPoolConfig) -> Result<Self, PersistenceError> {
+        let payload: PoolPayload = serde_json::from_str(s).map_err(PersistenceError::Json)?;
+        if payload.version != PERSISTENCE_VERSION {
+            return Err(PersistenceError::UnsupportedVersion(payload.version));
+        }
+        Ok(payload.into_pool(config))
+    }
+
+    /// Persist the pool as JSON to `path`. Convenience wrapper around
+    /// [`Self::to_json`] + `fs::write`.
+    ///
+    /// # Errors
+    /// Returns [`PersistenceError::Io`] for filesystem failures or
+    /// [`PersistenceError::Json`] if serialisation fails.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PersistenceError> {
+        let body = self.to_json()?;
+        fs::write(path, body).map_err(PersistenceError::Io)
+    }
+
+    /// Load a pool from a JSON file at `path`.
+    ///
+    /// # Errors
+    /// Returns [`PersistenceError::Io`] for filesystem failures or
+    /// [`PersistenceError::Json`] / [`PersistenceError::UnsupportedVersion`]
+    /// for malformed payloads.
+    pub fn load(
+        path: impl AsRef<Path>,
+        config: EmbeddingPoolConfig,
+    ) -> Result<Self, PersistenceError> {
+        let body = fs::read_to_string(path).map_err(PersistenceError::Io)?;
+        Self::from_json(&body, config)
+    }
+}
+
+/// On-disk representation of [`EmbeddingPool`]. Kept private to the
+/// module so the public type remains free to evolve.
+#[derive(Debug, Serialize, Deserialize)]
+struct PoolPayload {
+    version: u32,
+    #[serde(default)]
+    anchors: Vec<Vec<f32>>,
+    #[serde(default)]
+    auto_learn: Vec<Vec<f32>>,
+    #[serde(default)]
+    metadata: EnrollmentMetadata,
+}
+
+impl PoolPayload {
+    fn from_pool(pool: &EmbeddingPool) -> Self {
+        Self {
+            version: PERSISTENCE_VERSION,
+            anchors: pool.anchors.clone(),
+            auto_learn: pool.auto_learn.iter().cloned().collect(),
+            metadata: pool.metadata,
+        }
+    }
+
+    fn into_pool(self, config: EmbeddingPoolConfig) -> EmbeddingPool {
+        let mut auto_learn: VecDeque<Vec<f32>> = self.auto_learn.into_iter().collect();
+        // Honour the FIFO bound on load — older saves with a larger
+        // capacity must not overflow a tighter live config.
+        while auto_learn.len() > config.auto_learn_max_size {
+            auto_learn.pop_front();
+        }
+        EmbeddingPool {
+            config,
+            anchors: self.anchors,
+            auto_learn,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// Errors returned by the [`EmbeddingPool`] JSON persistence path.
+#[derive(Debug)]
+pub enum PersistenceError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    UnsupportedVersion(u32),
+}
+
+impl std::fmt::Display for PersistenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Json(e) => write!(f, "JSON error: {e}"),
+            Self::UnsupportedVersion(v) => {
+                write!(f, "unsupported enrollment version: {v}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Json(e) => Some(e),
+            Self::UnsupportedVersion(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +459,84 @@ mod tests {
         let m = pool.metadata();
         assert_eq!(m.f0_mu, 180.0);
         assert_eq!(m.f0_sigma, 25.0);
+    }
+
+    // -----------------------------------------------------------------
+    // JSON persistence (mirrors poc/tests/test_enrollment.py)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn json_round_trip_preserves_state() {
+        let cfg = EmbeddingPoolConfig::default();
+        let mut pool = EmbeddingPool::new(cfg);
+        let anchor = unit(&[1.0, 0.0]);
+        pool.add_anchors([anchor.clone()]);
+        pool.set_f0_stats(180.0, 25.0);
+        assert!(pool.add_auto_learn(unit(&[0.99, 0.01])));
+
+        let body = pool.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["anchors"].as_array().unwrap().len(), 1);
+
+        let restored = EmbeddingPool::from_json(&body, cfg).unwrap();
+        assert_eq!(restored.anchors().len(), 1);
+        assert_eq!(restored.metadata().f0_mu, 180.0);
+        assert_eq!(restored.metadata().f0_sigma, 25.0);
+        assert_eq!(restored.auto_learn().len(), 1);
+    }
+
+    #[test]
+    fn save_load_through_filesystem() {
+        let cfg = EmbeddingPoolConfig::default();
+        let mut pool = EmbeddingPool::new(cfg);
+        pool.add_anchors([unit(&[1.0, 0.0])]);
+
+        let dir = std::env::temp_dir().join(format!(
+            "mellonella-pool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("enrollment.json");
+
+        pool.save(&path).unwrap();
+        let restored = EmbeddingPool::load(&path, cfg).unwrap();
+        assert_eq!(restored.anchors().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_version() {
+        let cfg = EmbeddingPoolConfig::default();
+        let body = r#"{"version": 99, "anchors": [], "auto_learn": [], "metadata": {}}"#;
+        match EmbeddingPool::from_json(body, cfg) {
+            Err(PersistenceError::UnsupportedVersion(99)) => {}
+            other => panic!("expected UnsupportedVersion(99), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_clamps_auto_learn_to_config() {
+        // Saved with 5 auto-learn entries; config caps at 2 — load
+        // drops the oldest.
+        let saved = r#"{
+            "version": 1,
+            "anchors": [],
+            "auto_learn": [[1.0], [2.0], [3.0], [4.0], [5.0]],
+            "metadata": {"f0_mu": 0.0, "f0_sigma": 0.0}
+        }"#;
+        let cfg = EmbeddingPoolConfig {
+            auto_learn_max_size: 2,
+            ..EmbeddingPoolConfig::default()
+        };
+        let pool = EmbeddingPool::from_json(saved, cfg).unwrap();
+        assert_eq!(pool.auto_learn().len(), 2);
+        assert_eq!(pool.auto_learn()[0][0], 4.0);
+        assert_eq!(pool.auto_learn()[1][0], 5.0);
     }
 }
