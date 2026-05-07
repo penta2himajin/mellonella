@@ -17,6 +17,10 @@ on:
         description: "Run per-language AS-Norm theta sweep (Phase 7 step 3)"
         type: boolean
         default: false
+      per_language_noise_types:
+        description: "Override noise types for per-language sweep (e.g. 'white' to drop pink). Empty = default (white,pink)."
+        type: string
+        default: ""
 
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -289,9 +293,14 @@ jobs:
           for lang in en ja ko zh-CN; do
             ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
           done
+          NOISE_FLAG=()
+          if [ -n "${{ inputs.per_language_noise_types }}" ]; then
+            NOISE_FLAG=("--noise-types" "${{ inputs.per_language_noise_types }}")
+          fi
           python scripts/calibrate_per_language.py \
             "${ARGS[@]}" \
             --cohort data/cohorts/scenario5_cohort.npz \
+            "${NOISE_FLAG[@]}" \
             --output docs/benchmarks/calibration_as_norm_per_language.json
 
       - name: Run scenario_5 against all available manifests (with AS-Norm)
