@@ -504,6 +504,20 @@ The v9 commit (`feat(d-010): Phase 6 part 1.5 — MLS train-split cohort sourcin
 - Tighten `scenario_5.yml` thresholds under the `--fpr-max < --tpr-min` invariant (combined Phase 5 + Phase 6 follow-up).
 - Add `use_as_norm = True` to scenario_1 / 4 / 6 with the new global θ.
 
+### Phase 7: complete the AS-Norm activation across scenarios + per-language θ refinement
+
+Phase 6 Part 2 step 3 closed the AS-Norm program for scenario_1 and scenario_5 (both running AS-Norm in CI on every push / PR). scenario_4 / scenario_6 were left "plumbed but inactive" (`run_all.py` passes `items=[]`) because the harness had no driver script that built per-scenario items from real manifests. Phase 7 finishes that activation and uses the resulting cross-scenario data to revisit the only outstanding AS-Norm calibration question — whether zh-CN is enough of a per-language outlier (FPR mean 0.084-0.184 vs the other 5 languages at ≤0.062) to justify a per-language θ.
+
+This phase is also the implementation.md Phase 1 + 2 PoC closeout: feature-complete Python with auto-learn pool + drift behaviour empirically verified in CI.
+
+**Step 1: scenario_4 (FP-tolerant overlap) wiring** (this PR — `scripts/scenario_4_from_manifest.py` + `.github/workflows/scenario_4.yml`).
+
+Mirrors the scenario_5 driver / workflow structure verbatim — same MLS de+fr + Emilia-YODAS 6-language manifests, same v10 AS-Norm cohort (cache key `scenario5-data-v10-...` shared so warm cache hits whenever scenario_5 has populated). The driver picks the top-2 speakers per language, designates speaker[0] = target / speaker[1] = other, and runs the scenario_4 default ratio sweep (`+inf` / `+9` / `+3` / `0` / `-3` / `-9` / `-inf` dB target-to-other). The driver computes per-ratio aggregates (`gate_tpr_mean_at_+9.0db`, `si_sdr_mean_at_<label>`, plus `gate_tpr_mean__<lang>_at_<ratio>` for per-language breakdown) and emits them in `summary.json` alongside the run-level aggregate. **Observation-only initially**: no `failures.json` and no hard thresholds — the FP-tolerant policy's per-ratio expected behaviour (TPR high at `+inf`, drops at `-inf`, SI-SDR tracks ratio monotonically) is qualitative until we observe two stable main runs and can set per-ratio thresholds with margin similar to scenario_5's per-language-mean check.
+
+**Step 2: scenario_6 (drift verification) wiring** (follow-up PR). Needs same-speaker multi-recording data, which neither MLS test (one chapter per speaker per language) nor Emilia-YODAS-by-shard naturally exposes. Likely path: pull multiple Emilia-YODAS shards for one speaker, OR record-split a single long Emilia clip into ordered "variants". Concrete plan to be detailed when step 2 starts.
+
+**Step 3: zh-CN per-language θ_pass_as_norm investigation** (follow-up PR). Across the four θ=2.25 baselines used to set the per-language-mean check (Phase 6 Part 2 step 2 closeout), zh-CN consistently presented the worst per-language FPR (mean 0.084-0.184 vs ≤0.062 for the other 5). Klusáček 2025 motivates a per-language θ when one language family is structurally distant from the cohort distribution. Phase 7 step 3 sweeps θ_pass_as_norm separately per language with `scripts/calibrate.py` and decides whether to (a) adopt a per-language θ table in `GatingConfig` or (b) keep the global θ = 2.25 because the per-language penalty for the zh-CN-tuned θ is not worth the per-language complexity. Either outcome is recorded as a closeout sub-step.
+
 ### References
 
 - Thienpondt et al. (2020) "Cross-Lingual Speaker Verification with Domain-Balanced Hard Prototype Mining and Language-Dependent Score Normalization", https://arxiv.org/abs/2007.07689
