@@ -1,0 +1,164 @@
+name: scenario-6
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  MELLONELLA_DATA_DIR: ${{ github.workspace }}/data
+
+jobs:
+  scenario-6:
+    name: scenario_6 (drift verification; MLS + Emilia-YODAS)
+    runs-on: ubuntu-latest
+    # Same 60-min margin as scenario_4 / scenario_5: cold-cache prep is
+    # dominated by the shared Emilia-YODAS step (~20-30 min), and we hit
+    # the same cache key so warm steady-state is fast.
+    timeout-minutes: 60
+    # Fork PRs do not see secrets — skip there so contributors aren't blocked
+    # by an obviously-failing required check. Push to main + same-repo PRs run
+    # the full thing.
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system audio deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libsndfile1 ffmpeg
+          version: 1.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+
+      - name: Install poc[models] + bench[hf] (CPU torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e "poc[models]"
+          pip install -e "bench[hf]"
+
+      - name: Cache HF + SpeechBrain + DFN3 model downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/mellonella
+            ~/.cache/librosa
+            ~/.cache/DeepFilterNet
+          key: scenario6-models-v1-${{ runner.os }}-${{ hashFiles('poc/pyproject.toml') }}
+          restore-keys: |
+            scenario6-models-v1-${{ runner.os }}-
+
+      # Share scenario_5's data cache key (same MLS + Emilia manifests +
+      # AS-Norm cohort .npz). Warm cache hits whenever scenario_5 has
+      # already populated for this commit's dataset module fingerprint —
+      # in steady state the only scenario_6-specific cost is the
+      # scenario_6 run itself.
+      - name: Cache MLS + Emilia subset materials + AS-Norm cohort
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: scenario5-data-v10-${{ runner.os }}-${{ hashFiles('bench/mellonella_bench/datasets/mls.py', 'bench/mellonella_bench/datasets/emilia.py', 'scripts/build_impostor_cohort.py') }}
+          restore-keys: |
+            scenario5-data-v10-${{ runner.os }}-
+
+      # ---- Prepare per-language subsets ----
+
+      - name: Prepare MLS test-split subsets (de, fr)
+        run: |
+          python -m mellonella_bench.datasets.mls prepare --language de
+          python -m mellonella_bench.datasets.mls prepare --language fr
+
+      - name: Check HF_TOKEN availability
+        id: hf
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -n "$HF_TOKEN" ]; then
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HF_TOKEN not set — skipping Emilia-YODAS prep (en, ja, ko, zh-CN coverage AND de/fr AS-Norm cohort)"
+          fi
+
+      - name: Prepare Emilia-YODAS subsets (en, ja, ko, zh-CN, de, fr)
+        if: steps.hf.outputs.have_token == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m mellonella_bench.datasets.emilia prepare --language en
+          python -m mellonella_bench.datasets.emilia prepare --language ja
+          python -m mellonella_bench.datasets.emilia prepare --language ko
+          python -m mellonella_bench.datasets.emilia prepare --language zh-CN
+          python -m mellonella_bench.datasets.emilia prepare --language de
+          python -m mellonella_bench.datasets.emilia prepare --language fr
+
+      - name: Build AS-Norm impostor cohort (skip if cached)
+        if: steps.hf.outputs.have_token == 'true'
+        run: |
+          set -euo pipefail
+          if [ -f data/cohorts/scenario5_cohort.npz ]; then
+            echo "cohort cached at data/cohorts/scenario5_cohort.npz; skipping rebuild"
+            exit 0
+          fi
+          mkdir -p data/cohorts
+          ARGS=()
+          for lang in de fr en ja ko zh-CN; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
+          done
+          python scripts/build_impostor_cohort.py \
+            "${ARGS[@]}" \
+            --skip-top-n 2 \
+            --per-language 50 \
+            --output data/cohorts/scenario5_cohort.npz
+
+      - name: Run scenario_6 against all available manifests (with AS-Norm when cohort present)
+        run: |
+          set -euo pipefail
+          ARGS=()
+          for lang in de fr; do
+            ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/mls/${lang}/manifest.csv")
+          done
+          if [ "${{ steps.hf.outputs.have_token }}" = "true" ]; then
+            for lang in en ja ko zh-CN; do
+              ARGS+=("--manifest" "${lang}=${MELLONELLA_DATA_DIR}/emilia_yodas/${lang}/manifest.csv")
+            done
+            ARGS+=("--as-norm-cohort" "data/cohorts/scenario5_cohort.npz")
+          fi
+          # Phase 7 step 2 first activation: observation only — no
+          # failures.json, no hard thresholds. Phase 7 step 2 closeout
+          # will add per-metric thresholds (e.g. gate_tpr_mean lower bound,
+          # auto_learn_resets upper bound) once we have a stable baseline
+          # observed across two main runs.
+          python scripts/scenario_6_from_manifest.py \
+            "${ARGS[@]}" \
+            --output benchmark_results/scenario_6 \
+            --real-pipeline
+
+      - name: Stage cohort summary into scenario_6 results dir
+        if: always()
+        run: |
+          mkdir -p benchmark_results/scenario_6
+          if [ -f data/cohorts/scenario5_cohort.json ]; then
+            cp data/cohorts/scenario5_cohort.json benchmark_results/scenario_6/cohort_summary.json
+          fi
+
+      - name: Upload scenario_6 outputs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-6-results
+          path: |
+            benchmark_results/scenario_6/
+          retention-days: 30
