@@ -6,7 +6,11 @@
 //! checks that the result is well-formed: same length as input,
 //! per-frame outputs aligned, decisions start at sample 0.
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
