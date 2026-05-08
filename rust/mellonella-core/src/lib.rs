@@ -9,4 +9,5 @@
 pub mod embedding;
 pub mod enrollment;
 pub mod f0;
+pub mod features;
 pub mod gating;

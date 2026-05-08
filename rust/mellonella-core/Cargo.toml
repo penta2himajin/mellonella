@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ort = { workspace = true }
 ndarray = { workspace = true }
+rustfft = { workspace = true }
 
 [lints]
 workspace = true

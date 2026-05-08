@@ -1,0 +1,28 @@
+{
+  "sample_rate": 16000,
+  "n_fft": 400,
+  "hop_length": 160,
+  "win_length": 400,
+  "window": "hamming",
+  "center": true,
+  "pad_mode": "constant",
+  "n_mels": 80,
+  "f_min": 0.0,
+  "f_max": 8000.0,
+  "log_mel": true,
+  "power": 2,
+  "amin": 1e-10,
+  "top_db": 80.0,
+  "multiplier": 10,
+  "fbank_matrix_shape": [
+    201,
+    80
+  ],
+  "input_shape": [
+    16000
+  ],
+  "expected_shape": [
+    101,
+    80
+  ]
+}
