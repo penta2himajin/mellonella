@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use ndarray::Array3;
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::{Tensor, TensorRef};
 
 /// Output dimensionality of the SpeechBrain ECAPA-TDNN backbone.
