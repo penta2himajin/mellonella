@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """Export SpeechBrain ECAPA-TDNN to ONNX and verify PyTorch ↔ ONNX parity.
 
-First concrete deliverable for implementation.md Phase 3 (Rust port). The
-goal is a single ONNX graph that takes a 16 kHz mono waveform and emits the
-192-dim speaker embedding, so the Rust side only needs the `ort` crate plus
-audio resampling — no SpeechBrain / torchaudio dependency at runtime.
+First concrete deliverable for implementation.md Phase 3 (Rust port).
 
 Modes
 -----
-``export`` (default)
-    Build a torch.nn.Module that wraps the SpeechBrain pipeline
-    (compute_features → mean_var_norm → embedding_model) and call
-    ``torch.onnx.export`` on it.
+``--mode full``
+    Wraps SpeechBrain's compute_features → mean_var_norm → embedding_model
+    into a single torch.nn.Module and exports it as a fixed-16 kHz,
+    dynamic-time-axis ONNX. **Currently broken** under torch 2.4 — the
+    SpeechBrain STFT returns a complex tensor and torch.onnx.export
+    raises ``SymbolicValueError: STFT does not currently support complex
+    types``. Kept here for when upstream lifts the restriction.
 
-``verify``
-    Load both the PyTorch model and the exported ONNX, run them on a small
-    set of deterministic synthetic waveforms (and optional `--audio` files),
-    and report:
-
-      * max |Δ| in raw 192-dim embeddings (component-wise)
-      * max |Δ| in pairwise cosine similarity matrix
-      * pass/fail against ``--tol`` (default 1e-4 to match issue #64)
+``--mode embedding-only`` (default)
+    Wraps mean_var_norm → embedding_model only. Input is the
+    pre-computed Fbank ``(B, T_frames, n_mels)`` tensor. The Rust side
+    must reproduce SpeechBrain's Fbank pipeline (or call out to a
+    feature-extractor crate). Verify still computes both halves in
+    PyTorch and confirms the ONNX subgraph is byte-equivalent on its
+    inputs, plus the round-trip cosine vs. the full PyTorch reference.
 
 Usage
 -----
@@ -38,8 +37,8 @@ Notes
 * Requires the `models` extra (`pip install -e poc[models]`) for torch,
   speechbrain, and onnxruntime.
 * The exported graph fixes the sample rate to 16 kHz (SpeechBrain's
-  ``compute_features`` pre-built pipeline is hard-coded to that rate). The
-  time axis is dynamic so the same .onnx works for any clip length ≥ 1 s.
+  ``compute_features`` pipeline is hard-coded to that rate). The time
+  axis is dynamic so the same .onnx works for any clip length ≥ 1 s.
 * This is intentionally a _verification_ tool, not a production builder.
   The Rust integration in ``mellonella-core`` will likely re-export with
   graph-level optimisation (e.g. constant-fold the mean/var norm stats).
@@ -61,6 +60,8 @@ DEFAULT_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_TOL = 1e-4
 EMBEDDING_DIM = 192
+DEFAULT_MEL_BINS = 80
+DEFAULT_MODE = "embedding-only"
 
 
 def _synth_waveform(seed: int, sr: int, duration_sec: float, f0: float) -> np.ndarray:
@@ -96,22 +97,25 @@ def _load_audio(path: Path, target_sr: int) -> np.ndarray:
     return audio
 
 
-def _build_wrapper(source: str, savedir: str | None) -> "torch.nn.Module":
-    """Return a torch.nn.Module: (B, T) float32 → (B, 192) float32 embedding."""
-    import torch
+def _load_classifier(source: str, savedir: str | None):  # noqa: ANN202
     from speechbrain.inference.speaker import EncoderClassifier  # type: ignore[import-not-found]
 
-    classifier = EncoderClassifier.from_hparams(
+    return EncoderClassifier.from_hparams(
         source=source,
         savedir=savedir,
         run_opts={"device": "cpu"},
     )
 
+
+def _build_full_wrapper(classifier) -> "torch.nn.Module":  # noqa: ANN001
+    """Module: (B, T) float32 → (B, 192) float32 — known to fail ONNX export today."""
+    import torch
+
     compute_features = classifier.mods.compute_features
     mean_var_norm = classifier.mods.mean_var_norm
     embedding_model = classifier.mods.embedding_model
 
-    class EcapaOnnxWrapper(torch.nn.Module):
+    class FullWrapper(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.compute_features = compute_features
@@ -121,13 +125,58 @@ def _build_wrapper(source: str, savedir: str | None) -> "torch.nn.Module":
         def forward(self, wav: "torch.Tensor") -> "torch.Tensor":
             feats = self.compute_features(wav)
             wav_lens = torch.ones(wav.shape[0], device=wav.device)
-            feats = self.mean_var_norm(feats, wav_lens)
-            emb = self.embedding_model(feats, wav_lens)
+            normed = self.mean_var_norm(feats, wav_lens)
+            emb = self.embedding_model(normed, wav_lens)
             return emb.squeeze(1)
 
-    wrapper = EcapaOnnxWrapper()
+    wrapper = FullWrapper()
     wrapper.eval()
     return wrapper
+
+
+def _build_features(classifier) -> "torch.nn.Module":  # noqa: ANN001
+    """Module: (B, T) → (B, T_frames, n_mels) — SpeechBrain Fbank."""
+    import torch
+
+    compute_features = classifier.mods.compute_features
+
+    class Features(torch.nn.Module):
+        def forward(self, wav: "torch.Tensor") -> "torch.Tensor":
+            return compute_features(wav)
+
+    fe = Features()
+    fe.eval()
+    return fe
+
+
+def _build_embedding_only_wrapper(classifier) -> "torch.nn.Module":  # noqa: ANN001
+    """Module: (B, T_frames, n_mels) → (B, 192) — ONNX-exportable subgraph."""
+    import torch
+
+    mean_var_norm = classifier.mods.mean_var_norm
+    embedding_model = classifier.mods.embedding_model
+
+    class EmbeddingOnly(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mean_var_norm = mean_var_norm
+            self.embedding_model = embedding_model
+
+        def forward(self, feats: "torch.Tensor") -> "torch.Tensor":
+            wav_lens = torch.ones(feats.shape[0], device=feats.device)
+            normed = self.mean_var_norm(feats, wav_lens)
+            emb = self.embedding_model(normed, wav_lens)
+            return emb.squeeze(1)
+
+    eo = EmbeddingOnly()
+    eo.eval()
+    return eo
+
+
+def _dummy_features(sr: int, duration_sec: float = 3.0) -> "torch.Tensor":
+    import torch
+
+    return torch.zeros(1, int(sr * duration_sec / 160), DEFAULT_MEL_BINS, dtype=torch.float32)
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -136,10 +185,34 @@ def cmd_export(args: argparse.Namespace) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[export] loading {args.source}", file=sys.stderr)
-    wrapper = _build_wrapper(args.source, args.savedir)
+    print(f"[export] mode={args.mode} loading {args.source}", file=sys.stderr)
+    classifier = _load_classifier(args.source, args.savedir)
 
-    dummy = torch.zeros(1, args.sample_rate * 3, dtype=torch.float32)
+    if args.mode == "full":
+        wrapper = _build_full_wrapper(classifier)
+        dummy = torch.zeros(1, args.sample_rate * 3, dtype=torch.float32)
+        input_names = ["waveform"]
+        dynamic_axes = {
+            "waveform": {0: "batch", 1: "samples"},
+            "embedding": {0: "batch"},
+        }
+    elif args.mode == "embedding-only":
+        # Probe true mel-bin count by running compute_features once.
+        fe = _build_features(classifier)
+        with torch.no_grad():
+            probe = fe(torch.zeros(1, args.sample_rate, dtype=torch.float32))
+        n_mels = probe.shape[-1]
+        wrapper = _build_embedding_only_wrapper(classifier)
+        dummy = torch.zeros(1, 100, n_mels, dtype=torch.float32)
+        input_names = ["features"]
+        dynamic_axes = {
+            "features": {0: "batch", 1: "frames"},
+            "embedding": {0: "batch"},
+        }
+        print(f"[export] embedding-only n_mels={n_mels}", file=sys.stderr)
+    else:
+        raise ValueError(f"unknown mode: {args.mode}")
+
     with torch.no_grad():
         out = wrapper(dummy)
     if out.shape[-1] != EMBEDDING_DIM:
@@ -153,12 +226,9 @@ def cmd_export(args: argparse.Namespace) -> int:
         wrapper,
         (dummy,),
         str(output),
-        input_names=["waveform"],
+        input_names=input_names,
         output_names=["embedding"],
-        dynamic_axes={
-            "waveform": {0: "batch", 1: "samples"},
-            "embedding": {0: "batch"},
-        },
+        dynamic_axes=dynamic_axes,
         opset_version=args.opset,
         do_constant_folding=True,
     )
@@ -181,8 +251,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"[verify] missing {onnx_path}; run `export` first", file=sys.stderr)
         return 2
 
-    print(f"[verify] loading torch model {args.source}", file=sys.stderr)
-    wrapper = _build_wrapper(args.source, args.savedir)
+    print(f"[verify] mode={args.mode} loading torch model {args.source}", file=sys.stderr)
+    classifier = _load_classifier(args.source, args.savedir)
+    full_ref = _build_full_wrapper(classifier)
+    fe = _build_features(classifier) if args.mode == "embedding-only" else None
 
     print(f"[verify] loading onnx {onnx_path}", file=sys.stderr)
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
@@ -214,8 +286,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
     for wav, label in zip(waves, labels, strict=True):
         wav_t = torch.from_numpy(wav).unsqueeze(0)
         with torch.no_grad():
-            emb_t = wrapper(wav_t).cpu().numpy().astype(np.float64)
-        emb_o = session.run(["embedding"], {"waveform": wav[None, :]})[0].astype(np.float64)
+            emb_t = full_ref(wav_t).cpu().numpy().astype(np.float64)
+            if args.mode == "full":
+                onnx_input = wav[None, :]
+                onnx_input_name = "waveform"
+            else:
+                feats_t = fe(wav_t).cpu().numpy().astype(np.float32)
+                onnx_input = feats_t
+                onnx_input_name = "features"
+        emb_o = session.run(["embedding"], {onnx_input_name: onnx_input})[0].astype(np.float64)
         delta = float(np.max(np.abs(emb_t - emb_o)))
         raw_max_delta = max(raw_max_delta, delta)
         print(f"[verify] {label:24s} raw max|Δ|={delta:.3e}", file=sys.stderr)
@@ -251,13 +330,22 @@ def cmd_export_and_verify(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source", default=DEFAULT_SOURCE)
     common.add_argument("--savedir", default=None)
     common.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
+    common.add_argument(
+        "--mode",
+        choices=("full", "embedding-only"),
+        default=DEFAULT_MODE,
+        help="full = waveform→embedding (broken under torch 2.4 STFT export); "
+        "embedding-only = features→embedding (default)",
+    )
 
     p_export = sub.add_parser("export", parents=[common])
     p_export.add_argument("--output", required=True)
