@@ -6,12 +6,7 @@
 //! once the ONNX export from `scripts/export_ecapa_onnx.py` is parity-
 //! verified (handoff issue #66).
 
-pub mod embedding {
-    //! ECAPA-TDNN inference wrapper. Will load the ONNX produced by
-    //! `scripts/export_ecapa_onnx.py` and expose a `(samples_16k) → [f32; 192]`
-    //! function. Backed by `ort` once added.
-}
-
+pub mod embedding;
 pub mod enrollment;
 pub mod f0;
 pub mod gating;
