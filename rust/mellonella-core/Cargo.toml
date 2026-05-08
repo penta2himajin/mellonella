@@ -10,6 +10,8 @@ description = "Single-target speaker hard-gating filter — core library (Phase 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ort = { workspace = true }
+ndarray = { workspace = true }
 
 [lints]
 workspace = true
