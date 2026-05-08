@@ -1,0 +1,11 @@
+{
+  "sample_rate": 16000,
+  "chunk_samples": 512,
+  "n_chunks": 31,
+  "input_shape": [
+    16000
+  ],
+  "expected_shape": [
+    31
+  ]
+}
