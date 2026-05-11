@@ -1,0 +1,12 @@
+{
+  "sample_rate": 16000,
+  "vad_frame_samples": 512,
+  "sv_window_samples": 16000,
+  "sv_update_samples": 4000,
+  "vad_threshold": -1.0,
+  "theta_pass": 0.3,
+  "hangover_ms": 300.0,
+  "n_frames": 62,
+  "anchor_dim": 192,
+  "audio_source": "fixtures/vad_input.bin"
+}
