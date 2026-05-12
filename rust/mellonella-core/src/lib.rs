@@ -12,4 +12,5 @@ pub mod f0;
 pub mod features;
 pub mod gating;
 pub mod pipeline;
+pub mod resample;
 pub mod vad;
