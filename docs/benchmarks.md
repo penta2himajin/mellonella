@@ -377,23 +377,33 @@ Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` prof
 
 | Stage | Input | Wall time (median) | RTF (real-time factor) |
 |---|---|---|---|
-| `Fbank::compute` | 1 s @ 16 kHz | **504 µs** | ~1985× |
-| `SileroVad::score` | 32 ms chunk @ 16 kHz | **168 µs** | ~190× |
-| `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **41.2 ms** | ~24× |
-| `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **28.4 ms** | ~36× |
-| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **389 ms** | ~5.1× |
+| `Fbank::compute` | 1 s @ 16 kHz | **492 µs** | ~2030× |
+| `SileroVad::score` | 32 ms chunk @ 16 kHz | **179 µs** | ~179× |
+| `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **40.3 ms** | ~25× |
+| `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **29.7 ms** | ~34× |
+| `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **9.5 ms** | ~105× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **324 ms** | ~6.2× |
+
+Pipeline RTF improved from 5.1× → 6.2× after Phase 3.5 step 1 below (YIN F0 τ-window pruning).
 
 Interpretation:
 
-- **Per-stage cost is dominated by ECAPA.** A single embedding refresh costs ~41 ms; the pipeline refresh cadence (250 ms = 4 000 samples) keeps that comfortably below real-time.
-- **DFN3 fits in budget too** at ~36× real-time per 1-s chunk. Wall-clock cost grows linearly with chunk count for longer audio.
-- **End-to-end pipeline at ~5× real-time** is the slowest path because YIN F0 (`estimate_f0_track`) runs on a 1-s window each refresh and has an O(N²)-flavoured inner loop. That's the obvious place to optimise if a real-time variant is needed — Phase 3.5.
+- **Per-stage cost is dominated by ECAPA.** A single embedding refresh costs ~40 ms; the pipeline refresh cadence (250 ms = 4 000 samples) keeps that comfortably below real-time.
+- **DFN3 fits in budget too** at ~34× real-time per 1-s chunk. Wall-clock cost grows linearly with chunk count for longer audio.
+- **YIN F0 used to be the second-largest contributor** at ~25 ms/call before the τ-pruning optimisation; the hinted path now finishes in ~9.5 ms.
 
-These numbers establish the **Phase 3 perf baseline** for future regression tracking. They do not yet claim parity with the Python reference (Python timings haven't been measured under matching conditions). Add a Python-side bench harness in Phase 3.5 to close that gap.
+These numbers establish the **Phase 3 perf baseline** for future regression tracking. They do not yet claim parity with the Python reference (Python timings haven't been measured under matching conditions). A Python-side bench harness is a future Phase 3.5 task.
 
-### Profile hints for Phase 3.5
+### Phase 3.5 step 1: YIN F0 τ-window pruning
 
-- F0 estimation: cache the FFT plan, prune `tau` search space against the previous frame's estimate, or replace YIN with a lighter-weight pitch heuristic when only `f0_match` (not the absolute pitch) is needed.
+`yin_frame_with_hint` narrows the τ search to `[τ_hint × 0.7, τ_hint × 1.4]` when a prior frame's estimate is available, dropping the `difference` O(frame × τ_max) loop from `τ_max = sr/f_min` (e.g. 320 samples @ 50 Hz floor) to ~30–80 samples for a continuous-pitch track. `estimate_f0_track` threads the prior estimate forward across hops; unvoiced frames keep the last voiced hint so a brief glottal break doesn't re-trigger the wide scan.
+
+Hint window falls back to the full τ range when the narrow scan misses (`find_tau_dip` returns `None`), so the optimisation never sacrifices recall — at most it adds one wide retry per hop.
+
+Result: per-call cost ~9.5 ms (was ~25 ms estimated from the pre-optimisation pipeline budget); end-to-end pipeline -17 %.
+
+### Other profile hints for Phase 3.5
+
 - ECAPA: optimisation levels and provider selection in `ort` (CoreML / DirectML / TensorRT-EP) likely move the needle on production hardware.
 - DFN3: single-chunk-only is the current cap; streaming-overlap would amortise the per-chunk model load + state warmup.
 
