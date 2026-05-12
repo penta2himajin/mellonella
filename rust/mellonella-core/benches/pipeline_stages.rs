@@ -235,6 +235,23 @@ fn bench_pipeline(c: &mut Criterion) {
             black_box(result);
         });
     });
+    let pipeline_cfg_async = PipelineConfig {
+        async_refresh: true,
+        ..pipeline_cfg
+    };
+    group.bench_function("2s_16khz_offline_async", |b| {
+        b.iter(|| {
+            let result = process_offline(
+                black_box(&audio),
+                &mut pool,
+                &pipeline_cfg_async,
+                &gate_cfg,
+                &mut components,
+            )
+            .expect("pipeline");
+            black_box(result);
+        });
+    });
     group.finish();
 }
 

@@ -110,12 +110,17 @@ impl SileroVad {
         // Prepend the carried context, then run ONNX on the (1, ctx+chunk)
         // buffer. After inference, the last `context_len` samples of this
         // buffer become the new context for the next call.
-        let mut prepended = Vec::with_capacity(self.context.len() + chunk.len());
+        let ctx_len = self.context.len();
+        let prepended_len = ctx_len + chunk.len();
+        let mut prepended = Vec::with_capacity(prepended_len);
         prepended.extend_from_slice(&self.context);
         prepended.extend_from_slice(chunk);
-        let prepended_len = prepended.len();
-        let input_arr = Array2::from_shape_vec((1, prepended_len), prepended.clone())
-            .map_err(EmbeddingError::Shape)?;
+        // Snapshot the context tail before handing the buffer to ndarray
+        // so we don't need to clone the whole prepended slab.
+        self.context
+            .copy_from_slice(&prepended[prepended_len - ctx_len..]);
+        let input_arr =
+            Array2::from_shape_vec((1, prepended_len), prepended).map_err(EmbeddingError::Shape)?;
         let sr_arr = Array1::from_vec(vec![self.sample_rate]);
         // Borrow current state for input; new state replaces it after
         // the run.
@@ -140,33 +145,26 @@ impl SileroVad {
             }
         };
 
-        // stateN: copy back into self.state
+        // stateN: copy back into self.state without re-allocating the
+        // Array3 each call.
         let (state_shape, state_data) = outputs["stateN"].try_extract_tensor::<f32>()?;
         let state_dims: &[i64] = &state_shape;
-        if state_dims.len() != 3 || state_dims[0] != 2 || state_dims[2] != STATE_HIDDEN as i64 {
+        if state_dims.len() != 3
+            || state_dims[0] != 2
+            || state_dims[1] != 1
+            || state_dims[2] != STATE_HIDDEN as i64
+        {
             return Err(EmbeddingError::UnexpectedOutputShape {
                 got: state_dims.to_vec(),
                 expected_dim: STATE_HIDDEN,
             });
         }
-        let new_state = Array3::from_shape_vec(
-            (
-                state_dims[0] as usize,
-                state_dims[1] as usize,
-                state_dims[2] as usize,
-            ),
-            state_data.to_vec(),
-        )
-        .map_err(EmbeddingError::Shape)?;
-        self.state = new_state;
-
-        // Carry the last context_len samples of the prepended buffer
-        // forward — Python copies `x[..., -context_size:]` after each
-        // call so subsequent chunks see the trailing waveform of the
-        // previous fed buffer.
-        let ctx_len = self.context.len();
-        self.context
-            .copy_from_slice(&prepended[prepended_len - ctx_len..]);
+        if let Some(slot) = self.state.as_slice_mut() {
+            slot.copy_from_slice(state_data);
+        } else {
+            self.state = Array3::from_shape_vec((2, 1, STATE_HIDDEN), state_data.to_vec())
+                .map_err(EmbeddingError::Shape)?;
+        }
 
         Ok(prob)
     }
