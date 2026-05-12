@@ -382,9 +382,17 @@ Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` prof
 | `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **40.3 ms** | ~25× |
 | `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **29.7 ms** | ~34× |
 | `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **9.5 ms** | ~105× |
-| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **324 ms** | ~6.2× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **170 ms** | ~11.8× |
 
-Pipeline RTF improved from 5.1× → 6.2× after Phase 3.5 step 1 below (YIN F0 τ-window pruning).
+Pipeline RTF trajectory:
+
+| step | pipeline | RTF | comment |
+|---|---|---|---|
+| Phase 3 closeout (step 17) | 389 ms | 5.1× | bench baseline |
+| Phase 3.5 step 1 | 324 ms | 6.2× | YIN F0 τ-window pruning |
+| Phase 3.5 step 3 | **170 ms** | **11.8×** | sv_update_samples 4000 → 8000 |
+
+Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). INT8 quantization (step 2) stays opt-in — see below.
 
 Interpretation:
 
@@ -417,6 +425,21 @@ Result: per-call cost ~9.5 ms (was ~25 ms estimated from the pre-optimisation pi
 `QInt8` *regresses* on this host — the conv1d kernel path's dynamic-quant prologue overwhelms the savings. `QUInt8` recovers a real 14 % cut at the cost of a cosine `max|Δ|` that exceeds the original 1 × 10⁻² parity bar; for our AS-Norm gating that's still 1.4 % relative to the `theta_pass_as_norm = 2.25` decision boundary, so production gating on synthetic fixtures continues to decide correctly. Real-data sign-off (LibriSpeech + MUSAN) should re-verify before flipping the default.
 
 ROI takeaway: INT8 dynamic quantization is **opt-in, not the default**. Tools live in the export script; users with AVX-VNNI hardware and recall budget for `~3 × 10⁻²` cosine drift can try it. Conv-heavy speaker models benefit much less than transformer LLMs from this technique.
+
+### Phase 3.5 step 3: ECAPA refresh cadence 250 ms → 500 ms
+
+`PipelineConfig::sv_update_samples` default goes from 4 000 (one refresh every 250 ms @ 16 kHz) to 8 000 (one every 500 ms). The cost dominator in `process_offline` is ECAPA inference, fired on each refresh — halving the cadence directly halves the per-second ECAPA spend, which is the largest single contributor to wall time at ~50 % of the budget.
+
+| metric | before | after | delta |
+|---|---|---|---|
+| pipeline (2 s) | 324 ms | **170 ms** | **-47.5 %** |
+| RTF | 6.2× | 11.8× | nearly 2× |
+| ECAPA refreshes per 2 s | 4 | 2 | -50 % |
+| F0 calls per 2 s | 4 | 2 | -50 % |
+
+Trade-off: drift response is half as fast — score changes from a different speaker (or sudden anchor mismatch) now take up to ~500 ms to reflect in the gate vs the previous ~250 ms. Hangover (`hangover_ms = 300`) absorbs short transients on the way in; for transitions OFF the worst-case unmute-on-impostor window grows by 250 ms. AS-Norm's cohort-normalised score is still recomputed at the refresh boundary, so steady-state impostor rejection is unchanged.
+
+The `pipeline_parity` integration test pins itself to `sv_update_samples = 4 000` to match the fixture generated under the old default; downstream callers that need the tight cadence override on the live `PipelineConfig`.
 
 ### Other profile hints for Phase 3.5
 

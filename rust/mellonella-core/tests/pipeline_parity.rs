@@ -82,6 +82,12 @@ fn process_offline_matches_python_reference() {
 
     let pipeline_cfg = PipelineConfig {
         vad_threshold: -1.0, // mirrors the dump script's always-accept
+        // The fixture was generated against sv_update_samples = 4 000
+        // (250 ms refresh cadence). Pin the test to that value even
+        // though the live default is now 8 000 (Phase 3.5 step 3) —
+        // otherwise the Rust run would refresh on a different schedule
+        // than the Python reference and the per-frame scores diverge.
+        sv_update_samples: 4_000,
         enable_auto_learn: false,
         ..PipelineConfig::default()
     };
