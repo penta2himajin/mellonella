@@ -16,5 +16,12 @@ rustfft = { workspace = true }
 rubato = { workspace = true }
 deep_filter = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "pipeline_stages"
+harness = false
+
 [lints]
 workspace = true
