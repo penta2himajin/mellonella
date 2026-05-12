@@ -61,6 +61,22 @@ pub struct PipelineConfig {
     /// are never admitted into the FIFO and `maybe_reset` is never
     /// invoked.
     pub enable_auto_learn: bool,
+    /// Minimum new-speech samples accumulated after a speech→silence
+    /// transition before an *early* (cadence-skipping) ECAPA refresh
+    /// is allowed. Default 4 000 (250 ms @ 16 kHz). Setting this to
+    /// `usize::MAX` disables the early-refresh path entirely (every
+    /// refresh waits for the full `sv_update_samples` cadence).
+    ///
+    /// Rationale: when [`Self::sv_update_samples`] grew to 500 ms
+    /// (Phase 3.5 step 3) the worst-case ON→OFF latency on speaker
+    /// turn went up by ~250 ms. Most real turns include a brief
+    /// inter-speaker pause that the VAD already detects; firing the
+    /// next ECAPA call as soon as we've heard enough of the new
+    /// speaker recovers the latency without changing the
+    /// steady-state refresh rate (no perf regression — the
+    /// `pipeline_parity` test fixture uses `vad_threshold = -1.0`,
+    /// so silence never fires and the trigger stays dormant).
+    pub sv_min_new_samples_after_silence: usize,
 }
 
 impl Default for PipelineConfig {
@@ -71,6 +87,7 @@ impl Default for PipelineConfig {
             sv_update_samples: 8_000,
             vad_threshold: 0.5,
             enable_auto_learn: true,
+            sv_min_new_samples_after_silence: 4_000,
         }
     }
 }
@@ -211,6 +228,13 @@ pub fn process_offline(
     // Allocated once with the window size and reused.
     let mut sv_window_scratch: Vec<f32> = Vec::with_capacity(pipeline_cfg.sv_window_samples);
     let mut samples_since_update = 0_usize;
+    // VAD-edge-triggered early-refresh state. Tracks whether a
+    // speech→silence transition has occurred since the last ECAPA
+    // refresh, and how much new speech has accumulated since that
+    // silence ended. See `PipelineConfig::sv_min_new_samples_after_silence`.
+    let mut silence_seen_since_refresh = false;
+    let mut new_speech_samples_after_silence = 0_usize;
+    let mut prev_speech = false;
     let mut consecutive_speech_ms = 0.0_f32;
     let mut last_score = 0.0_f32;
     let mut last_cs = 0.0_f32;
@@ -231,7 +255,8 @@ pub fn process_offline(
         let frame = &audio[frame_start..frame_start + vad_frame];
 
         let speech_prob = components.vad.score(frame)?;
-        if speech_prob > pipeline_cfg.vad_threshold {
+        let now_speech = speech_prob > pipeline_cfg.vad_threshold;
+        if now_speech {
             for &sample in frame {
                 if speech_buffer.len() == pipeline_cfg.sv_window_samples {
                     speech_buffer.pop_front();
@@ -239,15 +264,28 @@ pub fn process_offline(
                 speech_buffer.push_back(sample);
             }
             consecutive_speech_ms += dt_ms;
+            if silence_seen_since_refresh {
+                new_speech_samples_after_silence += vad_frame;
+            }
         } else {
             consecutive_speech_ms = 0.0;
         }
+        // Detect a speech → silence edge for the early-refresh trigger.
+        if prev_speech && !now_speech {
+            silence_seen_since_refresh = true;
+            new_speech_samples_after_silence = 0;
+        }
+        prev_speech = now_speech;
         samples_since_update += vad_frame;
 
-        if samples_since_update >= pipeline_cfg.sv_update_samples
-            && speech_buffer.len() >= pipeline_cfg.sv_window_samples
-        {
+        let due_normal = samples_since_update >= pipeline_cfg.sv_update_samples;
+        let due_early = silence_seen_since_refresh
+            && now_speech
+            && new_speech_samples_after_silence >= pipeline_cfg.sv_min_new_samples_after_silence;
+        if (due_normal || due_early) && speech_buffer.len() >= pipeline_cfg.sv_window_samples {
             samples_since_update = 0;
+            silence_seen_since_refresh = false;
+            new_speech_samples_after_silence = 0;
             // Copy the ring buffer into a contiguous scratch slice once
             // per refresh. Fbank / F0 want `&[f32]`.
             sv_window_scratch.clear();

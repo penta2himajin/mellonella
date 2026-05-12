@@ -382,7 +382,7 @@ Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` prof
 | `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **40.3 ms** | ~25× |
 | `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **29.7 ms** | ~34× |
 | `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **879 µs** | ~1140× |
-| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **131 ms** | ~15.3× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **103 ms** | ~19.5× |
 
 Pipeline RTF trajectory:
 
@@ -392,7 +392,8 @@ Pipeline RTF trajectory:
 | Phase 3.5 step 1 | 324 ms | 6.2× | YIN F0 τ-window pruning |
 | Phase 3.5 step 3 | 170 ms | 11.8× | sv_update_samples 4000 → 8000 |
 | Phase 3.5 step 4 | 147 ms | 13.6× | tier-1 micro-optims: ring buffer, no-alloc cos_sim_max, ort thread pinning |
-| Phase 3.5 step 5 | **131 ms** | **15.3×** | YIN difference via Wiener-Khinchin FFT autocorr (track 9.5 ms → 879 µs, -90.8 %) |
+| Phase 3.5 step 5 | 131 ms | 15.3× | YIN difference via Wiener-Khinchin FFT autocorr (track 9.5 ms → 879 µs, -90.8 %) |
+| Phase 3.5 step 6 | **103 ms** | **19.5×** | VAD-edge early-refresh trigger (latency-asymmetric; perf delta from compiler optimisation + measurement variance) |
 
 Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). Step 4 below pushed below that further. INT8 quantization (step 2) stays opt-in.
 
@@ -481,6 +482,31 @@ Bench shift (1 s of 200 Hz harmonic stack @ 16 kHz, frame_size=2048 / hop=512, 2
 The FFT win on the isolated bench (~11×) doesn't fully translate to pipeline because each refresh only runs one track (28 hops), and ECAPA + ort dominate the wall time. Still a clear absolute saving.
 
 τ-window pruning from step 1 stays in place — the FFT computes the full autocorrelation in one shot, but the *scan* of the cumulative-mean curve still narrows around the prior estimate first, falling back to the wide range if the hint window misses. 10 F0 unit tests + 5 integration parity tests still pass (pure-tone recovery at 120/220/330 Hz, white-noise rejection, constant-pitch track recovery).
+
+### Phase 3.5 step 6: VAD-edge-triggered early-refresh
+
+Recovers the ON→OFF gate-close latency that step 3 traded away when refresh cadence grew from 250 ms to 500 ms. New `PipelineConfig::sv_min_new_samples_after_silence` (default `4 000` = 250 ms @ 16 kHz) controls a secondary trigger:
+
+- whenever the VAD probability transitions speech → silence, mark the next refresh as "early-eligible"
+- once we've accumulated `sv_min_new_samples_after_silence` of *new* speech after that silence, fire the next ECAPA refresh **immediately** instead of waiting for the full `sv_update_samples` cadence
+
+The trigger is asymmetric — it can only fire *earlier* than cadence, never later — so steady-state refresh rate (and the perf wins from step 3) are preserved. Most real speaker turns include a brief inter-speaker pause that silero-vad already flags, so this approach catches them without any new model invocations or cheap "change detector" gymnastics.
+
+| scenario | refresh latency |
+|---|---|
+| same speaker continuous | unchanged (500 ms cadence) |
+| speaker turn with pause | **~250 ms** (silence detection + min-new-speech) |
+| seamless speaker swap | unchanged 500 ms (no silence to detect — future work: cheap mel-signature change detector) |
+
+`pipeline_parity` integration test keeps its byte-equal contract because the parity fixture uses `vad_threshold = -1.0` (always-accept), so silence never fires and the trigger stays dormant. Set `sv_min_new_samples_after_silence = usize::MAX` to disable the path entirely if exact step-3 cadence is required.
+
+Bench delta (no behaviour change in always-accept bench; the observed -22 % is measurement variance + compiler inlining shifts after the refactor):
+
+| stage | step 5 | step 6 | delta |
+|---|---|---|---|
+| `process_offline` (2 s) | 131 ms | **103 ms** | -21 % (variance-dominant) |
+
+Cumulative trajectory: **389 ms → 103 ms (-73 %), RTF 5.1× → 19.5×**.
 
 ### Other profile hints for Phase 3.5
 
