@@ -6,6 +6,7 @@
 //! once the ONNX export from `scripts/export_ecapa_onnx.py` is parity-
 //! verified (handoff issue #66).
 
+pub mod dfn3;
 pub mod embedding;
 pub mod enrollment;
 pub mod f0;
