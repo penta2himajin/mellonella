@@ -95,6 +95,14 @@ struct ProcessArgs {
     /// `EnrollArgs::enable_dfn3`.
     #[arg(long)]
     enable_dfn3: bool,
+    /// Optional path to dump per-VAD-frame diagnostics as JSON
+    /// (`gate_per_frame`, `score_per_frame`, `cos_sim_max_per_frame`,
+    /// `f0_match_per_frame`, gate `decisions` run-length, plus the
+    /// auto-learn event log). Used by the bench-side scenario runners
+    /// to compare Rust output against the Python reference at the same
+    /// granularity.
+    #[arg(long)]
+    gate_decisions: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -293,6 +301,35 @@ fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
         REQUIRED_SAMPLE_RATE,
         on_frames * 100 / total,
     );
+    if let Some(diag_path) = args.gate_decisions {
+        let payload = serde_json::json!({
+            "version": 1,
+            "sample_rate": REQUIRED_SAMPLE_RATE,
+            "vad_frame_samples": 512,
+            "gate_per_frame": result.gate_per_frame,
+            "score_per_frame": result.score_per_frame,
+            "cos_sim_max_per_frame": result.cos_sim_max_per_frame,
+            "f0_match_per_frame": result.f0_match_per_frame,
+            "gate_decisions": result
+                .gate_decisions
+                .iter()
+                .map(|(s, o)| serde_json::json!([s, o]))
+                .collect::<Vec<_>>(),
+            "auto_learn_events": result
+                .auto_learn_events
+                .iter()
+                .map(|ev| serde_json::json!({
+                    "frame_idx": ev.frame_idx,
+                    "kind": format!("{:?}", ev.kind),
+                    "score": ev.score,
+                    "f0_match": ev.f0_match,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        std::fs::write(&diag_path, serde_json::to_string_pretty(&payload).unwrap())
+            .map_err(CliError::Io)?;
+        eprintln!("[info] diagnostics → {}", diag_path.display());
+    }
     Ok(())
 }
 
