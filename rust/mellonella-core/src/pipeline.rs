@@ -25,7 +25,7 @@
 )]
 
 use crate::embedding::{EcapaTdnn, EmbeddingError};
-use crate::enrollment::EmbeddingPool;
+use crate::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
@@ -330,4 +330,60 @@ pub fn process_offline(
         f0_match_per_frame: fm_per_frame,
         auto_learn_events,
     })
+}
+
+/// Default ECAPA enrollment chunk length (3 s @ 16 kHz).
+pub const ENROLL_CHUNK_SAMPLES: usize = 48_000;
+/// Default ECAPA enrollment chunk shift (1.5 s @ 16 kHz).
+pub const ENROLL_SHIFT_SAMPLES: usize = 24_000;
+
+/// Build an [`EmbeddingPool`] from a clean enrollment recording.
+///
+/// Per `docs/gating.md`:
+///
+/// * 5–10 anchor embeddings via sliding `ENROLL_CHUNK_SAMPLES` /
+///   `ENROLL_SHIFT_SAMPLES` chunks
+/// * F0 statistics from the voiced portion of the whole recording
+///
+/// Mirrors `mellonella_poc.pipeline.enroll_from_recording`. Currently
+/// assumes the caller hands in 16 kHz audio; a Rust resampler will
+/// land in a follow-up.
+///
+/// # Errors
+/// Returns [`EmbeddingError`] when the recording is too short to feed
+/// ECAPA at all, or when an inference call fails.
+pub fn enroll_from_recording(
+    audio: &[f32],
+    components: &mut PipelineComponents,
+    pool_cfg: EmbeddingPoolConfig,
+) -> Result<EmbeddingPool, EmbeddingError> {
+    let sv_sr = 16_000_u32;
+    let mut anchors: Vec<Vec<f32>> = Vec::new();
+    let mut start = 0_usize;
+    while start + ENROLL_CHUNK_SAMPLES <= audio.len() {
+        let window = &audio[start..start + ENROLL_CHUNK_SAMPLES];
+        let feats = components.fbank.compute(window);
+        let n_frames = feats.len() / N_MELS;
+        anchors.push(components.ecapa.embed_features(&feats, n_frames, N_MELS)?);
+        start += ENROLL_SHIFT_SAMPLES;
+    }
+    if anchors.is_empty() {
+        if audio.len() < sv_sr as usize {
+            return Err(EmbeddingError::Shape(ndarray::ShapeError::from_kind(
+                ndarray::ErrorKind::IncompatibleShape,
+            )));
+        }
+        let window = &audio[..ENROLL_CHUNK_SAMPLES.min(audio.len())];
+        let feats = components.fbank.compute(window);
+        let n_frames = feats.len() / N_MELS;
+        anchors.push(components.ecapa.embed_features(&feats, n_frames, N_MELS)?);
+    }
+
+    let track = estimate_f0_track(audio, sv_sr, 2048, 512, DEFAULT_F_MIN, DEFAULT_F_MAX);
+    let (f0_mu, f0_sigma) = f0_statistics(&track);
+
+    let mut pool = EmbeddingPool::new(pool_cfg);
+    pool.add_anchors(anchors);
+    pool.set_f0_stats(f0_mu, f0_sigma);
+    Ok(pool)
 }

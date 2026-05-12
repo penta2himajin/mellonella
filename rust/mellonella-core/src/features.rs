@@ -75,7 +75,28 @@ pub struct Fbank {
     filterbank: Box<[f32]>,
 }
 
+/// SpeechBrain ECAPA-TDNN filterbank matrix, vendored from
+/// `scripts/dump_fbank_fixture.py`. Use [`Fbank::with_speechbrain_filterbank`]
+/// to construct an `Fbank` from this buffer at runtime.
+const SPEECHBRAIN_FILTERBANK_BYTES: &[u8] =
+    include_bytes!("../tests/fixtures/fbank_filterbank.bin");
+
 impl Fbank {
+    /// Convenience constructor that uses the vendored SpeechBrain
+    /// filterbank matrix from `tests/fixtures/fbank_filterbank.bin`.
+    ///
+    /// # Errors
+    /// Returns [`FbankError::BadFilterbankLength`] if the vendored
+    /// buffer ever gets out of sync with `N_STFT * N_MELS`.
+    pub fn with_speechbrain_filterbank() -> Result<Self, FbankError> {
+        let n = SPEECHBRAIN_FILTERBANK_BYTES.len() / 4;
+        let mut filterbank = Vec::with_capacity(n);
+        for chunk in SPEECHBRAIN_FILTERBANK_BYTES.chunks_exact(4) {
+            filterbank.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Self::new(&filterbank)
+    }
+
     /// Build an Fbank using a vendored filterbank matrix.
     ///
     /// `filterbank` must be a `(N_STFT, N_MELS)` row-major buffer
