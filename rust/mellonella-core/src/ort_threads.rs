@@ -27,7 +27,6 @@ pub fn intra_op_threads() -> usize {
         }
     }
     std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
+        .map_or(1, std::num::NonZeroUsize::get)
         .min(2)
 }
