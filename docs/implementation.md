@@ -100,12 +100,16 @@ Deliverable: a feature-complete Python implementation.
 Goal: production desktop implementation, performance optimization.
 
 Tasks:
-- ONNX conversion: ECAPA-TDNN (SpeechBrain → ONNX); silero-vad already ships in ONNX form.
-- Design the Rust crate layout (`mellonella-core`, `mellonella-cli`, `mellonella-ffi`, etc.).
-- Streaming processing (ring buffer, frame sync).
-- Integrate the Rust DFN3 implementation.
-- Integrate ONNX Runtime (the `ort` crate).
-- Benchmarks (perf parity with the Python version, CPU usage).
+- ONNX conversion: ECAPA-TDNN (SpeechBrain → ONNX); silero-vad already ships in ONNX form. ✅ (PR #65, #74; embedding-only graph)
+- Design the Rust crate layout (`mellonella-core`, `mellonella-cli`, `mellonella-ffi`, etc.). ✅ (PR #67; `rust/` workspace)
+- Streaming processing (ring buffer, frame sync). ⏳ deferred to Phase 3.5
+- Integrate the Rust DFN3 implementation. ✅ (PR #83–#86; ONNX path with `df_op` patch, `df` crate for STFT / ERB primitives)
+- Integrate ONNX Runtime (the `ort` crate). ✅ (PR #75; `ort 2.0.0-rc.12`, `load-dynamic`)
+- Benchmarks (perf parity with the Python version, CPU usage). ⏳ deferred
+
+Per-stage details for reviewers: D-011 in [decisions.md](decisions.md) (ONNX runtime choice, embedding-only ECAPA graph, DFN3 `df_op` monkey-patch, repo layout, config split, resampler).
+
+Phase 3 status: feature-complete for **offline** use (`mellonella enroll` + `mellonella process` end-to-end on arbitrary-SR WAV input with optional `--enable-dfn3`). The two ⏳ items above and a streaming-overlap variant of `Dfn3Pipeline` are Phase 3.5 work.
 
 Estimated time: 2–3 weeks.
 Deliverable: a CLI plus library that runs on Linux / macOS / Windows.
