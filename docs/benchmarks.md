@@ -368,3 +368,31 @@ bench/
 4. **After Phase 4 mobile deployment**: on-device latency / battery measurement on mobile.
 
 For each phase, the gate condition before progression is to clear the minimum criterion of the corresponding scenarios. Concrete thresholds are fixed after the Phase 1 initial measurement.
+
+## Rust pipeline micro-benchmarks (Phase 3 closeout)
+
+Run with `cargo bench --bench pipeline_stages` from `rust/`. ONNX-dependent benches need `MELLONELLA_ECAPA_ONNX`, `MELLONELLA_VAD_ONNX`, `MELLONELLA_DFN3_ONNX`, and `ORT_DYLIB_PATH`.
+
+Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` profile = `release` (criterion default).
+
+| Stage | Input | Wall time (median) | RTF (real-time factor) |
+|---|---|---|---|
+| `Fbank::compute` | 1 s @ 16 kHz | **504 µs** | ~1985× |
+| `SileroVad::score` | 32 ms chunk @ 16 kHz | **168 µs** | ~190× |
+| `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **41.2 ms** | ~24× |
+| `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **28.4 ms** | ~36× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **389 ms** | ~5.1× |
+
+Interpretation:
+
+- **Per-stage cost is dominated by ECAPA.** A single embedding refresh costs ~41 ms; the pipeline refresh cadence (250 ms = 4 000 samples) keeps that comfortably below real-time.
+- **DFN3 fits in budget too** at ~36× real-time per 1-s chunk. Wall-clock cost grows linearly with chunk count for longer audio.
+- **End-to-end pipeline at ~5× real-time** is the slowest path because YIN F0 (`estimate_f0_track`) runs on a 1-s window each refresh and has an O(N²)-flavoured inner loop. That's the obvious place to optimise if a real-time variant is needed — Phase 3.5.
+
+These numbers establish the **Phase 3 perf baseline** for future regression tracking. They do not yet claim parity with the Python reference (Python timings haven't been measured under matching conditions). Add a Python-side bench harness in Phase 3.5 to close that gap.
+
+### Profile hints for Phase 3.5
+
+- F0 estimation: cache the FFT plan, prune `tau` search space against the previous frame's estimate, or replace YIN with a lighter-weight pitch heuristic when only `f0_match` (not the absolute pitch) is needed.
+- ECAPA: optimisation levels and provider selection in `ort` (CoreML / DirectML / TensorRT-EP) likely move the needle on production hardware.
+- DFN3: single-chunk-only is the current cap; streaming-overlap would amortise the per-chunk model load + state warmup.
