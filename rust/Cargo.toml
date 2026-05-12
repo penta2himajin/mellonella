@@ -18,6 +18,7 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "n
 ndarray = "0.17"
 rustfft = "6"
 rubato = "0.16"
+deep_filter = { version = "0.2", default-features = false, features = ["transforms"] }
 clap = { version = "4", features = ["derive"] }
 hound = "3"
 
