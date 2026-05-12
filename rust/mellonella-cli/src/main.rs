@@ -16,9 +16,12 @@
 //! * `ORT_DYLIB_PATH`        — path to libonnxruntime (used by ort's
 //!   `load-dynamic` feature)
 //!
-//! Audio I/O accepts 16-bit signed-integer WAVs at 16 kHz (which is
-//! what most VC stacks emit). Other rates / depths are rejected
-//! upfront — the polyphase resampler lands in a follow-up PR.
+//! Audio I/O accepts 16-bit signed-integer mono WAVs at any common
+//! sample rate; non-16 kHz inputs are resampled to 16 kHz via
+//! `mellonella_core::resample` before being fed into the pipeline.
+//! 24-bit/32-bit/float WAVs are still rejected upfront — the SV
+//! pipeline operates on `f32` peak-normalised samples and re-coding
+//! those extra depths isn't worth the complexity today.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -38,6 +41,7 @@ use mellonella_core::gating::GateConfig;
 use mellonella_core::pipeline::{
     enroll_from_recording, process_offline, PipelineComponents, PipelineConfig,
 };
+use mellonella_core::resample::resample_to;
 use mellonella_core::vad::SileroVad;
 
 const REQUIRED_SAMPLE_RATE: u32 = 16_000;
@@ -65,7 +69,8 @@ enum Cmd {
 
 #[derive(Args, Debug)]
 struct EnrollArgs {
-    /// Input WAV (16-bit signed, 16 kHz, mono).
+    /// Input WAV (16-bit signed, mono; any common sample rate — resampled
+    /// to 16 kHz on the way in).
     input: PathBuf,
     /// Output enrollment JSON.
     output: PathBuf,
@@ -73,7 +78,8 @@ struct EnrollArgs {
 
 #[derive(Args, Debug)]
 struct ProcessArgs {
-    /// Input WAV (16-bit signed, 16 kHz, mono).
+    /// Input WAV (16-bit signed, mono; any common sample rate — resampled
+    /// to 16 kHz on the way in).
     input: PathBuf,
     /// Enrollment JSON produced by `mellonella enroll`.
     enrollment: PathBuf,
@@ -114,15 +120,9 @@ impl From<hound::Error> for CliError {
     }
 }
 
-fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, CliError> {
+fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, CliError> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
-    if spec.sample_rate != REQUIRED_SAMPLE_RATE {
-        return Err(CliError::UnsupportedFormat(format!(
-            "expected {REQUIRED_SAMPLE_RATE} Hz, got {} Hz",
-            spec.sample_rate
-        )));
-    }
     if spec.channels != 1 {
         return Err(CliError::UnsupportedFormat(format!(
             "expected mono, got {} channels",
@@ -140,7 +140,20 @@ fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, CliError> {
         .samples::<i16>()
         .map(|s| s.map(|v| f32::from(v) * scale))
         .collect();
-    Ok(samples?)
+    let samples = samples?;
+    if spec.sample_rate == REQUIRED_SAMPLE_RATE {
+        return Ok(samples);
+    }
+    let resampled = resample_to(&samples, spec.sample_rate, REQUIRED_SAMPLE_RATE)
+        .map_err(|e| CliError::Pipeline(format!("resample {}→16000 Hz: {e}", spec.sample_rate)))?;
+    eprintln!(
+        "[info] resampled {} Hz → {} Hz ({} → {} samples)",
+        spec.sample_rate,
+        REQUIRED_SAMPLE_RATE,
+        samples.len(),
+        resampled.len()
+    );
+    Ok(resampled)
 }
 
 fn write_wav_16k_mono(path: &Path, audio: &[f32]) -> Result<(), CliError> {
@@ -184,7 +197,7 @@ fn build_components() -> Result<PipelineComponents, CliError> {
 }
 
 fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
-    let audio = read_wav_16k_mono(&args.input)?;
+    let audio = read_wav_to_16k_mono(&args.input)?;
     let mut components = build_components()?;
     let pool = enroll_from_recording(&audio, &mut components, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("enroll: {e}")))?;
@@ -202,7 +215,7 @@ fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
 }
 
 fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
-    let audio = read_wav_16k_mono(&args.input)?;
+    let audio = read_wav_to_16k_mono(&args.input)?;
     let mut pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
     let mut components = build_components()?;
