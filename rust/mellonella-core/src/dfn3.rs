@@ -37,11 +37,29 @@
 
 use std::path::Path;
 
+// The `deep_filter` crate is published as the `df` lib (see its
+// Cargo.toml `[lib] name = "df"`).
+use df::{
+    band_mean_norm_erb, band_unit_norm, compute_band_corr, Complex32, DFState, MEAN_NORM_INIT,
+    UNIT_NORM_INIT,
+};
 use ndarray::{Array4, Array5};
 use ort::session::Session;
 use ort::value::TensorRef;
 
 use crate::embedding::EmbeddingError;
+
+/// Sample rate the DFN3 model is trained on.
+pub const DFN3_SR: usize = 48_000;
+/// FFT size used by the analysis / synthesis stages.
+pub const DFN3_FFT: usize = 960;
+/// Hop size (50 % overlap).
+pub const DFN3_HOP: usize = 480;
+/// Minimum frequency bins per ERB band (matches `df_state` defaults).
+pub const MIN_NB_FREQS: usize = 2;
+/// EMA factor for the ERB / unit-norm states (matches Python
+/// `get_norm_alpha(False)` after model load).
+pub const NORM_ALPHA: f32 = 0.99;
 
 /// Required STFT frame count per inference call. See module docs.
 pub const FRAMES_PER_CHUNK: usize = 102;
@@ -51,6 +69,8 @@ pub const N_FREQ: usize = 481;
 pub const NB_DF: usize = 96;
 /// Number of ERB filterbank bands.
 pub const N_ERB: usize = 32;
+/// Audio samples consumed / produced by one chunk.
+pub const SAMPLES_PER_CHUNK: usize = FRAMES_PER_CHUNK * DFN3_HOP;
 
 /// DFN3 ONNX inference wrapper.
 pub struct Dfn3 {
@@ -126,6 +146,136 @@ impl Dfn3 {
             });
         }
         Ok(data.to_vec())
+    }
+}
+
+/// Linear interpolation of a two-value initialiser across `n` bins.
+/// `MEAN_NORM_INIT = [-60, -90]` and `UNIT_NORM_INIT = [0.001, 0.0001]`
+/// are stored as endpoints by `deep_filter`; the live state is the
+/// per-band interpolation between them. Mirrors libdf's binding.
+fn init_state_lerp(init: [f32; 2], n: usize) -> Vec<f32> {
+    #[allow(clippy::cast_precision_loss)]
+    if n <= 1 {
+        return vec![init[0]; n];
+    }
+    (0..n)
+        .map(|i| init[0] + (init[1] - init[0]) * (i as f32) / ((n as f32) - 1.0))
+        .collect()
+}
+
+/// End-to-end DFN3 pipeline: 48 kHz audio in → 48 kHz audio out.
+///
+/// Wraps:
+///
+/// * `deep_filter::DFState` for STFT / iSTFT and ERB filterbank widths
+/// * the [`Dfn3`] ONNX wrapper for the neural step
+/// * EMA state for `band_mean_norm_erb` (32 bins) and
+///   `band_unit_norm` (`NB_DF` bins)
+///
+/// Single-chunk only for now: callers hand in a buffer at most
+/// [`SAMPLES_PER_CHUNK`] long (zero-padded internally) and get a fresh
+/// buffer back of the same length. Streaming multi-chunk support
+/// follows in a later PR once the state carry-over semantics across
+/// chunk boundaries are tested.
+pub struct Dfn3Pipeline {
+    dfstate: DFState,
+    net: Dfn3,
+    erb_widths: Vec<usize>,
+    erb_norm_state: Vec<f32>,
+    df_norm_state: Vec<f32>,
+    norm_alpha: f32,
+}
+
+impl Dfn3Pipeline {
+    /// Build a pipeline that loads the patched DFN3 ONNX from `path`.
+    ///
+    /// # Errors
+    /// Returns [`EmbeddingError::Ort`] when the ONNX is missing or
+    /// rejected by the ort runtime.
+    pub fn from_onnx_path(path: impl AsRef<Path>) -> Result<Self, EmbeddingError> {
+        let dfstate = DFState::new(DFN3_SR, DFN3_FFT, DFN3_HOP, N_ERB, MIN_NB_FREQS);
+        let erb_widths = dfstate.erb.clone();
+        let net = Dfn3::from_onnx_path(path)?;
+        Ok(Self {
+            dfstate,
+            net,
+            erb_widths,
+            erb_norm_state: init_state_lerp(MEAN_NORM_INIT, N_ERB),
+            df_norm_state: init_state_lerp(UNIT_NORM_INIT, NB_DF),
+            norm_alpha: NORM_ALPHA,
+        })
+    }
+
+    /// Reset the STFT memory + EMA states. Call between independent
+    /// recordings; not needed between consecutive frames of the same
+    /// recording.
+    pub fn reset(&mut self) {
+        self.dfstate.reset();
+        self.erb_norm_state = init_state_lerp(MEAN_NORM_INIT, N_ERB);
+        self.df_norm_state = init_state_lerp(UNIT_NORM_INIT, NB_DF);
+    }
+
+    /// Enhance `audio` (≤ [`SAMPLES_PER_CHUNK`] samples @ 48 kHz mono).
+    /// Returns a buffer of exactly [`SAMPLES_PER_CHUNK`] samples.
+    ///
+    /// # Errors
+    /// Forwards [`EmbeddingError`] from the underlying ONNX call.
+    pub fn process(&mut self, audio: &[f32]) -> Result<Vec<f32>, EmbeddingError> {
+        let mut padded = vec![0.0_f32; SAMPLES_PER_CHUNK];
+        let copy_len = audio.len().min(SAMPLES_PER_CHUNK);
+        padded[..copy_len].copy_from_slice(&audio[..copy_len]);
+
+        let mut spec_buf = vec![0.0_f32; FRAMES_PER_CHUNK * N_FREQ * 2];
+        let mut erb_buf = vec![0.0_f32; FRAMES_PER_CHUNK * N_ERB];
+        let mut df_spec_buf = vec![0.0_f32; FRAMES_PER_CHUNK * NB_DF * 2];
+
+        let mut spec_frame = vec![Complex32::new(0.0, 0.0); N_FREQ];
+        let mut band_pow = vec![0.0_f32; N_ERB];
+
+        for i in 0..FRAMES_PER_CHUNK {
+            let start = i * DFN3_HOP;
+            let audio_frame = &padded[start..start + DFN3_HOP];
+            self.dfstate.analysis(audio_frame, &mut spec_frame);
+
+            for (k, &c) in spec_frame.iter().enumerate() {
+                spec_buf[(i * N_FREQ + k) * 2] = c.re;
+                spec_buf[(i * N_FREQ + k) * 2 + 1] = c.im;
+            }
+
+            compute_band_corr(&mut band_pow, &spec_frame, &spec_frame, &self.erb_widths);
+            for b in &mut band_pow {
+                *b = 10.0 * (1e-10_f32 + *b).log10();
+            }
+            band_mean_norm_erb(&mut band_pow, &mut self.erb_norm_state, self.norm_alpha);
+            for (k, &p) in band_pow.iter().enumerate() {
+                erb_buf[i * N_ERB + k] = p;
+            }
+
+            let mut df_spec_frame: Vec<Complex32> = spec_frame[..NB_DF].to_vec();
+            band_unit_norm(&mut df_spec_frame, &mut self.df_norm_state, self.norm_alpha);
+            for (k, &c) in df_spec_frame.iter().enumerate() {
+                df_spec_buf[(i * NB_DF + k) * 2] = c.re;
+                df_spec_buf[(i * NB_DF + k) * 2 + 1] = c.im;
+            }
+        }
+
+        let enhanced_spec = self.net.enhance_spec(&spec_buf, &erb_buf, &df_spec_buf)?;
+
+        let mut out_audio = vec![0.0_f32; SAMPLES_PER_CHUNK];
+        let mut out_frame = vec![0.0_f32; DFN3_HOP];
+        let mut enh_frame = vec![Complex32::new(0.0, 0.0); N_FREQ];
+        for i in 0..FRAMES_PER_CHUNK {
+            for k in 0..N_FREQ {
+                enh_frame[k] = Complex32::new(
+                    enhanced_spec[(i * N_FREQ + k) * 2],
+                    enhanced_spec[(i * N_FREQ + k) * 2 + 1],
+                );
+            }
+            self.dfstate.synthesis(&mut enh_frame, &mut out_frame);
+            out_audio[i * DFN3_HOP..(i + 1) * DFN3_HOP].copy_from_slice(&out_frame);
+        }
+
+        Ok(out_audio)
     }
 }
 

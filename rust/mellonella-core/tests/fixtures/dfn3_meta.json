@@ -1,0 +1,15 @@
+{
+  "sample_rate": 48000,
+  "n_fft": 960,
+  "hop_size": 480,
+  "n_erb": 32,
+  "nb_df": 96,
+  "frames_per_chunk": 102,
+  "samples_per_chunk": 48960,
+  "input_shape": [
+    48960
+  ],
+  "expected_audio_shape": [
+    48960
+  ]
+}
