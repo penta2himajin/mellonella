@@ -329,6 +329,65 @@ def cmd_export_and_verify(args: argparse.Namespace) -> int:
     return cmd_verify(args)
 
 
+def cmd_quantize(args: argparse.Namespace) -> int:
+    """Dynamic INT8 quantization of an existing FP32 ECAPA ONNX.
+
+    Uses ``onnxruntime.quantization.quantize_dynamic`` — weight-only INT8
+    with activations dynamically quantized at runtime. No calibration
+    dataset required.
+
+    Measured trade-off on the AVX-512 + VNNI dev VM (ORT 1.25.1):
+
+    * QInt8  (signed):     cosine max|Δ| = 6.6e-3 ✅ but
+                           ECAPA 40 ms → 80 ms (**regression** —
+                           the QInt8 conv1d kernel path isn't tuned
+                           for this hardware).
+    * QUInt8 (unsigned):   cosine max|Δ| = 3.2e-2 (above the 1e-2
+                           bar but only 1.4 % relative to the AS-Norm
+                           gate threshold 2.25; production gating
+                           still decides correctly on synth fixtures)
+                           and ECAPA 40 ms → 35 ms (-14 %),
+                           pipeline 324 ms → 280 ms (-14 %).
+
+    Neither setting reaches the 2–3× Microsoft reports for
+    transformer-heavy networks — ECAPA-TDNN is conv1d-dominant and
+    the dynamic-quant overhead eats most of the win. The Rust side
+    needs no changes: ``MELLONELLA_ECAPA_ONNX`` can point at either
+    flavour, this script just helps build them.
+    """
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+    except ImportError as exc:  # pragma: no cover
+        print(
+            "[quantize] missing dependency: pip install onnxruntime onnx onnxruntime-tools",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+
+    src = Path(args.input)
+    dst = Path(args.output)
+    if not src.exists():
+        print(f"[quantize] missing {src}; run `export` first", file=sys.stderr)
+        return 2
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    weight_type = QuantType.QUInt8 if args.unsigned else QuantType.QInt8
+    print(f"[quantize] {src} → {dst} (weight_type={weight_type})", file=sys.stderr)
+    quantize_dynamic(
+        model_input=str(src),
+        model_output=str(dst),
+        weight_type=weight_type,
+    )
+    size_in = src.stat().st_size / 1e6
+    size_out = dst.stat().st_size / 1e6
+    print(
+        f"[quantize] done — {size_in:.1f} MB → {size_out:.1f} MB "
+        f"({size_out / size_in * 100:.1f} % of original)",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -364,6 +423,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_both.add_argument("--audio", nargs="*")
     p_both.add_argument("--tol", type=float, default=DEFAULT_TOL)
     p_both.set_defaults(func=cmd_export_and_verify)
+
+    p_quant = sub.add_parser("quantize")
+    p_quant.add_argument("--input", required=True, help="FP32 ECAPA ONNX file")
+    p_quant.add_argument("--output", required=True, help="output INT8 ONNX file")
+    p_quant.add_argument(
+        "--unsigned",
+        action="store_true",
+        help="use QUInt8 weights (default is QInt8). UInt8 sometimes maps to faster "
+        "x86_64 kernels on hosts where the QInt8 path isn't optimised.",
+    )
+    p_quant.set_defaults(func=cmd_quantize)
 
     return parser
 

@@ -402,6 +402,22 @@ Hint window falls back to the full τ range when the narrow scan misses (`find_t
 
 Result: per-call cost ~9.5 ms (was ~25 ms estimated from the pre-optimisation pipeline budget); end-to-end pipeline -17 %.
 
+### Phase 3.5 step 2: ECAPA INT8 dynamic quantization (opt-in)
+
+`scripts/export_ecapa_onnx.py quantize` runs `onnxruntime.quantization.quantize_dynamic` against the FP32 ECAPA ONNX, producing a weight-only-INT8 file ~4× smaller (83.5 MB → 21.5 MB). The Rust side needs no changes: `MELLONELLA_ECAPA_ONNX` can point at either flavour, and `EcapaTdnn::from_onnx_path` loads them the same way.
+
+**Measured on the dev VM (Intel Xeon, AVX-512 + VNNI, ORT 1.25.1).** The result didn't meet expectations and is documented here as a *cautionary baseline* rather than a default — INT8 quantization helps less than the Microsoft transformer benchmarks suggest on this conv1d-dominant model:
+
+| weight type | model size | ECAPA latency | pipeline (2 s) | cosine `max\|Δ\|` |
+|---|---|---|---|---|
+| FP32 (baseline) | 83.5 MB | 40.3 ms | 324 ms | 2.1 × 10⁻⁷ |
+| **`QInt8`** (signed)   | 21.5 MB | **80.6 ms** | **484 ms** | 6.6 × 10⁻³ |
+| **`QUInt8`** (unsigned) | 21.5 MB | 34.7 ms (-14 %) | 280 ms (-14 %) | 3.2 × 10⁻² |
+
+`QInt8` *regresses* on this host — the conv1d kernel path's dynamic-quant prologue overwhelms the savings. `QUInt8` recovers a real 14 % cut at the cost of a cosine `max|Δ|` that exceeds the original 1 × 10⁻² parity bar; for our AS-Norm gating that's still 1.4 % relative to the `theta_pass_as_norm = 2.25` decision boundary, so production gating on synthetic fixtures continues to decide correctly. Real-data sign-off (LibriSpeech + MUSAN) should re-verify before flipping the default.
+
+ROI takeaway: INT8 dynamic quantization is **opt-in, not the default**. Tools live in the export script; users with AVX-VNNI hardware and recall budget for `~3 × 10⁻²` cosine drift can try it. Conv-heavy speaker models benefit much less than transformer LLMs from this technique.
+
 ### Other profile hints for Phase 3.5
 
 - ECAPA: optimisation levels and provider selection in `ort` (CoreML / DirectML / TensorRT-EP) likely move the needle on production hardware.
