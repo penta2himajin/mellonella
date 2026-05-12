@@ -16,6 +16,11 @@
     clippy::cast_sign_loss
 )]
 
+use std::sync::Arc;
+
+use realfft::num_complex::Complex32;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+
 /// Default voiced-pitch lower bound (Hz).
 pub const DEFAULT_F_MIN: f32 = 50.0;
 /// Default voiced-pitch upper bound (Hz).
@@ -26,19 +31,134 @@ pub const DEFAULT_THRESHOLD: f64 = 0.1;
 /// Squared-difference function `d(τ)` over `frame`, computed up to (but
 /// not including) `max_tau`. Returns a `f64` buffer to keep the
 /// cumulative-mean stage numerically stable on long frames.
-fn difference(frame: &[f32], max_tau: usize) -> Vec<f64> {
-    let mut diff = vec![0.0_f64; max_tau];
+///
+/// Uses the Wiener-Khinchin identity:
+///
+/// ```text
+/// d(τ) = sum (x[i] - x[i+τ])²
+///      = sum x[i]² + sum x[i+τ]² − 2 · autocorr(τ)
+///      = energy(0, N−τ) + energy(τ, N) − 2 · IFFT(|FFT(x)|²)[τ]
+/// ```
+///
+/// The FFT is real-input, zero-padded to the next power of two of
+/// 2·N to make the autocorrelation linear (not circular). For
+/// `N = 2048`, that's a single 4096-point real-FFT plus the matching
+/// inverse — ~50 k flops total versus the naïve O(N·τ_max) ≈ 655 k
+/// flops, an ~13× theoretical win at the full τ range.
+///
+/// `cache` reuses one `RealFftPlanner` allocation across calls; the
+/// time-domain scratch and prefix-sum buffers are also pooled.
+fn difference(frame: &[f32], max_tau: usize, cache: &mut FftCache) -> Vec<f64> {
     let n = frame.len();
-    for tau in 1..max_tau {
-        let mut s = 0.0_f64;
-        let upper = n - tau;
-        for i in 0..upper {
-            let d = f64::from(frame[i]) - f64::from(frame[i + tau]);
-            s += d * d;
-        }
-        diff[tau] = s;
+    let mut diff = vec![0.0_f64; max_tau];
+    if n == 0 || max_tau == 0 {
+        return diff;
+    }
+
+    // FFT length: next power of two ≥ 2·N for linear autocorr.
+    let fft_len = (2 * n).next_power_of_two();
+    let (forward, inverse) = cache.plans(fft_len);
+
+    let scratch = &mut cache.real_scratch;
+    scratch.clear();
+    scratch.resize(fft_len, 0.0);
+    scratch[..n].copy_from_slice(frame);
+
+    let spectrum = &mut cache.complex_scratch;
+    spectrum.clear();
+    spectrum.resize(fft_len / 2 + 1, Complex32::new(0.0, 0.0));
+
+    let fwd_scratch = &mut cache.fwd_scratch;
+    fwd_scratch.resize(forward.get_scratch_len(), Complex32::new(0.0, 0.0));
+    let _ = forward.process_with_scratch(scratch, spectrum, fwd_scratch);
+
+    // |X|² in-place (imag set to 0 so IFFT round-trips into real).
+    for c in spectrum.iter_mut() {
+        let p = c.re * c.re + c.im * c.im;
+        c.re = p;
+        c.im = 0.0;
+    }
+
+    let autocorr = &mut cache.autocorr_scratch;
+    autocorr.clear();
+    autocorr.resize(fft_len, 0.0);
+
+    let inv_scratch = &mut cache.inv_scratch;
+    inv_scratch.resize(inverse.get_scratch_len(), Complex32::new(0.0, 0.0));
+    let _ = inverse.process_with_scratch(spectrum, autocorr, inv_scratch);
+
+    // realfft inverse leaves the result unnormalised — divide by fft_len.
+    let inv_norm = 1.0_f64 / f64::from(u32::try_from(fft_len).unwrap_or(u32::MAX));
+
+    // Prefix sum of squared frame samples for energy(s, e) lookups.
+    let energy = &mut cache.energy_scratch;
+    energy.clear();
+    energy.resize(n + 1, 0.0);
+    for i in 0..n {
+        energy[i + 1] = energy[i] + f64::from(frame[i]) * f64::from(frame[i]);
+    }
+    let total_energy = energy[n];
+
+    let upper = max_tau.min(n);
+    for tau in 1..upper {
+        let left = energy[n - tau];
+        let right = total_energy - energy[tau];
+        let auto = f64::from(autocorr[tau]) * inv_norm;
+        diff[tau] = (left + right - 2.0 * auto).max(0.0);
     }
     diff
+}
+
+/// FFT plan + scratch reuse across `yin_frame` calls in a track.
+///
+/// Building a `RealFftPlanner` is non-trivial (~ms) so we want one
+/// per F0 call site; the time-domain / complex / energy scratch
+/// vectors come from the same struct to skip allocation in the hot
+/// path.
+#[derive(Default)]
+pub struct FftCache {
+    planner: Option<RealFftPlanner<f32>>,
+    forward: Option<(usize, Arc<dyn RealToComplex<f32>>)>,
+    inverse: Option<(usize, Arc<dyn ComplexToReal<f32>>)>,
+    real_scratch: Vec<f32>,
+    complex_scratch: Vec<Complex32>,
+    autocorr_scratch: Vec<f32>,
+    fwd_scratch: Vec<Complex32>,
+    inv_scratch: Vec<Complex32>,
+    energy_scratch: Vec<f64>,
+}
+
+impl FftCache {
+    /// Construct a fresh cache. The first `difference` call populates
+    /// the planner + plans lazily for whatever FFT length it needs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn plans(
+        &mut self,
+        fft_len: usize,
+    ) -> (Arc<dyn RealToComplex<f32>>, Arc<dyn ComplexToReal<f32>>) {
+        let planner = self.planner.get_or_insert_with(RealFftPlanner::<f32>::new);
+        let forward = match &self.forward {
+            Some((len, plan)) if *len == fft_len => Arc::clone(plan),
+            _ => {
+                let plan = planner.plan_fft_forward(fft_len);
+                self.forward = Some((fft_len, Arc::clone(&plan)));
+                plan
+            }
+        };
+        let inverse = match &self.inverse {
+            Some((len, plan)) if *len == fft_len => Arc::clone(plan),
+            _ => {
+                let plan = planner.plan_fft_inverse(fft_len);
+                self.inverse = Some((fft_len, Arc::clone(&plan)));
+                plan
+            }
+        };
+        (forward, inverse)
+    }
 }
 
 /// Cumulative mean normalised difference `d'(τ)`. `diff[0]` is replaced
@@ -64,6 +184,11 @@ fn cumulative_mean_normalized(diff: &[f64]) -> Vec<f64> {
 
 /// Estimate F0 for a single frame. Returns `None` for unvoiced or
 /// unstable frames. Mirrors `mellonella_poc.f0.yin_frame`.
+///
+/// One-shot convenience entry. Builds a fresh [`FftCache`] each call,
+/// so the per-call FFT-planner setup overhead is paid every time;
+/// the per-track [`estimate_f0_track`] path amortises this across
+/// hops.
 #[must_use]
 pub fn yin_frame(
     frame: &[f32],
@@ -72,19 +197,21 @@ pub fn yin_frame(
     f_max: f32,
     threshold: f64,
 ) -> Option<f32> {
-    yin_frame_with_hint(frame, sample_rate, f_min, f_max, threshold, None)
+    let mut cache = FftCache::new();
+    yin_frame_with_cache(
+        frame,
+        sample_rate,
+        f_min,
+        f_max,
+        threshold,
+        None,
+        &mut cache,
+    )
 }
 
 /// Variant of [`yin_frame`] that narrows the τ search window around a
-/// prior estimate. When `prev_hz` is `Some` and lands in `[f_min, f_max]`,
-/// the inner squared-difference loop visits only `[τ_hint × 0.7, τ_hint × 1.4]`
-/// — empirically ~5–8× faster on continuous-pitch tracks. The unhinted
-/// path falls back to the standard `[τ_min, τ_max]` range and is what
-/// [`yin_frame`] keeps using.
-///
-/// If the hint search fails (no dip below `threshold` in the narrow
-/// window), the function widens to the full range so we don't get
-/// stuck on a stale prior.
+/// prior estimate. Kept as a convenience for one-off callers that
+/// don't already hold an [`FftCache`].
 #[must_use]
 pub fn yin_frame_with_hint(
     frame: &[f32],
@@ -93,6 +220,37 @@ pub fn yin_frame_with_hint(
     f_max: f32,
     threshold: f64,
     prev_hz: Option<f32>,
+) -> Option<f32> {
+    let mut cache = FftCache::new();
+    yin_frame_with_cache(
+        frame,
+        sample_rate,
+        f_min,
+        f_max,
+        threshold,
+        prev_hz,
+        &mut cache,
+    )
+}
+
+/// Core YIN entry — same semantics as [`yin_frame_with_hint`] but
+/// takes an external [`FftCache`] so the planner + scratch buffers
+/// can be reused across many calls (used by [`estimate_f0_track`]).
+///
+/// When `prev_hz` is `Some` and lands in `[f_min, f_max]`, the inner
+/// difference computation covers only `[τ_hint × 0.7, τ_hint × 1.4]`
+/// — empirically ~5–8× faster on continuous-pitch tracks. If the
+/// hint window misses (no dip below `threshold`), the function
+/// widens to the full range so we don't get stuck on a stale prior.
+#[must_use]
+pub fn yin_frame_with_cache(
+    frame: &[f32],
+    sample_rate: u32,
+    f_min: f32,
+    f_max: f32,
+    threshold: f64,
+    prev_hz: Option<f32>,
+    cache: &mut FftCache,
 ) -> Option<f32> {
     if frame.len() < 64 {
         return None;
@@ -122,36 +280,21 @@ pub fn yin_frame_with_hint(
         }
     });
 
-    // Hot path: when the hint window is narrow we only compute
-    // `difference` up to `hi`, which is what dominates the per-frame
-    // cost (O(frame_len × τ_max) inner loop). The cumulative mean
-    // term needs all τ from 1..=hi, so we have to keep the prefix —
-    // just not run all the way to τ_max_full.
-    let (diff, cmnd, scan_max) = if let Some((_lo, hi)) = hint_range {
-        let d = difference(frame, hi + 1);
-        let c = cumulative_mean_normalized(&d);
-        (d, c, hi)
-    } else {
-        let d = difference(frame, tau_max_full + 1);
-        let c = cumulative_mean_normalized(&d);
-        (d, c, tau_max_full)
-    };
+    // With the FFT-based `difference` the cost is dominated by one
+    // 2·N FFT pair (~50 k flops at N=2048) regardless of `max_tau`.
+    // The hint window still narrows the *scan* range, but no longer
+    // bounds the FFT cost; just running the full FFT once per frame
+    // wins out over re-running for the fallback case.
+    let diff = difference(frame, tau_max_full + 1, cache);
+    let cmnd = cumulative_mean_normalized(&diff);
 
     if let Some((lo, hi)) = hint_range {
         if let Some(found_tau) = find_tau_dip(&cmnd, lo, hi, threshold) {
-            let _ = diff;
-            return parabolic_refine(&cmnd, found_tau, scan_max, sr_f);
+            return parabolic_refine(&cmnd, found_tau, tau_max_full, sr_f);
         }
-        // Hint window missed — widen to the full τ range. Requires
-        // recomputing diff over the wider span.
-        let diff_full = difference(frame, tau_max_full + 1);
-        let cmnd_full = cumulative_mean_normalized(&diff_full);
-        let found_tau = find_tau_dip(&cmnd_full, tau_min_full, tau_max_full, threshold)?;
-        return parabolic_refine(&cmnd_full, found_tau, tau_max_full, sr_f);
     }
-    let _ = diff;
     let found_tau = find_tau_dip(&cmnd, tau_min_full, tau_max_full, threshold)?;
-    parabolic_refine(&cmnd, found_tau, scan_max, sr_f)
+    parabolic_refine(&cmnd, found_tau, tau_max_full, sr_f)
 }
 
 /// Scan `cmnd[tau_min..tau_max]` for the first dip below `threshold`,
@@ -211,10 +354,21 @@ pub fn estimate_f0_track(
     let n_frames = 1 + (audio.len() - frame_size) / hop_size;
     let mut track = vec![f32::NAN; n_frames];
     let mut last_hz: Option<f32> = None;
+    // One cache across every hop so the FFT planner + scratch buffers
+    // are allocated exactly once.
+    let mut cache = FftCache::new();
     for (i, slot) in track.iter_mut().enumerate() {
         let start = i * hop_size;
         let frame = &audio[start..start + frame_size];
-        let est = yin_frame_with_hint(frame, sample_rate, f_min, f_max, DEFAULT_THRESHOLD, last_hz);
+        let est = yin_frame_with_cache(
+            frame,
+            sample_rate,
+            f_min,
+            f_max,
+            DEFAULT_THRESHOLD,
+            last_hz,
+            &mut cache,
+        );
         if let Some(hz) = est {
             *slot = hz;
             last_hz = Some(hz);

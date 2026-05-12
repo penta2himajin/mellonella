@@ -381,8 +381,8 @@ Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` prof
 | `SileroVad::score` | 32 ms chunk @ 16 kHz | **179 µs** | ~179× |
 | `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **40.3 ms** | ~25× |
 | `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **29.7 ms** | ~34× |
-| `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **9.5 ms** | ~105× |
-| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **147 ms** | ~13.6× |
+| `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **879 µs** | ~1140× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **131 ms** | ~15.3× |
 
 Pipeline RTF trajectory:
 
@@ -391,7 +391,8 @@ Pipeline RTF trajectory:
 | Phase 3 closeout (step 17) | 389 ms | 5.1× | bench baseline |
 | Phase 3.5 step 1 | 324 ms | 6.2× | YIN F0 τ-window pruning |
 | Phase 3.5 step 3 | 170 ms | 11.8× | sv_update_samples 4000 → 8000 |
-| Phase 3.5 step 4 | **147 ms** | **13.6×** | tier-1 micro-optims: ring buffer, no-alloc cos_sim_max, ort thread pinning |
+| Phase 3.5 step 4 | 147 ms | 13.6× | tier-1 micro-optims: ring buffer, no-alloc cos_sim_max, ort thread pinning |
+| Phase 3.5 step 5 | **131 ms** | **15.3×** | YIN difference via Wiener-Khinchin FFT autocorr (track 9.5 ms → 879 µs, -90.8 %) |
 
 Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). Step 4 below pushed below that further. INT8 quantization (step 2) stays opt-in.
 
@@ -459,6 +460,27 @@ Three independent micro-optimisations identified by combined code inspection + w
 | isolated ECAPA | 40.3 ms | 61 ms | +52 % (regression) |
 
 The isolated-ECAPA regression is real and informative: the thread pin makes a single-call ECAPA *slower* on a quiet 2-vCPU VM where ORT's default unpinned execution could otherwise saturate both vCPUs. But inside `process_offline` ECAPA shares the runtime with VAD-per-frame inference, and the contention removal wins overall (DFN3 also benefits). For deployment on machines that don't run anything else next to mellonella, set `MELLONELLA_ORT_INTRA_THREADS` to the physical core count to restore the per-call ECAPA speed.
+
+### Phase 3.5 step 5: YIN difference via Wiener-Khinchin FFT autocorrelation
+
+Replaces the O(N · τ_max) time-domain squared-difference loop with the FFT-based identity
+
+```text
+d(τ) = energy(0, N−τ) + energy(τ, N) − 2 · IFFT(|FFT(x)|²)[τ]
+```
+
+`mellonella_core::f0::FftCache` holds one `RealFftPlanner` plus pooled scratch (`real_scratch`, `complex_scratch`, `autocorr_scratch`, `fwd_scratch`, `inv_scratch`, `energy_scratch`) so the planner build + buffer allocs happen exactly once per F0 call site. `estimate_f0_track` threads one cache across every hop in the track.
+
+Bench shift (1 s of 200 Hz harmonic stack @ 16 kHz, frame_size=2048 / hop=512, 28 hops):
+
+| stage | step 4 | step 5 | delta |
+|---|---|---|---|
+| `estimate_f0_track` | 9.5 ms | **879 µs** | **-90.8 %** |
+| `process_offline` (2 s) | 147 ms | **131 ms** | **-11.4 %** |
+
+The FFT win on the isolated bench (~11×) doesn't fully translate to pipeline because each refresh only runs one track (28 hops), and ECAPA + ort dominate the wall time. Still a clear absolute saving.
+
+τ-window pruning from step 1 stays in place — the FFT computes the full autocorrelation in one shot, but the *scan* of the cumulative-mean curve still narrows around the prior estimate first, falling back to the wide range if the hint window misses. 10 F0 unit tests + 5 integration parity tests still pass (pure-tone recovery at 120/220/330 Hz, white-noise rejection, constant-pitch track recovery).
 
 ### Other profile hints for Phase 3.5
 
