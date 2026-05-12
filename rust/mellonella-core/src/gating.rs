@@ -68,6 +68,31 @@ pub fn cos_sim_max<V: AsRef<[f32]>>(emb: &[f32], pool: &[V]) -> f32 {
     }
 }
 
+/// Iterator variant of [`cos_sim_max`]. Lets the caller chain
+/// anchors + auto_learn without allocating a temporary `Vec` per call
+/// (the offline pipeline refreshes embeddings 2-4× per second so the
+/// alloc would otherwise show up in profiles).
+#[must_use]
+pub fn cos_sim_max_iter<'a, I>(emb: &[f32], pool: I) -> f32
+where
+    I: IntoIterator<Item = &'a [f32]>,
+{
+    let mut best = 0.0f32;
+    let mut found = false;
+    for ref_vec in pool {
+        found = true;
+        let s = cos_similarity(emb, ref_vec);
+        if s > best {
+            best = s;
+        }
+    }
+    if found {
+        best
+    } else {
+        0.0
+    }
+}
+
 /// Gaussian fit of `f0_mean` against the enrollment F0 distribution.
 /// Returns `1.0` (neutral) when `sigma <= 0` or `f0_mean` is non-finite,
 /// matching the Python implementation.
