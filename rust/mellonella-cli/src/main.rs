@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use mellonella_core::dfn3::{Dfn3Pipeline, DFN3_SR, SAMPLES_PER_CHUNK};
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
@@ -74,6 +75,11 @@ struct EnrollArgs {
     input: PathBuf,
     /// Output enrollment JSON.
     output: PathBuf,
+    /// Run DFN3 noise suppression on the input before enrolling. Requires
+    /// `MELLONELLA_DFN3_ONNX`. Input is processed at 48 kHz one chunk
+    /// (≤ 1.02 s) at a time, then resampled to 16 kHz for ECAPA.
+    #[arg(long)]
+    enable_dfn3: bool,
 }
 
 #[derive(Args, Debug)]
@@ -85,6 +91,10 @@ struct ProcessArgs {
     enrollment: PathBuf,
     /// Output WAV (will be 16-bit, 16 kHz, mono).
     output: PathBuf,
+    /// Run DFN3 noise suppression on the input before gating. See
+    /// `EnrollArgs::enable_dfn3`.
+    #[arg(long)]
+    enable_dfn3: bool,
 }
 
 #[derive(Debug)]
@@ -120,7 +130,36 @@ impl From<hound::Error> for CliError {
     }
 }
 
-fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, CliError> {
+/// Run DFN3 chunk-by-chunk over `audio_48k`, concatenating each chunk's
+/// output. Audio shorter than one chunk gets a single chunk zero-pad;
+/// longer audio is split into back-to-back chunks without overlap (the
+/// streaming-overlap model lands in a later PR).
+fn apply_dfn3(audio_48k: &[f32]) -> Result<Vec<f32>, CliError> {
+    let onnx_path = env_path("MELLONELLA_DFN3_ONNX")?;
+    let mut pipeline = Dfn3Pipeline::from_onnx_path(&onnx_path)
+        .map_err(|e| CliError::Pipeline(format!("DFN3 load: {e}")))?;
+    let mut enhanced = Vec::with_capacity(audio_48k.len());
+    let mut start = 0_usize;
+    while start < audio_48k.len() {
+        let end = (start + SAMPLES_PER_CHUNK).min(audio_48k.len());
+        let chunk = &audio_48k[start..end];
+        let out = pipeline
+            .process(chunk)
+            .map_err(|e| CliError::Pipeline(format!("DFN3 process: {e}")))?;
+        enhanced.extend_from_slice(&out[..end - start]);
+        start = end;
+    }
+    if audio_48k.is_empty() {
+        return Ok(Vec::new());
+    }
+    eprintln!(
+        "[info] DFN3 noise suppression applied ({} samples @ 48 kHz)",
+        enhanced.len()
+    );
+    Ok(enhanced)
+}
+
+fn read_wav_to_16k_mono(path: &Path, enable_dfn3: bool) -> Result<Vec<f32>, CliError> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     if spec.channels != 1 {
@@ -140,15 +179,36 @@ fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, CliError> {
         .samples::<i16>()
         .map(|s| s.map(|v| f32::from(v) * scale))
         .collect();
-    let samples = samples?;
-    if spec.sample_rate == REQUIRED_SAMPLE_RATE {
+    let mut samples = samples?;
+    let mut current_sr = spec.sample_rate;
+
+    if enable_dfn3 {
+        // DFN3 operates at 48 kHz natively.
+        if current_sr != DFN3_SR as u32 {
+            let to_48k = resample_to(&samples, current_sr, DFN3_SR as u32).map_err(|e| {
+                CliError::Pipeline(format!("resample {current_sr}→{DFN3_SR} Hz for DFN3: {e}"))
+            })?;
+            eprintln!(
+                "[info] resampled {} Hz → {} Hz for DFN3 ({} → {} samples)",
+                current_sr,
+                DFN3_SR,
+                samples.len(),
+                to_48k.len()
+            );
+            samples = to_48k;
+            current_sr = DFN3_SR as u32;
+        }
+        samples = apply_dfn3(&samples)?;
+    }
+
+    if current_sr == REQUIRED_SAMPLE_RATE {
         return Ok(samples);
     }
-    let resampled = resample_to(&samples, spec.sample_rate, REQUIRED_SAMPLE_RATE)
-        .map_err(|e| CliError::Pipeline(format!("resample {}→16000 Hz: {e}", spec.sample_rate)))?;
+    let resampled = resample_to(&samples, current_sr, REQUIRED_SAMPLE_RATE)
+        .map_err(|e| CliError::Pipeline(format!("resample {current_sr}→16000 Hz: {e}")))?;
     eprintln!(
         "[info] resampled {} Hz → {} Hz ({} → {} samples)",
-        spec.sample_rate,
+        current_sr,
         REQUIRED_SAMPLE_RATE,
         samples.len(),
         resampled.len()
@@ -197,7 +257,7 @@ fn build_components() -> Result<PipelineComponents, CliError> {
 }
 
 fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
-    let audio = read_wav_to_16k_mono(&args.input)?;
+    let audio = read_wav_to_16k_mono(&args.input, args.enable_dfn3)?;
     let mut components = build_components()?;
     let pool = enroll_from_recording(&audio, &mut components, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("enroll: {e}")))?;
@@ -215,7 +275,7 @@ fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
 }
 
 fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
-    let audio = read_wav_to_16k_mono(&args.input)?;
+    let audio = read_wav_to_16k_mono(&args.input, args.enable_dfn3)?;
     let mut pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
     let mut components = build_components()?;
@@ -239,11 +299,13 @@ fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
 fn cmd_info() {
     let ecapa = std::env::var("MELLONELLA_ECAPA_ONNX").unwrap_or_else(|_| "<unset>".into());
     let vad = std::env::var("MELLONELLA_VAD_ONNX").unwrap_or_else(|_| "<unset>".into());
+    let dfn3 = std::env::var("MELLONELLA_DFN3_ONNX").unwrap_or_else(|_| "<unset>".into());
     let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| "<unset>".into());
     println!("mellonella-cli");
     println!("  required sample rate : {REQUIRED_SAMPLE_RATE} Hz, mono, 16-bit signed");
     println!("  MELLONELLA_ECAPA_ONNX = {ecapa}");
     println!("  MELLONELLA_VAD_ONNX   = {vad}");
+    println!("  MELLONELLA_DFN3_ONNX  = {dfn3}");
     println!("  ORT_DYLIB_PATH        = {dylib}");
     let cfg = PipelineConfig::default();
     let gate = GateConfig::default();
