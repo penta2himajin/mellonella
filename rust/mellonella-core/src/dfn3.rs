@@ -86,7 +86,10 @@ impl Dfn3 {
     /// error enum so call sites can chain ECAPA / VAD / DFN3 failures
     /// uniformly.
     pub fn from_onnx_path(path: impl AsRef<Path>) -> Result<Self, EmbeddingError> {
-        let session = Session::builder()?.commit_from_file(path)?;
+        let session = Session::builder()?
+            .with_intra_threads(crate::ort_threads::intra_op_threads())?
+            .with_inter_threads(1)?
+            .commit_from_file(path)?;
         Ok(Self { session })
     }
 

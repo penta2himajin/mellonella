@@ -382,7 +382,7 @@ Measured on Linux x86_64 (dev VM, 2-vCPU class), ONNX Runtime 1.25.1, `dev` prof
 | `EcapaTdnn::embed_features` | 100 frames × 80 mels (≈ 1 s speech window) | **40.3 ms** | ~25× |
 | `Dfn3Pipeline::process` | 1 chunk (1.02 s @ 48 kHz) | **29.7 ms** | ~34× |
 | `estimate_f0_track` | 1 s @ 16 kHz (28 hops × 2048 frame) | **9.5 ms** | ~105× |
-| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **170 ms** | ~11.8× |
+| `process_offline` (no DFN3) | 2 s @ 16 kHz, AS-Norm off, auto-learn off | **147 ms** | ~13.6× |
 
 Pipeline RTF trajectory:
 
@@ -390,9 +390,10 @@ Pipeline RTF trajectory:
 |---|---|---|---|
 | Phase 3 closeout (step 17) | 389 ms | 5.1× | bench baseline |
 | Phase 3.5 step 1 | 324 ms | 6.2× | YIN F0 τ-window pruning |
-| Phase 3.5 step 3 | **170 ms** | **11.8×** | sv_update_samples 4000 → 8000 |
+| Phase 3.5 step 3 | 170 ms | 11.8× | sv_update_samples 4000 → 8000 |
+| Phase 3.5 step 4 | **147 ms** | **13.6×** | tier-1 micro-optims: ring buffer, no-alloc cos_sim_max, ort thread pinning |
 
-Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). INT8 quantization (step 2) stays opt-in — see below.
+Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). Step 4 below pushed below that further. INT8 quantization (step 2) stays opt-in.
 
 Interpretation:
 
@@ -440,6 +441,24 @@ ROI takeaway: INT8 dynamic quantization is **opt-in, not the default**. Tools li
 Trade-off: drift response is half as fast — score changes from a different speaker (or sudden anchor mismatch) now take up to ~500 ms to reflect in the gate vs the previous ~250 ms. Hangover (`hangover_ms = 300`) absorbs short transients on the way in; for transitions OFF the worst-case unmute-on-impostor window grows by 250 ms. AS-Norm's cohort-normalised score is still recomputed at the refresh boundary, so steady-state impostor rejection is unchanged.
 
 The `pipeline_parity` integration test pins itself to `sv_update_samples = 4 000` to match the fixture generated under the old default; downstream callers that need the tight cadence override on the live `PipelineConfig`.
+
+### Phase 3.5 step 4: tier-1 pipeline micro-optims
+
+Three independent micro-optimisations identified by combined code inspection + web research:
+
+1. **Ring buffer for the SV speech accumulator.** `process_offline` previously did `speech_buffer.extend_from_slice(frame)` followed by `speech_buffer.drain(..drop)` on every speech frame past the 1-s window, which is O(N) per drain. Swapped to `VecDeque<f32>` with a `pop_front`/`push_back` pair plus a contiguous scratch slice rebuilt once per refresh (Fbank/F0 want `&[f32]`).
+2. **`cos_sim_max_iter` — alloc-free cohort sweep.** The original call chained anchors and auto-learn, but went through `.cloned().collect::<Vec<_>>()` — one Vec allocation + N×192-float copies per refresh. New `cos_sim_max_iter` accepts an iterator of slices so the caller chains directly with `pool.anchors().iter().chain(pool.auto_learn().iter()).map(Vec::as_slice)`.
+3. **ort thread-pool pinning.** `Session::builder()` defaults intra-op and inter-op pools both to `num_cores`, which fights itself on small (≤ 2-vCPU) hosts — every op pool spreads each op across all cores while the inter-op pool also tries to run ops in parallel. New `crate::ort_threads` clamps `intra_op_num_threads` to `min(2, available_parallelism)` and pins `inter_op_num_threads = 1`; override via `MELLONELLA_ORT_INTRA_THREADS` for wider servers. Applied to ECAPA, VAD, and DFN3 sessions uniformly.
+
+| metric | step 3 | step 4 | delta |
+|---|---|---|---|
+| pipeline (2 s) | 170 ms | **147 ms** | **-13.5 %** |
+| RTF | 11.8× | 13.6× | +15 % |
+| VAD per chunk | 179 µs | 180 µs | ~ |
+| DFN3 per chunk | 29.7 ms | **23.4 ms** | -21 % (threading) |
+| isolated ECAPA | 40.3 ms | 61 ms | +52 % (regression) |
+
+The isolated-ECAPA regression is real and informative: the thread pin makes a single-call ECAPA *slower* on a quiet 2-vCPU VM where ORT's default unpinned execution could otherwise saturate both vCPUs. But inside `process_offline` ECAPA shares the runtime with VAD-per-frame inference, and the contention removal wins overall (DFN3 also benefits). For deployment on machines that don't run anything else next to mellonella, set `MELLONELLA_ORT_INTRA_THREADS` to the physical core count to restore the per-call ECAPA speed.
 
 ### Other profile hints for Phase 3.5
 

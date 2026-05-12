@@ -12,6 +12,7 @@ pub mod enrollment;
 pub mod f0;
 pub mod features;
 pub mod gating;
+pub mod ort_threads;
 pub mod pipeline;
 pub mod resample;
 pub mod vad;

@@ -63,7 +63,10 @@ impl SileroVad {
         path: impl AsRef<Path>,
         sample_rate: u32,
     ) -> Result<Self, EmbeddingError> {
-        let session = Session::builder()?.commit_from_file(path)?;
+        let session = Session::builder()?
+            .with_intra_threads(crate::ort_threads::intra_op_threads())?
+            .with_inter_threads(1)?
+            .commit_from_file(path)?;
         let context_len = match sample_rate {
             8_000 => CONTEXT_SAMPLES_8K,
             _ => CONTEXT_SAMPLES_16K,

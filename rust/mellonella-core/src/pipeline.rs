@@ -24,12 +24,14 @@
     clippy::too_many_lines
 )]
 
+use std::collections::VecDeque;
+
 use crate::embedding::{EcapaTdnn, EmbeddingError};
 use crate::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
-    apply_envelope, as_norm_score, cos_sim_max, f0_match, should_admit_auto_learn,
+    apply_envelope, as_norm_score, cos_sim_max_iter, f0_match, should_admit_auto_learn,
     ApplyEnvelopeError, GateConfig, GateState,
 };
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
@@ -201,7 +203,13 @@ pub fn process_offline(
     let sv_sr = pipeline_cfg.sample_rate;
     let dt_ms = pipeline_cfg.vad_frame_ms();
 
-    let mut speech_buffer: Vec<f32> = Vec::with_capacity(pipeline_cfg.sv_window_samples);
+    // Ring buffer for the SV speech accumulator. VecDeque keeps drop-
+    // oldest in O(1) so we don't pay an O(N) Vec::drain shift every
+    // speech frame once the buffer is at capacity.
+    let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
+    // Contiguous staging slice used to feed Fbank / F0 once per refresh.
+    // Allocated once with the window size and reused.
+    let mut sv_window_scratch: Vec<f32> = Vec::with_capacity(pipeline_cfg.sv_window_samples);
     let mut samples_since_update = 0_usize;
     let mut consecutive_speech_ms = 0.0_f32;
     let mut last_score = 0.0_f32;
@@ -224,10 +232,11 @@ pub fn process_offline(
 
         let speech_prob = components.vad.score(frame)?;
         if speech_prob > pipeline_cfg.vad_threshold {
-            speech_buffer.extend_from_slice(frame);
-            if speech_buffer.len() > pipeline_cfg.sv_window_samples {
-                let drop = speech_buffer.len() - pipeline_cfg.sv_window_samples;
-                speech_buffer.drain(..drop);
+            for &sample in frame {
+                if speech_buffer.len() == pipeline_cfg.sv_window_samples {
+                    speech_buffer.pop_front();
+                }
+                speech_buffer.push_back(sample);
             }
             consecutive_speech_ms += dt_ms;
         } else {
@@ -239,7 +248,11 @@ pub fn process_offline(
             && speech_buffer.len() >= pipeline_cfg.sv_window_samples
         {
             samples_since_update = 0;
-            let window = &speech_buffer[speech_buffer.len() - pipeline_cfg.sv_window_samples..];
+            // Copy the ring buffer into a contiguous scratch slice once
+            // per refresh. Fbank / F0 want `&[f32]`.
+            sv_window_scratch.clear();
+            sv_window_scratch.extend(speech_buffer.iter().copied());
+            let window: &[f32] = &sv_window_scratch;
 
             // Fbank → ECAPA → 192-dim embedding.
             let feats = components.fbank.compute(window);
@@ -250,14 +263,14 @@ pub fn process_offline(
                 estimate_f0_track(window, sv_sr, 2048, 512, DEFAULT_F_MIN, DEFAULT_F_MAX);
             let (f0_mu, _) = f0_statistics(&f0_track);
 
-            let cs = cos_sim_max(
+            // Chain anchors + auto_learn as slice references directly —
+            // no Vec allocation per refresh, no Vec<f32> clones.
+            let cs = cos_sim_max_iter(
                 &embedding,
-                &pool
-                    .anchors()
+                pool.anchors()
                     .iter()
                     .chain(pool.auto_learn().iter())
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                    .map(Vec::as_slice),
             );
             let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
             last_cs = cs;

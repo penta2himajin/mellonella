@@ -100,6 +100,15 @@ impl EcapaTdnn {
     pub fn from_onnx_path(path: impl AsRef<Path>) -> Result<Self, EmbeddingError> {
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            // Pin intra-op threads to the physical-core count and
+            // disable inter-op parallelism. The default
+            // (intra=num_cores, inter=num_cores) thrashes on small
+            // 2-vCPU hosts because both pools fight for the same
+            // cores. Single-batch inference doesn't benefit from
+            // inter-op parallelism either — every op runs serially
+            // on the graph anyway.
+            .with_intra_threads(crate::ort_threads::intra_op_threads())?
+            .with_inter_threads(1)?
             .commit_from_file(path)?;
         Ok(Self { session })
     }
