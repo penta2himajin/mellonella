@@ -30,6 +30,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use mellonella_core::dfn3::{Dfn3Pipeline, SAMPLES_PER_CHUNK as DFN3_SAMPLES};
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
+use mellonella_core::f0::{estimate_f0_track, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use mellonella_core::features::{Fbank, N_MELS};
 use mellonella_core::gating::GateConfig;
 use mellonella_core::pipeline::{process_offline, PipelineComponents, PipelineConfig};
@@ -54,6 +55,28 @@ fn env_path(var: &str) -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+fn bench_f0_track(c: &mut Criterion) {
+    // 1 s @ 16 kHz at 200 Hz harmonic stack — what the pipeline calls
+    // estimate_f0_track on after each SV-window refresh.
+    let audio = synth_waveform(16_000, 1.0, 200.0);
+    let mut group = c.benchmark_group("f0");
+    group.throughput(Throughput::Elements(audio.len() as u64));
+    group.bench_function("track_1s_16khz", |b| {
+        b.iter(|| {
+            let track = estimate_f0_track(
+                black_box(&audio),
+                16_000,
+                2048,
+                512,
+                DEFAULT_F_MIN,
+                DEFAULT_F_MAX,
+            );
+            black_box(track);
+        });
+    });
+    group.finish();
 }
 
 fn bench_fbank(c: &mut Criterion) {
@@ -217,6 +240,7 @@ fn bench_pipeline(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_f0_track,
     bench_fbank,
     bench_vad,
     bench_ecapa,
