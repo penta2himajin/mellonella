@@ -322,6 +322,7 @@ dependencies = [
  "deep_filter",
  "ndarray 0.17.2",
  "ort",
+ "realfft",
  "rubato",
  "rustfft",
  "serde",
