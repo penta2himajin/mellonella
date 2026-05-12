@@ -562,3 +562,146 @@ scripts/calibrate_per_language.py and the workflow_dispatch hook stay in main fo
 - Park et al. (2025) "Trainable Adaptive Score Normalization for Automatic Speaker Verification", https://arxiv.org/abs/2504.04512
 - Ferrer et al. (2019) "A Discriminative Condition-Aware Backend for Speaker Verification", https://arxiv.org/abs/1911.11622
 - Klusáček et al. (2025) "On the influence of language similarity in non-target speaker verification trials", https://arxiv.org/abs/2506.02777
+
+## D-011: Phase 3 Rust port — desktop CLI, ONNX runtime, modular crates
+
+### Context
+
+Phase 3 of `docs/implementation.md` calls for a production desktop
+implementation. The Python PoC reached `docs/decisions.md` D-010
+closeout — algorithmically complete but not deployable. Phase 3 spans
+a long horizon (multiple sessions, multiple PRs) and several
+architectural decisions made along the way are stable enough to
+promote here.
+
+Originating workstream: handoff issue #66 (Phase 3: Rust port —
+desktop CLI 先行). Phase 3 step PRs #65 – #86.
+
+### Alternatives considered (per sub-decision)
+
+**A. ML runtime for ECAPA / VAD / DFN3.**
+A1. Pure Rust port of each network (re-implement the ops).
+A2. ONNX Runtime via the `ort` crate.
+A3. `candle` (Hugging Face's Rust ML framework).
+A4. `tract` (Sonos's pure-Rust inference engine).
+
+**B. ECAPA ONNX graph shape.**
+B1. `(audio_16k) → embedding[192]` — single graph including SpeechBrain's
+    `compute_features → mean_var_norm → embedding_model`.
+B2. `(fbank_features) → embedding[192]` — embedding-only graph; the
+    caller computes Fbank in Rust.
+
+**C. DFN3 export approach.**
+C1. Export DFN3 as-is via `torch.onnx.export`.
+C2. Export via `torch.onnx.dynamo_export` (newer compile-based path).
+C3. Monkey-patch DFN3's `df_op` module to functionally-equivalent
+    ONNX-friendly code, then export.
+C4. Run DFN3 in a Python sidecar (subprocess), keep Rust as glue.
+C5. Substitute a simpler NS (RNNoise) in Rust, skip DFN3.
+
+**D. Repo layout for the Rust crates.**
+D1. Top-level `crates/` directory.
+D2. Top-level `rust/` directory with a workspace inside.
+D3. Crates colocated with Python (e.g. `poc/rust/`).
+
+**E. Config-struct shape mirroring Python's `GatingConfig`.**
+E1. Single monolithic `GatingConfig` (like Python).
+E2. Split into focused configs: `EmbeddingPoolConfig` (drift safeguards),
+    `GateConfig` (thresholds + timing), `PipelineConfig` (cadence).
+
+**F. Resampler.**
+F1. `rubato` 2.x (latest, more powerful adapter API).
+F2. `rubato` 0.16 (older single-shot `SincFixedIn`).
+F3. Hand-rolled polyphase to match scipy `resample_poly` byte-for-byte.
+
+### Chosen
+
+- **A2 (ONNX Runtime via `ort`).** Single dependency, all three networks
+  share one runtime, parity with the Python reference is direct.
+- **B2 (embedding-only ECAPA graph).** B1 fails to export under torch
+  2.4: SpeechBrain's STFT returns a complex tensor and
+  `torch.onnx.export` doesn't support `aten::view_as_complex` at
+  opset 17. We could neither side-step the call site nor switch to
+  `dynamo_export` (which hit similar issues). B2 sidesteps the
+  exporter blocker entirely; the Rust caller reproduces Fbank using
+  `rustfft` + a vendored SpeechBrain filterbank matrix.
+- **C3 (monkey-patch `df_op`).** Same complex-tensor + in-place
+  `as_strided` mutation issues. The patched `DfOnnxSafe` module is
+  functionally equivalent (real-valued tensors, `F.pad` with literal
+  amounts, `torch.cat` instead of slice-mutation) and exports
+  cleanly. Parity vs the unpatched model:
+  `enhanced_spec max|Δ| = 1.28 × 10⁻⁹`.
+- **D2 (`rust/` workspace).** Common pattern for Python-primary
+  polyglot repos (Polars, Pydantic). Keeps the Python tree (`poc/`,
+  `bench/`) and the Rust tree (`rust/`) at the same level without
+  visual ambiguity.
+- **E2 (focused configs).** Decoupling auto-learn drift settings from
+  gate-state timing from pipeline cadence makes the caller API
+  clearer and lets each config evolve independently. Mirrors how
+  Python's flat `GatingConfig` would have evolved if we were starting
+  fresh.
+- **F2 (`rubato` 0.16).** The 2.x adapter API is overkill for our
+  one-shot single-channel resample call sites. 0.16's `SincFixedIn`
+  is the simplest interface that gets the job done with windowed-sinc
+  quality. Empirically the per-sample max|Δ| vs scipy's
+  `resample_poly` is ~5 × 10⁻³, and the downstream gate state stays
+  byte-equal because Fbank averages over 80 mel bins.
+
+### Reasons (joint rationale)
+
+- **Mirror the Python reference, don't replace it.** Per-component
+  parity tests (cosine 2 × 10⁻⁷, Fbank 1 mdB, VAD 1 × 10⁻³,
+  pipeline gate state byte-equal, DFN3 audio 1.5 × 10⁻²) catch
+  semantic drift early. Pure-Rust ports would have to re-derive each
+  network's numerical behaviour — substantial maintenance cost.
+- **Stay deployable.** ONNX Runtime ships on every desktop / server
+  platform; the `ort` crate's `load-dynamic` feature lets us point at
+  a system or vendored `libonnxruntime` without bundling. Mobile
+  variants (CoreML, NNAPI) are also accessible from `ort` if Phase 4
+  warrants them.
+- **Keep the Rust API surface obvious.** `mellonella-core` exposes a
+  small, focused module per stage (`embedding`, `features`, `vad`,
+  `dfn3`, `gating`, `enrollment`, `pipeline`, `resample`). Each
+  module owns its config, its error enum, and its parity test.
+
+### Trade-offs
+
+- **ONNX file size and distribution.** ECAPA = 83 MB, DFN3 = 9 MB,
+  silero-vad = 2 MB. Total ~94 MB of vendored model weight that has
+  to ship alongside the binary, or be downloaded at first run. Not
+  small. Native-Rust alternatives (`candle`, `tract`) could in
+  principle ship just code, but their model coverage is incomplete
+  and parity is unverified.
+- **Frame-count rigidity in the DFN3 export.** `tensor.unfold` and
+  downstream convolution layers reject symbolic time dims, so the
+  exported `dfn3.onnx` is locked at 102 frames (≈ 1.02 s @ 48 kHz).
+  Callers process audio in fixed-length chunks rather than streaming
+  arbitrary-length input. Acceptable for offline / batch use; a
+  streaming variant is a follow-up.
+- **`GateConfig` doesn't carry `alpha`/`beta` yet.** Python's
+  `α·cs + β·f0` mixture is a fallback when AS-Norm is disabled; the
+  Rust pipeline uses raw `cos_sim_max` in that path as a placeholder.
+  Production deployments today use AS-Norm (D-010), so this is a
+  paper cut rather than a real gap.
+- **DSP / NN split for DFN3.** The `df` crate (published as
+  `deep_filter` on crates.io with `[lib] name = "df"`) provides
+  STFT / iSTFT / ERB primitives only; the neural part is the ONNX
+  blob. Keeps the Rust binary small but couples us to whatever
+  upstream `df` does with its API.
+
+### Future revisit triggers
+
+- Streaming / real-time path: when Phase 3.5 / 4 needs sub-chunk
+  latency, the DFN3 frame-count rigidity has to be revisited (likely
+  requires re-exporting with `torch.onnx.dynamo_export` once it
+  supports the involved ops, or sliding-window inference in Rust).
+- `α·cs + β·f0` carry-over: when calibration data shows non-AS-Norm
+  recovery for any sub-population we care about.
+- Mobile (Phase 4): may push us toward `tract` or `candle` if `ort`'s
+  mobile back-ends prove finicky.
+
+### References
+
+- handoff issue #66 (Phase 3: Rust port — desktop CLI 先行)
+- Phase 3 step PRs #65, #67-#86 (16 step PRs covering export →
+  workspace → port → integration → CLI)
