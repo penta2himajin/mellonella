@@ -12,9 +12,9 @@
 //!   decision and one entry in `gate_per_frame`.
 //! * The speech buffer accumulates frames whose `speech_prob > 0.5`,
 //!   capped at `sv_window_samples` (1 s @ 16 kHz by default).
-//! * Every `sv_update_samples` (4 000 = 250 ms by default), if the
-//!   buffer is full, an embedding + F0 are recomputed and the gate
-//!   score is updated.
+//! * Every `sv_update_samples` (8 000 = 500 ms by default — Phase 3.5
+//!   step 3 bumped this from 250 ms), if the buffer is full, an
+//!   embedding + F0 are recomputed and the gate score is updated.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -45,8 +45,12 @@ pub struct PipelineConfig {
     /// Window length in samples used to compute speaker embeddings.
     /// Default 16 000 (1 s @ 16 kHz) per `docs/architecture.md`.
     pub sv_window_samples: usize,
-    /// How many samples between embedding refreshes. Default 4 000
-    /// (250 ms @ 16 kHz) per `docs/architecture.md`.
+    /// How many samples between embedding refreshes. Default 8 000
+    /// (500 ms @ 16 kHz). Phase 3.5 step 3 bumped this from the
+    /// original 4 000 (250 ms) to halve the ECAPA refresh cadence,
+    /// which is the pipeline's dominant cost (~50 % of wall time).
+    /// Tighter cadence (lower number) gives faster drift response;
+    /// looser (higher number) saves CPU.
     pub sv_update_samples: usize,
     /// VAD speech-probability threshold above which a frame contributes
     /// to the speech buffer. Default 0.5.
@@ -62,7 +66,7 @@ impl Default for PipelineConfig {
         Self {
             sample_rate: 16_000,
             sv_window_samples: 16_000,
-            sv_update_samples: 4_000,
+            sv_update_samples: 8_000,
             vad_threshold: 0.5,
             enable_auto_learn: true,
         }
