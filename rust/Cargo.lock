@@ -311,6 +311,7 @@ dependencies = [
  "clap",
  "hound",
  "mellonella-core",
+ "serde_json",
 ]
 
 [[package]]

@@ -396,3 +396,24 @@ These numbers establish the **Phase 3 perf baseline** for future regression trac
 - F0 estimation: cache the FFT plan, prune `tau` search space against the previous frame's estimate, or replace YIN with a lighter-weight pitch heuristic when only `f0_match` (not the absolute pitch) is needed.
 - ECAPA: optimisation levels and provider selection in `ort` (CoreML / DirectML / TensorRT-EP) likely move the needle on production hardware.
 - DFN3: single-chunk-only is the current cap; streaming-overlap would amortise the per-chunk model load + state warmup.
+
+## Rust ↔ Python cross-implementation comparison (Phase 3 sign-off)
+
+Beyond per-component parity (cosine 2 × 10⁻⁷, Fbank 1 mdB, VAD 1 × 10⁻³, gate state byte-equal, DFN3 audio 1.5 × 10⁻²), the Rust deliverable is also exercised end-to-end against the Python reference via `scripts/rust_scenario_1.py`. The harness:
+
+1. Builds a synthetic target + noise mixture at fixed SNR
+2. Runs both Python (`mellonella_poc.pipeline.process_offline`) and Rust (`mellonella process` via subprocess, with the new `--gate-decisions` JSON output)
+3. Compares per-VAD-frame gate state, gate duty cycle, audio RMS / peak, and `gate_agreement` (fraction of frames where the two pipelines agree on the binary gate decision)
+
+On the bundled synthetic mixture (3 s @ 16 kHz, 200 Hz harmonic stack target, white noise at SNR = 10 dB), both pipelines emit `gate_agreement = 1.00` over 93 VAD frames. The synth doesn't read as speech to silero-vad at the default `vad_threshold = 0.5`, so both pipelines correctly mute the entire output — a trivial-but-correct agreement.
+
+For non-trivial sign-off, run the harness with real recordings:
+
+```
+ORT_DYLIB_PATH=… MELLONELLA_ECAPA_ONNX=… MELLONELLA_VAD_ONNX=… \
+  python scripts/rust_scenario_1.py  # synth (default)
+# or pass --target / --noise / --enroll arguments once those flags
+# land in a follow-up; for now edit the script's synth_* calls.
+```
+
+Real-data sign-off (scenario 1 LibriSpeech + MUSAN; scenarios 4-6 multilingual / drift) is the obvious Phase 3.5 expansion — the harness pattern transfers directly.

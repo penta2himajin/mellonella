@@ -15,6 +15,7 @@ path = "src/main.rs"
 mellonella-core = { path = "../mellonella-core" }
 clap = { workspace = true }
 hound = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
