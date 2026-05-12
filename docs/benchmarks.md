@@ -393,9 +393,11 @@ Pipeline RTF trajectory:
 | Phase 3.5 step 3 | 170 ms | 11.8× | sv_update_samples 4000 → 8000 |
 | Phase 3.5 step 4 | 147 ms | 13.6× | tier-1 micro-optims: ring buffer, no-alloc cos_sim_max, ort thread pinning |
 | Phase 3.5 step 5 | 131 ms | 15.3× | YIN difference via Wiener-Khinchin FFT autocorr (track 9.5 ms → 879 µs, -90.8 %) |
-| Phase 3.5 step 6 | **103 ms** | **19.5×** | VAD-edge early-refresh trigger (latency-asymmetric; perf delta from compiler optimisation + measurement variance) |
+| Phase 3.5 step 6 | 103 ms | 19.5× | VAD-edge early-refresh trigger (latency-asymmetric; perf delta from compiler optimisation + measurement variance) |
+| Phase 3.5 step 7 (sync) | 101 ms | 19.9× | `lto = "fat"` + `codegen-units = 1` workspace profile (Rust glue and VAD pre/post-processing), minor VAD alloc cleanup |
+| Phase 3.5 step 7 (async) | **97 ms** | **20.6×** | opt-in `async_refresh` — ECAPA / Fbank / F0 run on a scoped worker thread while the VAD loop keeps progressing |
 
-Hit the **200 ms target** at Phase 3.5 step 3 (refresh cadence relaxed from 250 ms to 500 ms). Step 4 below pushed below that further. INT8 quantization (step 2) stays opt-in.
+Hit the **100 ms** sub-second target at Phase 3.5 step 7 (async). The synchronous bench in step 7 also dropped below the previous 103 ms but stays variance-bounded around 100 ms. INT8 quantization (step 2) stays opt-in.
 
 Interpretation:
 
@@ -507,6 +509,28 @@ Bench delta (no behaviour change in always-accept bench; the observed -22 % is m
 | `process_offline` (2 s) | 131 ms | **103 ms** | -21 % (variance-dominant) |
 
 Cumulative trajectory: **389 ms → 103 ms (-73 %), RTF 5.1× → 19.5×**.
+
+### Phase 3.5 step 7: sub-100 ms via fat LTO + async ECAPA worker
+
+Two independent gains, both opt-in at different layers:
+
+1. **Fat LTO + single codegen unit on the bench profile.** New `[profile.release]` / `[profile.bench]` block in `rust/Cargo.toml` sets `lto = "fat"` and `codegen-units = 1`. The wins are mostly on the Rust glue (VAD pre/post-processing, ring-buffer / gate-state updates, channel ops in async mode) — ORT's compiled CPU kernels are unaffected since they live in the shared library. Plus one surgical VAD allocation cleanup: drop the `prepended.clone()` round-trip and copy the new context tail before handing the buffer to ndarray; reuse `Array3::as_slice_mut` for the LSTM state instead of allocating a fresh `Array3` per call.
+
+2. **`PipelineConfig::async_refresh` (opt-in).** When enabled, `process_offline` dispatches each refresh (Fbank → ECAPA → F0) to a `std::thread::scope` worker. The main loop keeps running VAD frames while ECAPA is in flight, so the bench's two refreshes overlap with all 62 VAD chunks instead of blocking the main thread for ~44 ms each. Worker queue depth is 1, so a refresh that fires while the previous one is still running becomes the "pending" slot; refreshes are never dropped, only deferred until the worker drains.
+
+Trade-off for async: `last_score` / `cs` / `fm` update on the main thread when the worker's result arrives, **not** at the refresh-trigger frame. The score lag is roughly one ECAPA wall-time (~44 ms on the dev VM, ~1.4 VAD frames). The gate state's `hangover_ms = 300` smooths over multiples of that delay, so for streaming / real-time callers it's invisible — but `gate_per_frame` / `score_per_frame` differ byte-equally from the sync path. The `pipeline_parity` fixture stays on `async_refresh = false`, preserving its byte-equal contract against the Python reference.
+
+| stage | step 6 | step 7 sync | step 7 async | delta vs step 6 |
+|---|---|---|---|---|
+| `process_offline` (2 s) | 103 ms | 101 ms | **97 ms** | -6 % |
+| RTF | 19.5× | 19.9× | 20.6× | +6 % |
+
+Step 7 lands the cumulative trajectory at **389 ms → 97 ms (-75 %), RTF 5.1× → 20.6×** when using the async path, or 101 ms (RTF 19.9×) in the default sync mode.
+
+Worth re-tuning for other deployments:
+
+- `MELLONELLA_ORT_INTRA_THREADS=N` still wins when running on a dedicated wide CPU; the 4-thread case on a 4-vCPU box regressed (135 ms) under the bench because ECAPA + VAD share the cores and the inter-session threadpool starvation outweighs ECAPA's per-call gain.
+- `panic = "abort"` is intentionally **not** applied — the bench harness `expect`s, and panicking under abort would terminate the criterion driver process.
 
 ### Other profile hints for Phase 3.5
 

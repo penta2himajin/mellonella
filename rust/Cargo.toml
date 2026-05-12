@@ -24,6 +24,14 @@ clap = { version = "4", features = ["derive"] }
 hound = "3"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

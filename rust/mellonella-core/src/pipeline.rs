@@ -77,6 +77,21 @@ pub struct PipelineConfig {
     /// `pipeline_parity` test fixture uses `vad_threshold = -1.0`,
     /// so silence never fires and the trigger stays dormant).
     pub sv_min_new_samples_after_silence: usize,
+    /// When `true`, ECAPA / Fbank / F0 for each refresh are dispatched
+    /// to a worker thread so the VAD main loop can keep running while
+    /// inference is in flight. Default `false` to preserve byte-equiv
+    /// parity against the synchronous Python PoC.
+    ///
+    /// Trade-off: when enabled, the per-frame score `last_score`
+    /// trails the refresh point by one ECAPA inference (~ECAPA wall
+    /// time, e.g. ~44 ms on the dev VM). For streaming / real-time
+    /// callers this is invisible — the gate's `hangover_ms` already
+    /// smooths over multiples of that latency — but it changes
+    /// `gate_per_frame` / `score_per_frame` outputs relative to the
+    /// sync path, so the `pipeline_parity` fixture stays on the sync
+    /// default. Phase 3.5 step 7 introduced this for sub-100 ms
+    /// streaming RTF (see `docs/benchmarks.md`).
+    pub async_refresh: bool,
 }
 
 impl Default for PipelineConfig {
@@ -88,6 +103,7 @@ impl Default for PipelineConfig {
             vad_threshold: 0.5,
             enable_auto_learn: true,
             sv_min_new_samples_after_silence: 4_000,
+            async_refresh: false,
         }
     }
 }
@@ -216,6 +232,9 @@ pub fn process_offline(
     gate_cfg: &GateConfig,
     components: &mut PipelineComponents,
 ) -> Result<ProcessResult, PipelineError> {
+    if pipeline_cfg.async_refresh {
+        return process_offline_async(audio, pool, pipeline_cfg, gate_cfg, components);
+    }
     let vad_frame = CHUNK_SAMPLES_16K;
     let sv_sr = pipeline_cfg.sample_rate;
     let dt_ms = pipeline_cfg.vad_frame_ms();
@@ -385,6 +404,320 @@ pub fn process_offline(
         f0_match_per_frame: fm_per_frame,
         auto_learn_events,
     })
+}
+
+/// Async variant of [`process_offline`]: ECAPA / Fbank / F0 for each
+/// refresh run on a single worker thread so the VAD-driven main loop
+/// keeps progressing while inference is in flight. Selected
+/// automatically when `pipeline_cfg.async_refresh = true`.
+///
+/// Scoring (cos-sim, AS-Norm, auto-learn admission) stays on the main
+/// thread — the worker returns `(embedding, f0_mu)` and the main loop
+/// folds them into the pool / gate state. As a result the per-frame
+/// `last_score` trails the refresh sample boundary by roughly one
+/// ECAPA inference; see [`PipelineConfig::async_refresh`] for the
+/// trade-off.
+fn process_offline_async(
+    audio: &[f32],
+    pool: &mut EmbeddingPool,
+    pipeline_cfg: &PipelineConfig,
+    gate_cfg: &GateConfig,
+    components: &mut PipelineComponents,
+) -> Result<ProcessResult, PipelineError> {
+    let vad_frame = CHUNK_SAMPLES_16K;
+    let sv_sr = pipeline_cfg.sample_rate;
+    let dt_ms = pipeline_cfg.vad_frame_ms();
+
+    let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
+    let mut samples_since_update = 0_usize;
+    let mut silence_seen_since_refresh = false;
+    let mut new_speech_samples_after_silence = 0_usize;
+    let mut prev_speech = false;
+    let mut consecutive_speech_ms = 0.0_f32;
+    let mut last_score = 0.0_f32;
+    let mut last_cs = 0.0_f32;
+    let mut last_fm = 1.0_f32;
+
+    let mut gate_state = GateState::new(*gate_cfg);
+    let mut decisions: Vec<(usize, bool)> = Vec::new();
+    let mut current_decision: Option<bool> = None;
+    let mut per_frame: Vec<bool> = Vec::new();
+    let mut score_per_frame: Vec<f32> = Vec::new();
+    let mut cs_per_frame: Vec<f32> = Vec::new();
+    let mut fm_per_frame: Vec<f32> = Vec::new();
+    let mut auto_learn_events: Vec<AutoLearnEvent> = Vec::new();
+
+    // Disjoint borrows of PipelineComponents so the worker thread can
+    // own ecapa + fbank while the main loop keeps vad. The `cohort` is
+    // read-only and shared by-reference.
+    let PipelineComponents {
+        vad,
+        fbank,
+        ecapa,
+        cohort,
+    } = components;
+    let cohort: &Vec<Vec<f32>> = cohort;
+
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+
+    std::thread::scope(|scope| -> Result<(), PipelineError> {
+        scope.spawn(move || {
+            while let Ok(window) = work_rx.recv() {
+                let msg = match fbank_ecapa_one(&window, fbank, ecapa) {
+                    Ok(embedding) => {
+                        let f0_track = estimate_f0_track(
+                            &window,
+                            sv_sr,
+                            2048,
+                            512,
+                            DEFAULT_F_MIN,
+                            DEFAULT_F_MAX,
+                        );
+                        let (f0_mu, _) = f0_statistics(&f0_track);
+                        Ok((embedding, f0_mu))
+                    }
+                    Err(e) => Err(e),
+                };
+                if res_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // outstanding = number of work_tx sends not yet matched by a
+        // res_rx recv. Bench cadence + 2 s audio → worst case
+        // outstanding stays at 1; pending holds one queued window so a
+        // burst of two refreshes within one ECAPA wall time doesn't
+        // drop work.
+        let mut outstanding: u32 = 0;
+        let mut pending: Option<Vec<f32>> = None;
+        // Frame index of each refresh, in FIFO order, so AutoLearnEvent
+        // gets the trigger-time index rather than the result-arrival
+        // time.
+        let mut refresh_frame_indices: VecDeque<usize> = VecDeque::new();
+
+        let mut frame_start = 0_usize;
+        let mut frame_idx = 0_usize;
+
+        while frame_start + vad_frame <= audio.len() {
+            let frame = &audio[frame_start..frame_start + vad_frame];
+
+            let speech_prob = vad.score(frame)?;
+            let now_speech = speech_prob > pipeline_cfg.vad_threshold;
+            if now_speech {
+                for &sample in frame {
+                    if speech_buffer.len() == pipeline_cfg.sv_window_samples {
+                        speech_buffer.pop_front();
+                    }
+                    speech_buffer.push_back(sample);
+                }
+                consecutive_speech_ms += dt_ms;
+                if silence_seen_since_refresh {
+                    new_speech_samples_after_silence += vad_frame;
+                }
+            } else {
+                consecutive_speech_ms = 0.0;
+            }
+            if prev_speech && !now_speech {
+                silence_seen_since_refresh = true;
+                new_speech_samples_after_silence = 0;
+            }
+            prev_speech = now_speech;
+            samples_since_update += vad_frame;
+
+            let due_normal = samples_since_update >= pipeline_cfg.sv_update_samples;
+            let due_early = silence_seen_since_refresh
+                && now_speech
+                && new_speech_samples_after_silence
+                    >= pipeline_cfg.sv_min_new_samples_after_silence;
+            if (due_normal || due_early) && speech_buffer.len() >= pipeline_cfg.sv_window_samples {
+                samples_since_update = 0;
+                silence_seen_since_refresh = false;
+                new_speech_samples_after_silence = 0;
+                let window: Vec<f32> = speech_buffer.iter().copied().collect();
+                if outstanding == 0 {
+                    work_tx.send(window).expect("worker alive");
+                    outstanding = 1;
+                    refresh_frame_indices.push_back(frame_idx);
+                } else {
+                    pending = Some(window);
+                    refresh_frame_indices.push_back(frame_idx);
+                }
+            }
+
+            // Drain at most one ready result per frame so the gate
+            // score updates as soon as the worker is done.
+            if outstanding > 0 {
+                match res_rx.try_recv() {
+                    Ok(res) => {
+                        let (embedding, f0_mu) = res?;
+                        let trigger_frame = refresh_frame_indices.pop_front().unwrap_or(frame_idx);
+                        apply_refresh_result(
+                            embedding,
+                            f0_mu,
+                            trigger_frame,
+                            consecutive_speech_ms,
+                            pool,
+                            cohort,
+                            gate_cfg,
+                            pipeline_cfg.enable_auto_learn,
+                            &mut last_score,
+                            &mut last_cs,
+                            &mut last_fm,
+                            &mut auto_learn_events,
+                        );
+                        outstanding -= 1;
+                        if let Some(next) = pending.take() {
+                            work_tx.send(next).expect("worker alive");
+                            outstanding = 1;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(PipelineError::Embedding(EmbeddingError::Ort(
+                            "ECAPA worker disconnected".into(),
+                        )));
+                    }
+                }
+            }
+
+            let is_on = gate_state.update(last_score, dt_ms);
+            per_frame.push(is_on);
+            score_per_frame.push(last_score);
+            cs_per_frame.push(last_cs);
+            fm_per_frame.push(last_fm);
+
+            if current_decision != Some(is_on) {
+                decisions.push((frame_start, is_on));
+                current_decision = Some(is_on);
+            }
+
+            frame_start += vad_frame;
+            frame_idx += 1;
+        }
+
+        // Drain whatever ECAPA work is still in flight so the result
+        // log is complete before we tear down the worker. Per-frame
+        // outputs were already emitted for the main loop above, so
+        // these only affect pool / auto_learn_events.
+        while outstanding > 0 {
+            let res = res_rx.recv().map_err(|_| {
+                PipelineError::Embedding(EmbeddingError::Ort("ECAPA worker disconnected".into()))
+            })?;
+            let (embedding, f0_mu) = res?;
+            let trigger_frame = refresh_frame_indices.pop_front().unwrap_or(frame_idx);
+            apply_refresh_result(
+                embedding,
+                f0_mu,
+                trigger_frame,
+                consecutive_speech_ms,
+                pool,
+                cohort,
+                gate_cfg,
+                pipeline_cfg.enable_auto_learn,
+                &mut last_score,
+                &mut last_cs,
+                &mut last_fm,
+                &mut auto_learn_events,
+            );
+            outstanding -= 1;
+            if let Some(next) = pending.take() {
+                work_tx.send(next).expect("worker alive");
+                outstanding = 1;
+            }
+        }
+
+        // Closing the work channel lets the worker exit so the scope
+        // can join it.
+        drop(work_tx);
+        Ok(())
+    })?;
+
+    if decisions.is_empty() {
+        decisions.push((0, false));
+    } else if decisions[0].0 != 0 {
+        let first_on = decisions[0].1;
+        decisions.insert(0, (0, first_on));
+    }
+
+    let audio_out = apply_envelope(audio, &decisions, sv_sr, *gate_cfg)?;
+    Ok(ProcessResult {
+        audio: audio_out,
+        gate_decisions: decisions,
+        gate_per_frame: per_frame,
+        score_per_frame,
+        cos_sim_max_per_frame: cs_per_frame,
+        f0_match_per_frame: fm_per_frame,
+        auto_learn_events,
+    })
+}
+
+fn fbank_ecapa_one(
+    window: &[f32],
+    fbank: &mut Fbank,
+    ecapa: &mut EcapaTdnn,
+) -> Result<Vec<f32>, EmbeddingError> {
+    let feats = fbank.compute(window);
+    let n_frames = feats.len() / N_MELS;
+    ecapa.embed_features(&feats, n_frames, N_MELS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_refresh_result(
+    embedding: Vec<f32>,
+    f0_mu: f32,
+    trigger_frame: usize,
+    consecutive_speech_ms: f32,
+    pool: &mut EmbeddingPool,
+    cohort: &[Vec<f32>],
+    gate_cfg: &GateConfig,
+    enable_auto_learn: bool,
+    last_score: &mut f32,
+    last_cs: &mut f32,
+    last_fm: &mut f32,
+    auto_learn_events: &mut Vec<AutoLearnEvent>,
+) {
+    let cs = cos_sim_max_iter(
+        &embedding,
+        pool.anchors()
+            .iter()
+            .chain(pool.auto_learn().iter())
+            .map(Vec::as_slice),
+    );
+    let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
+    *last_cs = cs;
+    *last_fm = fm;
+    *last_score = if gate_cfg.use_as_norm && !cohort.is_empty() {
+        as_norm_score(&embedding, cs, cohort, 20)
+    } else {
+        cs
+    };
+
+    if enable_auto_learn
+        && should_admit_auto_learn(*last_score, fm, consecutive_speech_ms, gate_cfg)
+    {
+        let admitted = pool.add_auto_learn(embedding);
+        let kind = if admitted {
+            AutoLearnKind::Admit
+        } else {
+            AutoLearnKind::RejectAnchorDistance
+        };
+        auto_learn_events.push(AutoLearnEvent {
+            frame_idx: trigger_frame,
+            kind,
+            score: *last_score,
+            f0_match: fm,
+        });
+        if admitted && pool.maybe_reset() {
+            auto_learn_events.push(AutoLearnEvent {
+                frame_idx: trigger_frame,
+                kind: AutoLearnKind::Reset,
+                score: *last_score,
+                f0_match: fm,
+            });
+        }
+    }
 }
 
 /// Default ECAPA enrollment chunk length (3 s @ 16 kHz).

@@ -116,3 +116,57 @@ fn process_offline_runs_end_to_end() {
     // No NaNs leaked into the gated output.
     assert!(result.audio.iter().all(|v| v.is_finite()));
 }
+
+#[test]
+fn process_offline_async_runs_end_to_end() {
+    let Ok(ecapa_path) = std::env::var("MELLONELLA_ECAPA_ONNX") else {
+        eprintln!("[skip] MELLONELLA_ECAPA_ONNX not set");
+        return;
+    };
+    let Ok(vad_path) = std::env::var("MELLONELLA_VAD_ONNX") else {
+        eprintln!("[skip] MELLONELLA_VAD_ONNX not set");
+        return;
+    };
+    if !std::path::Path::new(&ecapa_path).exists() || !std::path::Path::new(&vad_path).exists() {
+        eprintln!("[skip] ONNX file(s) missing");
+        return;
+    }
+
+    let fb_matrix = read_f32_buffer(FILTERBANK);
+    let fbank = Fbank::new(&fb_matrix).expect("Fbank from fixture");
+    let ecapa = EcapaTdnn::from_onnx_path(&ecapa_path).expect("ECAPA load");
+    let vad_model = SileroVad::from_onnx_path(&vad_path, 16_000).expect("VAD load");
+
+    let mut components = PipelineComponents {
+        vad: vad_model,
+        fbank,
+        ecapa,
+        cohort: Vec::new(),
+    };
+
+    let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+    pool.add_anchors([vec![0.0_f32; 192]]);
+
+    let audio = synth_waveform(16_000, 2.0, 180.0);
+
+    let pipeline_cfg = PipelineConfig {
+        async_refresh: true,
+        // Match the sync smoke-test's default behaviour otherwise so
+        // any failure mode that's specific to async surfaces here.
+        ..PipelineConfig::default()
+    };
+    let gate_cfg = GateConfig::default();
+    let result = process_offline(&audio, &mut pool, &pipeline_cfg, &gate_cfg, &mut components)
+        .expect("async pipeline runs without error");
+
+    assert_eq!(result.audio.len(), audio.len());
+    assert_eq!(result.gate_per_frame.len(), result.score_per_frame.len());
+    let n_frames_expected = audio.len() / CHUNK_SAMPLES_16K;
+    assert_eq!(result.gate_per_frame.len(), n_frames_expected);
+    assert!(!result.gate_decisions.is_empty());
+    assert_eq!(result.gate_decisions[0].0, 0);
+    assert!(result.audio.iter().all(|v| v.is_finite()));
+    // Every per-frame score must be finite (no NaN propagation through
+    // the worker channel).
+    assert!(result.score_per_frame.iter().all(|v| v.is_finite()));
+}
