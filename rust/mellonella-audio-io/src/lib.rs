@@ -63,7 +63,8 @@
     clippy::needless_pass_by_value,
     clippy::must_use_candidate,
     clippy::missing_errors_doc,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::too_many_lines
 )]
 
 mod devices;
@@ -128,6 +129,69 @@ impl std::error::Error for AudioIoError {}
 /// default so all stages share the same audio-path rate.
 pub const INTERNAL_SAMPLE_RATE: u32 = 48_000;
 
+/// How to fold a multi-channel input device's interleaved frames
+/// down to mono before the pipeline sees them.
+///
+/// `Average` is the safe default that matches step 12's behaviour
+/// for stereo or multi-mic arrays where each channel hears the
+/// same speaker (e.g. a USB stereo mic recording one person).
+/// `Channel(n)` is the explicit pick for setups where one channel
+/// is the target signal and the others are room mics / reference
+/// channels (e.g. a podcast interface with the host on channel 0
+/// and the guest on channel 1 — when only the host should be
+/// enrolled / processed).
+///
+/// For mono inputs (`channels = 1`) every variant is a no-op
+/// pass-through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelStrategy {
+    /// Average all channels. Same as the previous hard-coded
+    /// behaviour; matches the safe default for most users.
+    #[default]
+    Average,
+    /// Take channel `n` (0-indexed). Out-of-range indices fall
+    /// back to averaging at runtime so a misconfigured live
+    /// session can't produce silent output.
+    Channel(u16),
+}
+
+impl ChannelStrategy {
+    /// Downmix one cpal callback's interleaved samples to mono per
+    /// this strategy. `channels` is the device's reported channel
+    /// count (cpal `StreamConfig::channels`).
+    #[must_use]
+    pub fn downmix(self, interleaved: &[f32], channels: usize) -> Vec<f32> {
+        if channels <= 1 {
+            return interleaved.to_vec();
+        }
+        match self {
+            Self::Average => {
+                let frames = interleaved.len() / channels;
+                let mut mono = Vec::with_capacity(frames);
+                for chunk in interleaved.chunks_exact(channels) {
+                    let sum: f32 = chunk.iter().sum();
+                    mono.push(sum / channels as f32);
+                }
+                mono
+            }
+            Self::Channel(n) => {
+                let n = n as usize;
+                if n >= channels {
+                    // Soft-fallback: a misconfigured channel index
+                    // shouldn't silence the pipeline. Average.
+                    return Self::Average.downmix(interleaved, channels);
+                }
+                let frames = interleaved.len() / channels;
+                let mut mono = Vec::with_capacity(frames);
+                for chunk in interleaved.chunks_exact(channels) {
+                    mono.push(chunk[n]);
+                }
+                mono
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +227,40 @@ mod tests {
             INTERNAL_SAMPLE_RATE,
             mellonella_core::streaming::StreamingConfig::default().audio_sample_rate
         );
+    }
+
+    #[test]
+    fn channel_strategy_average_two_channel() {
+        let interleaved = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let mono = ChannelStrategy::Average.downmix(&interleaved, 2);
+        // (0+1)/2, (2+3)/2, (4+5)/2 = 0.5, 2.5, 4.5
+        assert_eq!(mono, vec![0.5, 2.5, 4.5]);
+    }
+
+    #[test]
+    fn channel_strategy_pick_channel_two_channel() {
+        let interleaved = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let ch0 = ChannelStrategy::Channel(0).downmix(&interleaved, 2);
+        assert_eq!(ch0, vec![0.0, 2.0, 4.0]);
+        let ch1 = ChannelStrategy::Channel(1).downmix(&interleaved, 2);
+        assert_eq!(ch1, vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn channel_strategy_out_of_range_falls_back_to_average() {
+        let interleaved = [0.0_f32, 1.0, 2.0, 3.0];
+        // Channel 5 doesn't exist in a 2-channel stream; fall back
+        // to average rather than producing silence.
+        let mono = ChannelStrategy::Channel(5).downmix(&interleaved, 2);
+        assert_eq!(mono, vec![0.5, 2.5]);
+    }
+
+    #[test]
+    fn channel_strategy_mono_input_passthrough() {
+        let interleaved = [0.1_f32, 0.2, 0.3];
+        for strategy in [ChannelStrategy::Average, ChannelStrategy::Channel(0)] {
+            assert_eq!(strategy.downmix(&interleaved, 1), interleaved.to_vec());
+        }
     }
 
     #[test]

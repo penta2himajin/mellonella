@@ -6,7 +6,7 @@
 //! worker exits on the next iteration.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -22,7 +22,7 @@ use rubato::{
 };
 
 use crate::devices::DeviceKind;
-use crate::{AudioIoError, INTERNAL_SAMPLE_RATE};
+use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
@@ -54,6 +54,13 @@ pub struct SessionConfig {
     /// conv lookahead + ~10 ms model). Negligible compared to the
     /// previous 1.02 s the 102-frame export forced.
     pub dfn3_onnx_path: Option<PathBuf>,
+    /// How to fold a multi-channel input device's interleaved
+    /// frames down to mono. Default `Average` — same as step 12's
+    /// hard-coded behaviour. Use `Channel(n)` to pick a specific
+    /// channel for setups where one channel is the target signal
+    /// and the others are room mics / reference channels (podcast
+    /// interface with host on ch 0, guest on ch 1, etc.).
+    pub input_channel: ChannelStrategy,
 }
 
 /// Stats surfaced when [`LiveSession::stop`] returns. Useful as a
@@ -93,6 +100,17 @@ pub struct LiveSession {
     samples_processed: Arc<AtomicU64>,
     input_overruns: Arc<AtomicU64>,
     output_underruns: Arc<AtomicU64>,
+    /// f32 bits of the most recent input chunk's RMS — updated by
+    /// the worker each iteration. Polled by the GUI's level meter.
+    input_rms_bits: Arc<AtomicU32>,
+    /// f32 bits of the most recent output chunk's RMS — gate ×
+    /// envelope smoothing. Together with `input_rms_bits` gives the
+    /// "how much is being suppressed" reading.
+    output_rms_bits: Arc<AtomicU32>,
+    /// Latest gate state (true = the pipeline is currently passing
+    /// audio through). Updated whenever the streaming engine emits
+    /// a new gate transition.
+    gate_on: Arc<AtomicBool>,
 }
 
 impl LiveSession {
@@ -161,6 +179,9 @@ impl LiveSession {
         let samples_processed = Arc::new(AtomicU64::new(0));
         let input_overruns = Arc::new(AtomicU64::new(0));
         let output_underruns = Arc::new(AtomicU64::new(0));
+        let input_rms_bits = Arc::new(AtomicU32::new(0));
+        let output_rms_bits = Arc::new(AtomicU32::new(0));
+        let gate_on = Arc::new(AtomicBool::new(false));
 
         let input_stream = build_input_stream(
             &input_dev,
@@ -169,6 +190,7 @@ impl LiveSession {
             input_sr,
             input_tx,
             input_overruns.clone(),
+            config.input_channel,
         )?;
         let output_stream = build_output_stream(
             &output_dev,
@@ -204,6 +226,9 @@ impl LiveSession {
             output_tx,
             events_tx,
             samples_processed.clone(),
+            input_rms_bits.clone(),
+            output_rms_bits.clone(),
+            gate_on.clone(),
         )?;
 
         input_stream
@@ -221,7 +246,35 @@ impl LiveSession {
             samples_processed,
             input_overruns,
             output_underruns,
+            input_rms_bits,
+            output_rms_bits,
+            gate_on,
         })
+    }
+
+    /// Snapshot of the latest input chunk's RMS — useful for the
+    /// GUI's live level meter. Updated by the worker on each
+    /// `push_samples` iteration; reads are lock-free atomic loads
+    /// of an f32 stored as `u32` bits.
+    #[must_use]
+    pub fn input_rms(&self) -> f32 {
+        f32::from_bits(self.input_rms_bits.load(Ordering::Relaxed))
+    }
+
+    /// Snapshot of the latest output chunk's RMS. Compared with
+    /// `input_rms` this shows how much the gate × envelope is
+    /// suppressing right now.
+    #[must_use]
+    pub fn output_rms(&self) -> f32 {
+        f32::from_bits(self.output_rms_bits.load(Ordering::Relaxed))
+    }
+
+    /// Latest gate state (true = audio is currently being passed
+    /// through). Useful for a "live filter ON / OFF" indicator in
+    /// the GUI.
+    #[must_use]
+    pub fn gate_on(&self) -> bool {
+        self.gate_on.load(Ordering::Relaxed)
     }
 
     /// Try to receive a pending session event without blocking.
@@ -287,11 +340,20 @@ fn spawn_worker(
     output_tx: Sender<Vec<f32>>,
     events_tx: Sender<SessionEvent>,
     samples_processed: Arc<AtomicU64>,
+    input_rms_bits: Arc<AtomicU32>,
+    output_rms_bits: Arc<AtomicU32>,
+    gate_on: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, AudioIoError> {
     std::thread::Builder::new()
         .name("mellonella-audio-io-worker".into())
         .spawn(move || {
             while let Ok(chunk) = input_rx.recv() {
+                // Update input level meter before any processing —
+                // gives the GUI a "raw mic signal" reading
+                // independent of DFN3 / gate.
+                if !chunk.is_empty() {
+                    input_rms_bits.store(rms(&chunk).to_bits(), Ordering::Relaxed);
+                }
                 // DFN3 (if enabled) runs first — it buffers up to
                 // ~1.02 s and emits whole chunks. When the buffer
                 // isn't full yet, `enhanced` is empty and we skip
@@ -312,6 +374,14 @@ fn spawn_worker(
                 }
                 match pipeline.push_samples(&enhanced) {
                     Ok(out) => {
+                        // Pull the latest gate state from the run-
+                        // length decisions emitted this iteration.
+                        if let Some(&(_, is_on)) = out.gate_decisions.last() {
+                            gate_on.store(is_on, Ordering::Relaxed);
+                        }
+                        if !out.audio.is_empty() {
+                            output_rms_bits.store(rms(&out.audio).to_bits(), Ordering::Relaxed);
+                        }
                         let n = out.audio.len() as u64;
                         if n > 0 && output_tx.send(out.audio).is_err() {
                             // Output side disconnected — session is
@@ -362,6 +432,17 @@ fn spawn_worker(
 /// count; chunks vary in size by device callback period, but a
 /// 1-ms-equivalent slot count is a fine ceiling: 24 000 samples ≈
 /// 500 slots of 1 ms each.
+/// Root-mean-square of an audio chunk. Used by the worker thread
+/// to surface a level-meter reading via the atomic snapshot
+/// without forcing any new allocation.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
 fn ring_capacity_chunks(ring_cap_samples: usize) -> usize {
     let slots = ring_cap_samples / (INTERNAL_SAMPLE_RATE as usize / 1000).max(1);
     slots.max(16)
@@ -406,6 +487,7 @@ fn build_input_stream(
     device_sr: u32,
     input_tx: Sender<Vec<f32>>,
     overruns: Arc<AtomicU64>,
+    channel_strategy: ChannelStrategy,
 ) -> Result<Stream, AudioIoError> {
     let mut resampler = build_resampler(device_sr, INTERNAL_SAMPLE_RATE)?;
     let channels_usize = channels as usize;
@@ -414,19 +496,7 @@ fn build_input_stream(
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Downmix interleaved frames to mono by averaging.
-                let mut mono = Vec::with_capacity(data.len() / channels_usize);
-                let mut sum = 0.0_f32;
-                let mut count = 0_usize;
-                for (i, &s) in data.iter().enumerate() {
-                    sum += s;
-                    count += 1;
-                    if (i + 1) % channels_usize == 0 {
-                        mono.push(sum / count as f32);
-                        sum = 0.0;
-                        count = 0;
-                    }
-                }
+                let mono = channel_strategy.downmix(data, channels_usize);
                 let processed = match &mut resampler {
                     Some(r) => resample_one(r, &mono),
                     None => Ok(mono),

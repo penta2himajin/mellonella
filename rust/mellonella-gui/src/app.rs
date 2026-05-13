@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::state::{AppState, EnrollmentOrigin, DEFAULT_RECORD_SECS, OUTPUT_SAMPLE_RATE};
+use crate::state::{AppState, EnrollmentOrigin, OUTPUT_SAMPLE_RATE};
 use crate::tray::{TrayCommand, TrayHandles};
 
 pub struct MellonellaApp {
@@ -68,9 +68,13 @@ impl MellonellaApp {
             ui.add_space(8.0);
             self.render_run_controls(ui);
             ui.add_space(8.0);
+            self.render_meters(ui);
+            ui.add_space(6.0);
             self.render_status(ui);
             ui.add_space(6.0);
             self.render_error_row(ui);
+            ui.add_space(6.0);
+            self.render_settings_panel(ui);
         });
     }
 
@@ -102,16 +106,26 @@ impl MellonellaApp {
                     self.state.enroll_from_wav(&path);
                 }
             }
+            let record_secs = self.state.record_duration_secs;
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(format!("Record ({DEFAULT_RECORD_SECS:.0}s)")),
+                    egui::Button::new(format!("Record ({record_secs:.0}s)")),
                 )
                 .on_hover_text("Record from the selected input device.")
                 .clicked()
             {
-                self.state.start_recording(DEFAULT_RECORD_SECS);
+                self.state.start_recording(record_secs);
             }
+            ui.add_enabled(
+                !busy,
+                egui::DragValue::new(&mut self.state.record_duration_secs)
+                    .speed(0.5)
+                    .range(1.0..=30.0)
+                    .suffix(" s")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Recording duration (1 – 30 s)");
             ui.separator();
             if ui
                 .add_enabled(!busy, egui::Button::new("Load JSON…"))
@@ -147,7 +161,7 @@ impl MellonellaApp {
             .state
             .recorder
             .as_ref()
-            .map_or((0.0, DEFAULT_RECORD_SECS, 0.0), |r| {
+            .map_or((0.0, self.state.record_duration_secs, 0.0), |r| {
                 (r.elapsed_seconds(), r.target_seconds(), r.progress())
             });
         ui.horizontal(|ui| {
@@ -296,10 +310,100 @@ impl MellonellaApp {
     fn render_status(&self, ui: &mut egui::Ui) {
         let s = self.state.last_stats;
         let secs = s.samples_processed as f32 / OUTPUT_SAMPLE_RATE as f32;
+        let latency_ms = self.state.estimated_latency_ms();
         ui.label(format!(
-            "Processed: {secs:.1} s   ·   overruns: {}   underruns: {}",
+            "Processed: {secs:.1} s   ·   latency: ~{latency_ms:.0} ms   ·   overruns: {}   underruns: {}",
             s.input_overruns, s.output_underruns
         ));
+    }
+
+    /// Step 18: live level meter + gate light. Renders two thin
+    /// progress bars (input RMS, output RMS) and a coloured circle
+    /// for the gate state. RMS is mapped via a log-ish scale so
+    /// quiet speech (~-30 dBFS) still shows movement.
+    fn render_meters(&self, ui: &mut egui::Ui) {
+        let running = self.state.is_running();
+        let in_rms = self.state.input_rms();
+        let out_rms = self.state.output_rms();
+        let gate_on = self.state.gate_on();
+
+        ui.horizontal(|ui| {
+            ui.label("Mic:");
+            ui.add(
+                egui::ProgressBar::new(rms_to_bar(in_rms))
+                    .desired_width(160.0)
+                    .desired_height(10.0)
+                    .fill(egui::Color32::from_rgb(80, 160, 220)),
+            );
+            ui.label("Out:");
+            ui.add(
+                egui::ProgressBar::new(rms_to_bar(out_rms))
+                    .desired_width(160.0)
+                    .desired_height(10.0)
+                    .fill(egui::Color32::from_rgb(180, 180, 80)),
+            );
+            let (gate_label, gate_colour) = if !running {
+                ("○ off", egui::Color32::DARK_GRAY)
+            } else if gate_on {
+                ("● gate ON", egui::Color32::from_rgb(80, 200, 120))
+            } else {
+                ("○ gate", egui::Color32::from_rgb(160, 80, 80))
+            };
+            ui.label(egui::RichText::new(gate_label).color(gate_colour));
+        });
+    }
+
+    /// Step 19: collapsible "Settings" section with sliders for
+    /// the user-tunable gate / envelope / refresh-cadence
+    /// parameters. Disabled while a session is running — the
+    /// streaming pipeline reads the config at `LiveSession::new`,
+    /// not per-frame, so mid-stream changes wouldn't take effect
+    /// until Stop / Start anyway.
+    fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
+        let running = self.state.is_running();
+        egui::CollapsingHeader::new("Settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.label(
+                        egui::RichText::new("Tunable parameters (applied on next Start)")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.theta_pass, 0.0..=1.0)
+                            .text("theta_pass (gate threshold)")
+                            .fixed_decimals(2),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.hangover_ms, 0.0..=1000.0)
+                            .text("hangover_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.attack_ms, 0.0..=100.0)
+                            .text("attack_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.release_ms, 0.0..=500.0)
+                            .text("release_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.state.pipeline_cfg.sv_update_samples,
+                            1_000..=32_000,
+                        )
+                        .text("sv_update_samples (ECAPA refresh cadence @ 16 kHz)"),
+                    );
+                    if ui.button("Reset to defaults").clicked() {
+                        self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
+                        self.state.pipeline_cfg =
+                            mellonella_core::pipeline::PipelineConfig::default();
+                    }
+                });
+            });
     }
 
     fn render_error_row(&self, ui: &mut egui::Ui) {
@@ -317,6 +421,25 @@ impl eframe::App for MellonellaApp {
         self.state.poll_session();
         self.state.poll_recorder();
         self.drain_tray_commands(ctx);
+
+        // Step 17: minimise-to-tray. When the user clicks the
+        // window's close button AND the tray is available,
+        // intercept the close so the live session keeps running in
+        // the background. Without a tray (Linux without
+        // AppIndicator, etc.) we fall through to the OS default
+        // (close = quit) so users aren't trapped in a headless app.
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+        }
+
+        // Step 17: keep the tray icon's visual state in sync with
+        // the live-session state.
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_running(self.state.is_running());
+        }
+
         self.render_central_panel(ctx);
 
         // Repaint at ~10 Hz so the counter / recording progress
@@ -325,4 +448,17 @@ impl eframe::App for MellonellaApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// Map RMS in `[0, 1]` to a `[0, 1]` progress-bar reading via a
+/// pseudo-log scale: -60 dBFS → 0.0, 0 dBFS → 1.0. Conversational
+/// speech sits around -25 dBFS which lights about half the bar —
+/// the sweet spot for a level meter that "moves visibly" without
+/// pinning at the top.
+fn rms_to_bar(rms: f32) -> f32 {
+    if rms <= 1e-6 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }

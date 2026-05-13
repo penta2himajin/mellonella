@@ -37,6 +37,7 @@ use crate::gating::{
     ApplyEnvelopeError, GateConfig, GateState,
 };
 use crate::resample::{resample_to, ResampleError};
+use crate::streaming::{StreamingConfig, StreamingState};
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 /// SV-side cadence for the offline pipeline.
@@ -313,164 +314,35 @@ pub fn process_offline(
             components,
         );
     }
-    let vad_frame = CHUNK_SAMPLES_16K;
-    let sv_sr = pipeline_cfg.sample_rate;
-    let dt_ms = pipeline_cfg.vad_frame_ms();
+    // Sync offline = streaming engine called once with the whole
+    // buffer, then flushed. Per-frame outputs match the previous
+    // monolithic implementation byte-for-byte at identity rate
+    // (`streaming_identity_rate_per_frame_matches_offline`).
+    let cfg = StreamingConfig {
+        pipeline: *pipeline_cfg,
+        gate: *gate_cfg,
+        audio_sample_rate,
+        diagnostics: true,
+    };
+    let mut state = StreamingState::new(&cfg)?;
+    let mut head = state.push_block(audio, pool, components, &cfg)?;
+    let mut tail = state.flush(pool, components, &cfg)?;
 
-    // Decision-path buffer at the model-native (16 kHz) rate. The
-    // envelope is applied to the original-rate audio at the bottom
-    // so output quality stays at `audio_sample_rate`.
-    let decision_audio = audio_for_decisions(audio, audio_sample_rate, sv_sr)?;
-    let audio_dec: &[f32] = decision_audio.as_ref();
+    head.audio.append(&mut tail.audio);
+    head.gate_decisions.append(&mut tail.gate_decisions);
+    head.events.append(&mut tail.events);
+    head.gate_per_frame.append(&mut tail.gate_per_frame);
+    head.score_per_frame.append(&mut tail.score_per_frame);
+    head.cos_sim_max_per_frame
+        .append(&mut tail.cos_sim_max_per_frame);
+    head.f0_match_per_frame.append(&mut tail.f0_match_per_frame);
 
-    // Ring buffer for the SV speech accumulator. VecDeque keeps drop-
-    // oldest in O(1) so we don't pay an O(N) Vec::drain shift every
-    // speech frame once the buffer is at capacity.
-    let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
-    // Contiguous staging slice used to feed Fbank / F0 once per refresh.
-    // Allocated once with the window size and reused.
-    let mut sv_window_scratch: Vec<f32> = Vec::with_capacity(pipeline_cfg.sv_window_samples);
-    let mut samples_since_update = 0_usize;
-    // VAD-edge-triggered early-refresh state. Tracks whether a
-    // speech→silence transition has occurred since the last ECAPA
-    // refresh, and how much new speech has accumulated since that
-    // silence ended. See `PipelineConfig::sv_min_new_samples_after_silence`.
-    let mut silence_seen_since_refresh = false;
-    let mut new_speech_samples_after_silence = 0_usize;
-    let mut prev_speech = false;
-    let mut consecutive_speech_ms = 0.0_f32;
-    let mut last_score = 0.0_f32;
-    let mut last_cs = 0.0_f32;
-    let mut last_fm = 1.0_f32;
-
-    let mut gate_state = GateState::new(*gate_cfg);
-    let mut decisions: Vec<(usize, bool)> = Vec::new();
-    let mut current_decision: Option<bool> = None;
-    let mut per_frame: Vec<bool> = Vec::new();
-    let mut score_per_frame: Vec<f32> = Vec::new();
-    let mut cs_per_frame: Vec<f32> = Vec::new();
-    let mut fm_per_frame: Vec<f32> = Vec::new();
-    let mut auto_learn_events: Vec<AutoLearnEvent> = Vec::new();
-
-    let mut frame_start = 0_usize;
-    let mut frame_idx = 0_usize;
-    while frame_start + vad_frame <= audio_dec.len() {
-        let frame = &audio_dec[frame_start..frame_start + vad_frame];
-
-        let speech_prob = components.vad.score(frame)?;
-        let now_speech = speech_prob > pipeline_cfg.vad_threshold;
-        if now_speech {
-            for &sample in frame {
-                if speech_buffer.len() == pipeline_cfg.sv_window_samples {
-                    speech_buffer.pop_front();
-                }
-                speech_buffer.push_back(sample);
-            }
-            consecutive_speech_ms += dt_ms;
-            if silence_seen_since_refresh {
-                new_speech_samples_after_silence += vad_frame;
-            }
-        } else {
-            consecutive_speech_ms = 0.0;
-        }
-        // Detect a speech → silence edge for the early-refresh trigger.
-        if prev_speech && !now_speech {
-            silence_seen_since_refresh = true;
-            new_speech_samples_after_silence = 0;
-        }
-        prev_speech = now_speech;
-        samples_since_update += vad_frame;
-
-        let due_normal = samples_since_update >= pipeline_cfg.sv_update_samples;
-        let due_early = silence_seen_since_refresh
-            && now_speech
-            && new_speech_samples_after_silence >= pipeline_cfg.sv_min_new_samples_after_silence;
-        if (due_normal || due_early) && speech_buffer.len() >= pipeline_cfg.sv_window_samples {
-            samples_since_update = 0;
-            silence_seen_since_refresh = false;
-            new_speech_samples_after_silence = 0;
-            // Copy the ring buffer into a contiguous scratch slice once
-            // per refresh. Fbank / F0 want `&[f32]`.
-            sv_window_scratch.clear();
-            sv_window_scratch.extend(speech_buffer.iter().copied());
-            let window: &[f32] = &sv_window_scratch;
-
-            // Fbank → ECAPA → 192-dim embedding.
-            let feats = components.fbank.compute(window);
-            let n_frames = feats.len() / N_MELS;
-            let embedding = components.ecapa.embed_features(&feats, n_frames, N_MELS)?;
-
-            let f0_track =
-                estimate_f0_track(window, sv_sr, 2048, 512, DEFAULT_F_MIN, DEFAULT_F_MAX);
-            let (f0_mu, _) = f0_statistics(&f0_track);
-
-            // Chain anchors + auto_learn as slice references directly —
-            // no Vec allocation per refresh, no Vec<f32> clones.
-            let cs = cos_sim_max_iter(
-                &embedding,
-                pool.anchors()
-                    .iter()
-                    .chain(pool.auto_learn().iter())
-                    .map(Vec::as_slice),
-            );
-            let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
-            last_cs = cs;
-            last_fm = fm;
-            last_score = if gate_cfg.use_as_norm && !components.cohort.is_empty() {
-                // AS-Norm path: cohort-normalised similarity. F0 still
-                // gates auto-learn admission via theta_f0 below.
-                as_norm_score(&embedding, cs, &components.cohort, 20)
-            } else {
-                // Non-AS-Norm path. The Python PoC blends the score as
-                // `α·cs + β·f0`, but `alpha`/`beta` live on Python's
-                // monolithic GatingConfig and haven't been carved out
-                // into the Rust GateConfig yet — for the offline path
-                // raw `cos_sim_max` is a faithful enough proxy until
-                // they land in a follow-up.
-                cs
-            };
-
-            if pipeline_cfg.enable_auto_learn
-                && should_admit_auto_learn(last_score, fm, consecutive_speech_ms, gate_cfg)
-            {
-                let admitted = pool.add_auto_learn(embedding);
-                let kind = if admitted {
-                    AutoLearnKind::Admit
-                } else {
-                    AutoLearnKind::RejectAnchorDistance
-                };
-                auto_learn_events.push(AutoLearnEvent {
-                    frame_idx,
-                    kind,
-                    score: last_score,
-                    f0_match: fm,
-                });
-                if admitted && pool.maybe_reset() {
-                    auto_learn_events.push(AutoLearnEvent {
-                        frame_idx,
-                        kind: AutoLearnKind::Reset,
-                        score: last_score,
-                        f0_match: fm,
-                    });
-                }
-            }
-        }
-
-        let is_on = gate_state.update(last_score, dt_ms);
-        per_frame.push(is_on);
-        score_per_frame.push(last_score);
-        cs_per_frame.push(last_cs);
-        fm_per_frame.push(last_fm);
-
-        if current_decision != Some(is_on) {
-            decisions.push((frame_start, is_on));
-            current_decision = Some(is_on);
-        }
-
-        frame_start += vad_frame;
-        frame_idx += 1;
-    }
-
+    // Mirror the historical `gate_decisions[0].0 == 0` precondition
+    // `apply_envelope` was designed to expect. The streaming engine
+    // emits decisions on transitions starting at audio_samples_emitted=0,
+    // so the first decision is already at 0 in non-empty cases. Empty
+    // happens when audio is too short for one VAD frame.
+    let mut decisions = head.gate_decisions;
     if decisions.is_empty() {
         decisions.push((0, false));
     } else if decisions[0].0 != 0 {
@@ -478,16 +350,14 @@ pub fn process_offline(
         decisions.insert(0, (0, first_on));
     }
 
-    let audio_out =
-        apply_envelope_dual_rate(audio, &decisions, audio_sample_rate, sv_sr, *gate_cfg)?;
     Ok(ProcessResult {
-        audio: audio_out,
+        audio: head.audio,
         gate_decisions: decisions,
-        gate_per_frame: per_frame,
-        score_per_frame,
-        cos_sim_max_per_frame: cs_per_frame,
-        f0_match_per_frame: fm_per_frame,
-        auto_learn_events,
+        gate_per_frame: head.gate_per_frame,
+        score_per_frame: head.score_per_frame,
+        cos_sim_max_per_frame: head.cos_sim_max_per_frame,
+        f0_match_per_frame: head.f0_match_per_frame,
+        auto_learn_events: head.events,
     })
 }
 
@@ -743,7 +613,7 @@ fn process_offline_async(
     })
 }
 
-fn fbank_ecapa_one(
+pub(crate) fn fbank_ecapa_one(
     window: &[f32],
     fbank: &mut Fbank,
     ecapa: &mut EcapaTdnn,
@@ -754,7 +624,7 @@ fn fbank_ecapa_one(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_refresh_result(
+pub(crate) fn apply_refresh_result(
     embedding: Vec<f32>,
     f0_mu: f32,
     trigger_frame: usize,

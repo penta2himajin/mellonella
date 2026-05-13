@@ -69,6 +69,21 @@ pub struct AppState {
     /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
     /// otherwise (see [`Self::dfn3_available`]).
     pub enable_dfn3: bool,
+    /// Mic-enrollment recording duration in seconds. Step 20 made
+    /// this user-configurable from the GUI (a slider next to the
+    /// Record button); default matches the previous fixed
+    /// [`DEFAULT_RECORD_SECS`] value.
+    pub record_duration_secs: f32,
+    /// User-adjustable gate / envelope parameters. Sliders in the
+    /// Settings panel mutate these in place; `start()` reads them
+    /// when building the `SessionConfig`. Defaults match
+    /// `GateConfig::default()`.
+    pub gate_cfg: GateConfig,
+    /// User-adjustable pipeline cadence (currently just
+    /// `sv_update_samples` — ECAPA refresh interval). Sliders in
+    /// the Settings panel mutate this; defaults match
+    /// `PipelineConfig::default()`.
+    pub pipeline_cfg: PipelineConfig,
     pub session: Option<LiveSession>,
     pub recorder: Option<Recorder>,
     pub last_error: Option<String>,
@@ -90,6 +105,9 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             enable_dfn3: false,
+            record_duration_secs: DEFAULT_RECORD_SECS,
+            gate_cfg: GateConfig::default(),
+            pipeline_cfg: PipelineConfig::default(),
             session: None,
             recorder: None,
             last_error: None,
@@ -307,13 +325,18 @@ impl AppState {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
             streaming: StreamingConfig {
-                pipeline: PipelineConfig::default(),
-                gate: GateConfig::default(),
+                pipeline: self.pipeline_cfg,
+                gate: self.gate_cfg,
                 audio_sample_rate: OUTPUT_SAMPLE_RATE,
                 diagnostics: false,
             },
             ring_capacity_samples: 0,
             dfn3_onnx_path,
+            // GUI uses the safe default; multi-channel mic users
+            // who want a specific channel use the CLI's
+            // `mellonella live --input-channel N` for now. A GUI
+            // dropdown is a small follow-up.
+            input_channel: mellonella_audio_io::ChannelStrategy::default(),
         };
         match LiveSession::new(pool, components, cfg) {
             Ok(s) => {
@@ -378,6 +401,51 @@ impl AppState {
     #[allow(clippy::unused_self)] // method form is more discoverable from app.rs
     pub fn dfn3_available(&self) -> bool {
         dfn3_path_from_env().is_some()
+    }
+
+    /// Latest input RMS from the worker (0.0 when no session is
+    /// running). Used by the GUI's level meter.
+    #[must_use]
+    pub fn input_rms(&self) -> f32 {
+        self.session.as_ref().map_or(0.0, LiveSession::input_rms)
+    }
+
+    /// Latest output (gate × envelope) RMS from the worker.
+    #[must_use]
+    pub fn output_rms(&self) -> f32 {
+        self.session.as_ref().map_or(0.0, LiveSession::output_rms)
+    }
+
+    /// Latest gate state — `true` when audio is currently being
+    /// passed through. `false` for both "gated off" and "no session".
+    #[must_use]
+    pub fn gate_on(&self) -> bool {
+        self.session.as_ref().is_some_and(LiveSession::gate_on)
+    }
+
+    /// Estimated end-to-end output latency for the current
+    /// configuration, in milliseconds. Used by the GUI status row
+    /// so users can verify the live filter is in the right
+    /// ballpark for their use case (e.g. ≪ 100 ms for headphone
+    /// monitoring, < 200 ms for call apps).
+    ///
+    /// Breakdown:
+    ///
+    /// * resampler: ~5 ms
+    /// * VAD: < 10 ms (assume 8 ms)
+    /// * envelope attack: `gate.attack_ms`
+    /// * DFN3: ~30 ms when `enable_dfn3` is on, else 0
+    ///
+    /// This is the architecture doc's published budget — values
+    /// are conservative upper bounds, not measured per-frame on
+    /// the host. Useful as a sanity check, not a benchmark.
+    #[must_use]
+    pub fn estimated_latency_ms(&self) -> f32 {
+        let mut total = 5.0_f32 + 8.0 + self.gate_cfg.attack_ms;
+        if self.enable_dfn3 && self.dfn3_available() {
+            total += 30.0;
+        }
+        total
     }
 }
 
@@ -464,5 +532,33 @@ mod tests {
             mellonella_audio_io::INTERNAL_SAMPLE_RATE,
             "OUTPUT_SAMPLE_RATE must match mellonella-audio-io's INTERNAL_SAMPLE_RATE",
         );
+    }
+
+    #[test]
+    fn estimated_latency_without_dfn3_is_under_50_ms() {
+        let s = AppState::default();
+        let latency = s.estimated_latency_ms();
+        assert!(
+            (15.0..=50.0).contains(&latency),
+            "without DFN3 the budget should be in the 15–50 ms range, got {latency}"
+        );
+    }
+
+    #[test]
+    fn estimated_latency_increases_with_dfn3() {
+        let mut s = AppState::default();
+        let without = s.estimated_latency_ms();
+        s.enable_dfn3 = true;
+        let with = s.estimated_latency_ms();
+        // DFN3 only counts when the env var also points at a real
+        // file — which `default()` doesn't guarantee. Either the
+        // values are equal (env unset) or DFN3 adds ~30 ms.
+        if with > without {
+            let delta = with - without;
+            assert!(
+                (25.0..=35.0).contains(&delta),
+                "DFN3 should add ~30 ms, got {delta}"
+            );
+        }
     }
 }
