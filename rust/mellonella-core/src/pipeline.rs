@@ -335,8 +335,7 @@ pub fn process_offline(
     head.score_per_frame.append(&mut tail.score_per_frame);
     head.cos_sim_max_per_frame
         .append(&mut tail.cos_sim_max_per_frame);
-    head.f0_match_per_frame
-        .append(&mut tail.f0_match_per_frame);
+    head.f0_match_per_frame.append(&mut tail.f0_match_per_frame);
 
     // Mirror the historical `gate_decisions[0].0 == 0` precondition
     // `apply_envelope` was designed to expect. The streaming engine
@@ -614,7 +613,7 @@ fn process_offline_async(
     })
 }
 
-fn fbank_ecapa_one(
+pub(crate) fn fbank_ecapa_one(
     window: &[f32],
     fbank: &mut Fbank,
     ecapa: &mut EcapaTdnn,
@@ -625,7 +624,7 @@ fn fbank_ecapa_one(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_refresh_result(
+pub(crate) fn apply_refresh_result(
     embedding: Vec<f32>,
     f0_mu: f32,
     trigger_frame: usize,
