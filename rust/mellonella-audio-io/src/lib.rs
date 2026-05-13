@@ -62,13 +62,16 @@
     clippy::cast_sign_loss,
     clippy::needless_pass_by_value,
     clippy::must_use_candidate,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    clippy::too_many_arguments
 )]
 
 mod devices;
+mod recording;
 mod session;
 
 pub use devices::{list_input_devices, list_output_devices, AudioDevice, DeviceKind};
+pub use recording::Recorder;
 pub use session::{LiveSession, LiveSessionStats, SessionConfig, SessionEvent};
 
 /// Errors surfaced by the audio-IO crate.
