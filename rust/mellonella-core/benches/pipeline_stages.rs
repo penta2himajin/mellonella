@@ -226,6 +226,7 @@ fn bench_pipeline(c: &mut Criterion) {
         b.iter(|| {
             let result = process_offline(
                 black_box(&audio),
+                16_000,
                 &mut pool,
                 &pipeline_cfg,
                 &gate_cfg,
@@ -243,6 +244,7 @@ fn bench_pipeline(c: &mut Criterion) {
         b.iter(|| {
             let result = process_offline(
                 black_box(&audio),
+                16_000,
                 &mut pool,
                 &pipeline_cfg_async,
                 &gate_cfg,

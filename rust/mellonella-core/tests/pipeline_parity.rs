@@ -92,8 +92,15 @@ fn process_offline_matches_python_reference() {
         ..PipelineConfig::default()
     };
     let gate_cfg = GateConfig::default();
-    let result = process_offline(&audio, &mut pool, &pipeline_cfg, &gate_cfg, &mut components)
-        .expect("pipeline runs");
+    let result = process_offline(
+        &audio,
+        16_000,
+        &mut pool,
+        &pipeline_cfg,
+        &gate_cfg,
+        &mut components,
+    )
+    .expect("pipeline runs");
 
     assert_eq!(
         result.score_per_frame.len(),
