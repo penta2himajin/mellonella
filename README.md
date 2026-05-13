@@ -1,4 +1,10 @@
-# mellonella
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/icon-light.svg">
+    <img src="assets/icon-dark.svg" alt="" width="48" height="48" align="left">
+  </picture>
+  mellonella
+</h1>
 
 A real-time, single-target speaker voice filter — a hard-gating system that
 suppresses noise and lets through only the frames whose voiceprint matches the

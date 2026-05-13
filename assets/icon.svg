@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="mellonella">
+  <title>mellonella</title>
+  <desc>A simplified geometric mark for the mellonella project: a stylized moth with each side's forewing and translucent hindwing overlapping into a continuous fan, tilted 45°, with ultrasonic sound waves along the body axis (head and tail directions).</desc>
+  <g transform="rotate(45 32 32)">
+    <g fill="currentColor" fill-opacity="0.4">
+      <path d="M33 24 C47 23 56 30 54 36 C46 39 36 38 33 37 Z"/>
+      <path d="M31 24 C17 23 8 30 10 36 C18 39 28 38 31 37 Z"/>
+    </g>
+    <g fill="currentColor">
+      <path d="M33 22 C47 21 55 27 52 31 C46 33 36 32 33 31 Z"/>
+      <path d="M31 22 C17 21 9 27 12 31 C18 33 28 32 31 31 Z"/>
+      <ellipse cx="32" cy="32" rx="2" ry="12"/>
+    </g>
+    <g stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none">
+      <path d="M30.8 20.5 L29.2 18"/>
+      <path d="M33.2 20.5 L34.8 18"/>
+    </g>
+    <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+      <path d="M27 16 Q32 12 37 16"/>
+      <path d="M25 12 Q32 7 39 12" opacity="0.5"/>
+      <path d="M27 48 Q32 52 37 48"/>
+      <path d="M25 52 Q32 57 39 52" opacity="0.5"/>
+    </g>
+  </g>
+</svg>
