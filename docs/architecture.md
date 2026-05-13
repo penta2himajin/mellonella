@@ -203,17 +203,26 @@ The full Rustdoc — including the buffering model, parity contract against `pro
 
 ### Parity contract
 
-With `async_refresh = false`, chunking the same audio differently must produce the **same concatenated output** as a single `process_offline` call (at the same `audio_sample_rate`). A `streaming_chunk_invariance` test (chunks of 100 / 333 / 512 / 1024 samples) enforces this in the implementation PR. The existing `pipeline_parity` Rust↔Python parity fixture continues to use `process_offline` directly.
+At **identity rate** (`audio_sample_rate == pipeline.sample_rate`, 16 kHz throughout, resampler bypassed) and `async_refresh = false`:
 
-With `async_refresh = true`, the chunking-invariance property still holds within a single chunking strategy, but per-frame scores trail their refresh point by ≤ 1 ECAPA inference (~44 ms on the dev VM) — the same delay documented on `PipelineConfig::async_refresh`. The gate's `hangover_ms` already absorbs delays of that order, so audible behaviour is unchanged.
+- `StreamingPipeline::new → push_samples(audio) → flush` produces per-VAD-frame `gate_per_frame` and `score_per_frame` identical to `process_offline(audio, …)`. Verified by the `streaming_smoke` integration test `streaming_identity_rate_per_frame_matches_offline`.
+- Chunking the same audio in different patterns (one shot, 333, 512, 997, 1024 samples) produces byte-identical concatenated output. Verified by `streaming_identity_rate_chunk_invariance`.
+
+At **dual rate** (e.g. 48 kHz audio / 16 kHz decision):
+
+- `StreamingPipeline` uses a stateful `rubato::SincFixedOut` resampler; `process_offline` uses a one-shot `resample_to`. The two paths agree on overall behaviour (gate decisions, length within ±5 % of input) but are **not byte-identical** because the streaming and offline resamplers have different startup-delay characteristics. A follow-up step will unify the offline path on top of the streaming engine; the existing `pipeline_parity` Rust↔Python fixture stays at identity rate so it's unaffected by either path.
+
+With `async_refresh = true`:
+
+- Phase 3.5 step 9 routes async only through `process_offline_async`. `StreamingPipeline::new` returns an error when the flag is set (`PipelineError::Embedding` with a "not yet supported" message). Live async streaming needs a persistent worker lifecycle and lands in a later step.
 
 ### Diagnostics
 
 `StreamingConfig::diagnostics` (default `false`) gates the per-VAD-frame trace arrays on `StreamingOutput`. The live hot path skips the allocation; the GUI can opt in only while a "live status" panel is open.
 
-### Migration path for the offline pipeline
+### Migration path for the offline pipeline (deferred)
 
-`process_offline` will be re-expressed as a thin wrapper that builds a `StreamingPipeline` (with `audio_sample_rate` forwarded from the call), calls `push_samples` once with the whole buffer, then `flush`. The wrapper concatenates outputs into the existing `ProcessResult` shape, preserving the Rust↔Python parity fixture byte-for-byte. The migration lands in the same PR as the streaming implementation.
+A follow-up step will re-express `process_offline` as a thin wrapper that builds a `StreamingPipeline`, calls `push_samples` once with the whole buffer, then `flush`. The wrapper will concatenate outputs into the existing `ProcessResult` shape while preserving the Rust↔Python parity fixture byte-for-byte. Until then both paths coexist; the streaming engine is the recommended target for new callers (CLI live mode, audio-IO crate, GUI).
 
 ### Latency budget (streaming)
 
