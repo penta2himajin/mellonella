@@ -296,8 +296,9 @@ impl MellonellaApp {
     fn render_status(&self, ui: &mut egui::Ui) {
         let s = self.state.last_stats;
         let secs = s.samples_processed as f32 / OUTPUT_SAMPLE_RATE as f32;
+        let latency_ms = self.state.estimated_latency_ms();
         ui.label(format!(
-            "Processed: {secs:.1} s   ·   overruns: {}   underruns: {}",
+            "Processed: {secs:.1} s   ·   latency: ~{latency_ms:.0} ms   ·   overruns: {}   underruns: {}",
             s.input_overruns, s.output_underruns
         ));
     }
