@@ -21,12 +21,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: install ALSA headers (cpal Linux backend)
-        # mellonella-audio-io depends on cpal; on Linux cpal builds
-        # against ALSA, which needs the dev headers + pkg-config
-        # metadata in addition to the runtime lib that runners ship
-        # with.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - name: install Linux build deps (cpal + eframe + tray-icon)
+        # mellonella-audio-io depends on cpal (ALSA on Linux);
+        # mellonella-gui pulls in eframe (winit / wayland / X11) and
+        # tray-icon (AppIndicator / GTK). All three need dev headers
+        # + pkg-config metadata on top of the runtime libs the
+        # runner ships with.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -1,0 +1,23 @@
+[package]
+name = "mellonella-gui"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mellonella desktop GUI — egui + system tray (Phase C WIP)"
+
+[[bin]]
+name = "mellonella-gui"
+path = "src/main.rs"
+
+[dependencies]
+mellonella-core = { path = "../mellonella-core" }
+mellonella-audio-io = { path = "../mellonella-audio-io" }
+eframe = { workspace = true }
+egui = { workspace = true }
+tray-icon = { workspace = true }
+rfd = { workspace = true }
+
+[lints]
+workspace = true
