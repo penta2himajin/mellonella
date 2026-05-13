@@ -69,6 +69,16 @@ pub struct AppState {
     /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
     /// otherwise (see [`Self::dfn3_available`]).
     pub enable_dfn3: bool,
+    /// User-adjustable gate / envelope parameters. Sliders in the
+    /// Settings panel mutate these in place; `start()` reads them
+    /// when building the `SessionConfig`. Defaults match
+    /// `GateConfig::default()`.
+    pub gate_cfg: GateConfig,
+    /// User-adjustable pipeline cadence (currently just
+    /// `sv_update_samples` — ECAPA refresh interval). Sliders in
+    /// the Settings panel mutate this; defaults match
+    /// `PipelineConfig::default()`.
+    pub pipeline_cfg: PipelineConfig,
     pub session: Option<LiveSession>,
     pub recorder: Option<Recorder>,
     pub last_error: Option<String>,
@@ -90,6 +100,8 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             enable_dfn3: false,
+            gate_cfg: GateConfig::default(),
+            pipeline_cfg: PipelineConfig::default(),
             session: None,
             recorder: None,
             last_error: None,
@@ -307,8 +319,8 @@ impl AppState {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
             streaming: StreamingConfig {
-                pipeline: PipelineConfig::default(),
-                gate: GateConfig::default(),
+                pipeline: self.pipeline_cfg,
+                gate: self.gate_cfg,
                 audio_sample_rate: OUTPUT_SAMPLE_RATE,
                 diagnostics: false,
             },
@@ -423,8 +435,7 @@ impl AppState {
     /// the host. Useful as a sanity check, not a benchmark.
     #[must_use]
     pub fn estimated_latency_ms(&self) -> f32 {
-        let gate_cfg = GateConfig::default();
-        let mut total = 5.0_f32 + 8.0 + gate_cfg.attack_ms;
+        let mut total = 5.0_f32 + 8.0 + self.gate_cfg.attack_ms;
         if self.enable_dfn3 && self.dfn3_available() {
             total += 30.0;
         }

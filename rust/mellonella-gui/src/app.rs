@@ -73,6 +73,8 @@ impl MellonellaApp {
             self.render_status(ui);
             ui.add_space(6.0);
             self.render_error_row(ui);
+            ui.add_space(6.0);
+            self.render_settings_panel(ui);
         });
     }
 
@@ -339,6 +341,59 @@ impl MellonellaApp {
             };
             ui.label(egui::RichText::new(gate_label).color(gate_colour));
         });
+    }
+
+    /// Step 19: collapsible "Settings" section with sliders for
+    /// the user-tunable gate / envelope / refresh-cadence
+    /// parameters. Disabled while a session is running — the
+    /// streaming pipeline reads the config at `LiveSession::new`,
+    /// not per-frame, so mid-stream changes wouldn't take effect
+    /// until Stop / Start anyway.
+    fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
+        let running = self.state.is_running();
+        egui::CollapsingHeader::new("Settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.label(
+                        egui::RichText::new("Tunable parameters (applied on next Start)")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.theta_pass, 0.0..=1.0)
+                            .text("theta_pass (gate threshold)")
+                            .fixed_decimals(2),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.hangover_ms, 0.0..=1000.0)
+                            .text("hangover_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.attack_ms, 0.0..=100.0)
+                            .text("attack_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.gate_cfg.release_ms, 0.0..=500.0)
+                            .text("release_ms")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.state.pipeline_cfg.sv_update_samples,
+                            1_000..=32_000,
+                        )
+                        .text("sv_update_samples (ECAPA refresh cadence @ 16 kHz)"),
+                    );
+                    if ui.button("Reset to defaults").clicked() {
+                        self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
+                        self.state.pipeline_cfg =
+                            mellonella_core::pipeline::PipelineConfig::default();
+                    }
+                });
+            });
     }
 
     fn render_error_row(&self, ui: &mut egui::Ui) {
