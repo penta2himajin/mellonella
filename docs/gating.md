@@ -47,6 +47,18 @@ The relation `θ_pass < θ_learn` is strictly enforced. Reasoning:
 
 This separation gives FP tolerance while keeping auto-learning's drift risk in check.
 
+## Pre-roll (lookback)
+
+Mirror of hangover at the leading edge. Silero-vad declares speech a few frames into the actual onset, so without compensation the head of each utterance (30–100 ms of fricatives / soft attacks) is muted by the envelope's fade-in. `PipelineConfig::pre_roll_ms` (default 100 ms, issue #80) controls a decision-rate ring buffer that is folded into the speech buffer on every OFF→ON transition; the **offline** path additionally shifts each OFF→ON gate decision back by `pre_roll_ms` before applying the envelope so the pre-trigger audio survives muting:
+
+```
+on_idx_shifted = max(prev_off_idx, on_idx - pre_roll_samples)
+```
+
+The streaming engine applies only the speech-buffer prepend (not the envelope shift), because shifting requires holding audio output back by `pre_roll_ms` and that would break the sub-100 ms live-latency target. Live callers that want the boundary shift in their output should buffer + reapply `apply_envelope` on the gate decisions the engine returns.
+
+Set `pre_roll_ms = 0` to disable both effects.
+
 ## Hangover
 
 Prevents the gate from flipping OFF during transient silences (closure before plosives, breaths, etc.):
@@ -148,23 +160,39 @@ if median(auto_learn_pool)'s anchor_distance > δ_reset (= 0.5):
 
 ECAPA-TDNN is essentially stable only on samples of 1 s or longer. However, holding a fixed 1-second buffer at all times mixes in silence regions and degrades accuracy.
 
-Fix: **append only frames marked as speech by silero-vad to the internal buffer**:
+Fix: **append only frames marked as speech by silero-vad to the internal buffer**, with a parallel pre-roll ring (issue #80) that captures the few frames preceding VAD onset and folds them into the buffer at the OFF→ON transition:
 
 ```
 let mut speech_buffer: VecDeque<f32> = VecDeque::new();
+let mut pre_roll_ring: VecDeque<f32> = VecDeque::new(); // capacity = pre_roll_ms * sr / 1000
 let mut last_emb_update: Instant = Instant::now();
+let mut prev_speech = false;
 
 for frame in input_stream {
     let dfn3_out = dfn3.process(frame);
     let downsampled = resample(dfn3_out, 48000, 16000);
     let vad_score = vad.process(downsampled);
+    let now_speech = vad_score > 0.5;
 
-    if vad_score > 0.5 {
+    if now_speech {
+        if !prev_speech {
+            // VAD OFF→ON: fold the pre-roll ring into the speech buffer
+            // so the next ECAPA refresh sees the pre-trigger audio.
+            for &s in &pre_roll_ring {
+                speech_buffer.push_back(s);
+                if speech_buffer.len() > MAX_BUFFER { speech_buffer.pop_front(); }
+            }
+        }
         speech_buffer.extend(downsampled);
         if speech_buffer.len() > MAX_BUFFER {
             speech_buffer.drain(..speech_buffer.len() - MAX_BUFFER);
         }
     }
+    prev_speech = now_speech;
+
+    // Pre-roll ring is always populated so it's ready for the next onset.
+    pre_roll_ring.extend(downsampled);
+    while pre_roll_ring.len() > PRE_ROLL_CAP { pre_roll_ring.pop_front(); }
 
     // Update SV every 250 ms once the buffer holds at least 1 s
     if last_emb_update.elapsed() > Duration::from_millis(250)
