@@ -52,6 +52,23 @@ gating has these advantages:
 accept that with an FP-tolerant policy: if the target voiceprint component is
 present in the frame, the frame passes.
 
+## GUI
+
+The `mellonella-gui` crate ships an egui front-end with system-tray
+integration for the live filter (Linux / macOS / Windows). Screenshots
+below are from the Linux build under a dark theme.
+
+| Main window (idle) | Settings expanded |
+|---|---|
+| <img src="assets/screenshots/gui-main.png" alt="Mellonella main window — idle" width="320"> | <img src="assets/screenshots/gui-settings.png" alt="Mellonella settings panel expanded" width="320"> |
+
+Top to bottom: enrollment (WAV import or in-app mic record), input /
+output device pickers, Start / Stop with status light, optional DFN3
+noise suppression, mic / output level meters with gate indicator,
+processed-seconds / latency / overrun counters, and a collapsible
+Settings panel exposing the gating knobs (`theta_pass`, `hangover_ms`,
+`attack_ms`, `release_ms`, `sv_update_samples`).
+
 ## Documentation
 
 | Doc | Contents |
