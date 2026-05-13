@@ -1,11 +1,48 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="mellonella">
   <title>mellonella</title>
-  <desc>A stylized lateral silhouette of the greater wax moth (Galleria mellonella): elongated wedge-shaped folded forewing tapering to a sharp apex at the back, a beak-like labial palp projecting forward, and a long swept-back filiform antenna. Ultrasonic sound waves radiate ahead, evoking the species' wide-band hearing.</desc>
-  <path fill="#f5f5f5" fill-rule="evenodd" d="M3 39 C4 31, 9 21, 24 16 C36 12.5, 45 15, 47 22 C47.8 26, 47.4 30, 46.4 32 L46.4 33 Q47.6 34, 49 34.4 Q53.6 34.6, 54 36 Q53.2 37, 50 37 L45 37 Q40 38, 30 38.6 L3 39 Z M46.2 30.4 m-1 0 a1 1 0 1 0 2 0 a1 1 0 1 0 -2 0 Z"/>
-  <g fill="none" stroke="#f5f5f5" stroke-linecap="round">
-    <path d="M46 28 C40 18, 28 11, 12 10" stroke-width="1.5"/>
-    <path d="M56 30 Q60 36 56 42" stroke-width="2.2"/>
-    <path d="M59 24 Q63.8 36 59 48" stroke-width="2.2" opacity="0.55"/>
+  <desc>A stylized dorsal (pinned-specimen) silhouette of the greater wax moth (Galleria mellonella): forewing and hindwing on each side overlap into a continuous fan, with the male's distinctive concave outer (terminal) forewing margin and the hindwing peeking out below. Long swept-back filiform antennae, tapering abdomen, and flanking ultrasonic sound waves.</desc>
+  <g fill="#f5f5f5">
+    <path d="M32 22
+             Q39 22.5, 45 25.5
+             Q48 28.5, 46.5 32
+             Q42.5 35, 37 34.5
+             Q33 34, 32 31 Z"/>
+    <path d="M32 22
+             Q25 22.5, 19 25.5
+             Q16 28.5, 17.5 32
+             Q21.5 35, 27 34.5
+             Q31 34, 32 31 Z"/>
+    <path d="M32 14.5
+             Q41 13, 49.5 15
+             Q54.5 16.5, 55 19.5
+             Q53.5 22, 50.5 23.5
+             Q49 26, 47 27
+             Q41 27.5, 32 25 Z"/>
+    <path d="M32 14.5
+             Q23 13, 14.5 15
+             Q9.5 16.5, 9 19.5
+             Q10.5 22, 13.5 23.5
+             Q15 26, 17 27
+             Q23 27.5, 32 25 Z"/>
+    <path d="M32 13.6
+             Q34.4 13.8, 34.6 17.5
+             Q34.2 22, 33.5 26.5
+             Q32.7 34, 32.2 40.4
+             Q32 42, 31.8 40.4
+             Q31.3 34, 30.5 26.5
+             Q29.8 22, 29.4 17.5
+             Q29.6 13.8, 32 13.6 Z"/>
+    <circle cx="32" cy="12" r="2.1"/>
+  </g>
+  <g fill="none" stroke="#f5f5f5" stroke-linecap="round" stroke-width="1.5">
+    <path d="M30.8 10.2 C27 7, 23 5, 18.5 4"/>
+    <path d="M33.2 10.2 C37 7, 41 5, 45.5 4"/>
+  </g>
+  <g fill="none" stroke="#f5f5f5" stroke-linecap="round" stroke-width="2">
+    <path d="M57.6 22 Q61.4 28 57.6 34"/>
+    <path d="M60.6 17.5 Q64.6 28 60.6 38.5" opacity="0.55"/>
+    <path d="M6.4 22 Q2.6 28 6.4 34"/>
+    <path d="M3.4 17.5 Q-0.6 28 3.4 38.5" opacity="0.55"/>
   </g>
 </svg>
