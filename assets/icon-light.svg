@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="mellonella">
+  <title>mellonella</title>
+  <desc>A stylized greater wax moth (Galleria mellonella) with ultrasonic sound waves radiating from each side, representing a real-time single-target voice filter.</desc>
+  <g fill="#f5f5f5" stroke="none">
+    <circle cx="32" cy="21.5" r="2.4"/>
+    <ellipse cx="32" cy="38" rx="2.1" ry="11.8"/>
+    <path d="M32 26.2 C24 22.4, 17.5 25.6, 16.4 35.2 C20.8 40.4, 28 39.2, 32 36.2 Z"/>
+    <path d="M32 26.2 C40 22.4, 46.5 25.6, 47.6 35.2 C43.2 40.4, 36 39.2, 32 36.2 Z"/>
+    <path d="M32 38 C26 39.6, 21.6 45.4, 24.6 51.2 C29.6 52.4, 32 47.4, 32 43.4 Z"/>
+    <path d="M32 38 C38 39.6, 42.4 45.4, 39.4 51.2 C34.4 52.4, 32 47.4, 32 43.4 Z"/>
+  </g>
+  <g fill="none" stroke="#f5f5f5" stroke-width="1.8" stroke-linecap="round">
+    <path d="M30.6 19.8 Q27 15 23.8 12"/>
+    <path d="M33.4 19.8 Q37 15 40.2 12"/>
+  </g>
+  <g fill="none" stroke="#f5f5f5" stroke-linecap="round" stroke-width="2">
+    <path d="M51.4 27 Q56.4 32 51.4 37"/>
+    <path d="M55.6 22 Q62.6 32 55.6 42" opacity="0.55"/>
+    <path d="M12.6 27 Q7.6 32 12.6 37"/>
+    <path d="M8.4 22 Q1.4 32 8.4 42" opacity="0.55"/>
+  </g>
+</svg>
