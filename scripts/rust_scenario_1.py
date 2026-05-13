@@ -103,7 +103,15 @@ def run_rust(input_wav: Path, enroll_wav: Path, work: Path) -> dict:
     )
 
     audio, sr = sf.read(str(out_wav), dtype="float32", always_2d=False)
-    assert sr == SR
+    # The Rust CLI emits 48 kHz output per `docs/architecture.md`'s
+    # Sampling-rate policy; resample down to the 16 kHz comparison rate.
+    if sr != SR:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        g = gcd(sr, SR)
+        audio = resample_poly(audio, SR // g, sr // g).astype(np.float32)
     diag = json.loads(diag_json.read_text())
     return {
         "audio": audio.astype(np.float32),
@@ -124,8 +132,8 @@ def run_python(mixture: np.ndarray, enroll: np.ndarray) -> dict:
     components = PipelineComponents.build_default(config)
     pool = enroll_from_recording(enroll, SR, config, components)
     result = process_offline(mixture, SR, pool, config, components)
-    # The Python pipeline emits 48 kHz output (D-002); resample to 16k
-    # for direct comparison with Rust which stays at 16 kHz throughout.
+    # Both pipelines emit 48 kHz output (D-002); resample to 16 kHz for
+    # direct comparison at the SR the metrics function assumes.
     audio_48k = result.audio
     if audio_48k.size != mixture.size:
         from scipy.signal import resample_poly

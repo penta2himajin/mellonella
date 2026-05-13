@@ -161,3 +161,11 @@ That is, *decision responsiveness* and *absolute output latency* are managed sep
 - Internal decision: 16 kHz (ECAPA-TDNN's native rate).
 
 The post-DFN3 48 kHz signal is downsampled to 16 kHz for the decision step; the output stays at 48 kHz. This preserves final output quality while keeping the decision-stage models on their training distribution.
+
+### Implementation
+
+In the Rust port this is realised by the dual-rate split inside `mellonella_core::pipeline`:
+
+- `process_offline` (and its `async_refresh` variant) take an `audio_sample_rate: u32` parameter alongside the `PipelineConfig::sample_rate` field. The former is the rate of the audio path (the WAV the caller hands in and the WAV the caller gets back); the latter is the rate of the decision path (16 kHz, fixed by ECAPA / VAD training distribution).
+- When the two rates differ, the pipeline resamples the input *once* to the decision rate, runs VAD / ECAPA / F0 on the downsampled copy, and applies the envelope to the **original-rate** audio. Decision-rate boundaries are mapped onto the audio-rate axis via integer scaling (`scale_to_audio_rate`) with half-up rounding to avoid drift on non-integer ratios.
+- The `mellonella` CLI sets `audio_sample_rate = 48_000` for `process`, so output WAVs are always 48 kHz mono 16-bit signed. Inputs at any common sample rate are resampled to 48 kHz on the way in. The same rate is the default for the future audio-IO crate and the GUI.

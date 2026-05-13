@@ -17,8 +17,16 @@
 //!   `load-dynamic` feature)
 //!
 //! Audio I/O accepts 16-bit signed-integer mono WAVs at any common
-//! sample rate; non-16 kHz inputs are resampled to 16 kHz via
-//! `mellonella_core::resample` before being fed into the pipeline.
+//! sample rate.
+//!
+//! * **Enroll** resamples the input to 16 kHz (ECAPA-TDNN's native
+//!   training rate) before feeding ECAPA.
+//! * **Process** resamples the input to **48 kHz** (DFN3's native
+//!   rate, full-band quality) for the audio path and downsamples
+//!   internally to 16 kHz for the decision path (VAD / ECAPA / F0).
+//!   Output is always written at 48 kHz mono — see `Sampling-rate
+//!   policy` in `docs/architecture.md`.
+//!
 //! 24-bit/32-bit/float WAVs are still rejected upfront — the SV
 //! pipeline operates on `f32` peak-normalised samples and re-coding
 //! those extra depths isn't worth the complexity today.
@@ -45,7 +53,16 @@ use mellonella_core::pipeline::{
 use mellonella_core::resample::resample_to;
 use mellonella_core::vad::SileroVad;
 
-const REQUIRED_SAMPLE_RATE: u32 = 16_000;
+/// Internal decision rate (ECAPA-TDNN's training rate). The pipeline
+/// downsamples to this rate for VAD / ECAPA / F0 only — the audio
+/// path stays at [`OUTPUT_SAMPLE_RATE`].
+const DECISION_SAMPLE_RATE: u32 = 16_000;
+
+/// Output audio rate (DFN3's native rate; what `docs/architecture.md`
+/// promises for the filtered output). Driven by the "decisions at
+/// 16 kHz, audio at 48 kHz" split — see the Sampling-rate policy
+/// section of that doc.
+const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -84,12 +101,12 @@ struct EnrollArgs {
 
 #[derive(Args, Debug)]
 struct ProcessArgs {
-    /// Input WAV (16-bit signed, mono; any common sample rate — resampled
-    /// to 16 kHz on the way in).
+    /// Input WAV (16-bit signed, mono; any common sample rate —
+    /// resampled to 48 kHz on the way in for the audio path).
     input: PathBuf,
     /// Enrollment JSON produced by `mellonella enroll`.
     enrollment: PathBuf,
-    /// Output WAV (will be 16-bit, 16 kHz, mono).
+    /// Output WAV (will be 16-bit, 48 kHz, mono).
     output: PathBuf,
     /// Run DFN3 noise suppression on the input before gating. See
     /// `EnrollArgs::enable_dfn3`.
@@ -167,7 +184,9 @@ fn apply_dfn3(audio_48k: &[f32]) -> Result<Vec<f32>, CliError> {
     Ok(enhanced)
 }
 
-fn read_wav_to_16k_mono(path: &Path, enable_dfn3: bool) -> Result<Vec<f32>, CliError> {
+/// Decode a 16-bit signed mono WAV into `f32` samples in `[-1, 1]`
+/// and return `(samples, sample_rate)` at the file's native rate.
+fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), CliError> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     if spec.channels != 1 {
@@ -187,47 +206,72 @@ fn read_wav_to_16k_mono(path: &Path, enable_dfn3: bool) -> Result<Vec<f32>, CliE
         .samples::<i16>()
         .map(|s| s.map(|v| f32::from(v) * scale))
         .collect();
-    let mut samples = samples?;
-    let mut current_sr = spec.sample_rate;
-
-    if enable_dfn3 {
-        // DFN3 operates at 48 kHz natively.
-        if current_sr != DFN3_SR as u32 {
-            let to_48k = resample_to(&samples, current_sr, DFN3_SR as u32).map_err(|e| {
-                CliError::Pipeline(format!("resample {current_sr}→{DFN3_SR} Hz for DFN3: {e}"))
-            })?;
-            eprintln!(
-                "[info] resampled {} Hz → {} Hz for DFN3 ({} → {} samples)",
-                current_sr,
-                DFN3_SR,
-                samples.len(),
-                to_48k.len()
-            );
-            samples = to_48k;
-            current_sr = DFN3_SR as u32;
-        }
-        samples = apply_dfn3(&samples)?;
-    }
-
-    if current_sr == REQUIRED_SAMPLE_RATE {
-        return Ok(samples);
-    }
-    let resampled = resample_to(&samples, current_sr, REQUIRED_SAMPLE_RATE)
-        .map_err(|e| CliError::Pipeline(format!("resample {current_sr}→16000 Hz: {e}")))?;
-    eprintln!(
-        "[info] resampled {} Hz → {} Hz ({} → {} samples)",
-        current_sr,
-        REQUIRED_SAMPLE_RATE,
-        samples.len(),
-        resampled.len()
-    );
-    Ok(resampled)
+    Ok((samples?, spec.sample_rate))
 }
 
-fn write_wav_16k_mono(path: &Path, audio: &[f32]) -> Result<(), CliError> {
+/// Resample `samples` to `target_sr` if it isn't already there,
+/// logging the transition for diagnostic noise.
+fn resample_with_log(
+    samples: &[f32],
+    current_sr: u32,
+    target_sr: u32,
+    purpose: &str,
+) -> Result<Vec<f32>, CliError> {
+    if current_sr == target_sr {
+        return Ok(samples.to_vec());
+    }
+    let out = resample_to(samples, current_sr, target_sr).map_err(|e| {
+        CliError::Pipeline(format!(
+            "resample {current_sr}→{target_sr} Hz ({purpose}): {e}"
+        ))
+    })?;
+    eprintln!(
+        "[info] resampled {} Hz → {} Hz for {purpose} ({} → {} samples)",
+        current_sr,
+        target_sr,
+        samples.len(),
+        out.len()
+    );
+    Ok(out)
+}
+
+/// Prepare audio for `enroll`: 16 kHz mono, optionally DFN3-cleaned
+/// at 48 kHz first.
+fn prepare_audio_for_enroll(path: &Path, enable_dfn3: bool) -> Result<Vec<f32>, CliError> {
+    let (mut samples, mut current_sr) = read_wav_mono(path)?;
+    if enable_dfn3 {
+        samples = resample_with_log(&samples, current_sr, DFN3_SR as u32, "DFN3 input")?;
+        current_sr = DFN3_SR as u32;
+        samples = apply_dfn3(&samples)?;
+    }
+    resample_with_log(
+        &samples,
+        current_sr,
+        DECISION_SAMPLE_RATE,
+        "ECAPA enrollment",
+    )
+}
+
+/// Prepare audio for `process`: 48 kHz mono (output rate),
+/// optionally DFN3-cleaned. `process_offline` downsamples internally
+/// for the decision path.
+fn prepare_audio_for_process(path: &Path, enable_dfn3: bool) -> Result<Vec<f32>, CliError> {
+    let (mut samples, mut current_sr) = read_wav_mono(path)?;
+    samples = resample_with_log(&samples, current_sr, OUTPUT_SAMPLE_RATE, "audio path")?;
+    current_sr = OUTPUT_SAMPLE_RATE;
+    if enable_dfn3 {
+        // DFN3's native rate is 48 kHz, which already matches the
+        // audio path — no extra resample.
+        debug_assert_eq!(current_sr, DFN3_SR as u32);
+        samples = apply_dfn3(&samples)?;
+    }
+    Ok(samples)
+}
+
+fn write_wav_mono(path: &Path, audio: &[f32], sample_rate: u32) -> Result<(), CliError> {
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: REQUIRED_SAMPLE_RATE,
+        sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
@@ -254,7 +298,7 @@ fn build_components() -> Result<PipelineComponents, CliError> {
         .map_err(|e| CliError::Pipeline(format!("Fbank init: {e}")))?;
     let ecapa = EcapaTdnn::from_onnx_path(&ecapa_path)
         .map_err(|e| CliError::Pipeline(format!("ECAPA load: {e}")))?;
-    let vad = SileroVad::from_onnx_path(&vad_path, REQUIRED_SAMPLE_RATE)
+    let vad = SileroVad::from_onnx_path(&vad_path, DECISION_SAMPLE_RATE)
         .map_err(|e| CliError::Pipeline(format!("VAD load: {e}")))?;
     Ok(PipelineComponents {
         vad,
@@ -265,7 +309,7 @@ fn build_components() -> Result<PipelineComponents, CliError> {
 }
 
 fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
-    let audio = read_wav_to_16k_mono(&args.input, args.enable_dfn3)?;
+    let audio = prepare_audio_for_enroll(&args.input, args.enable_dfn3)?;
     let mut components = build_components()?;
     let pool = enroll_from_recording(&audio, &mut components, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("enroll: {e}")))?;
@@ -283,28 +327,36 @@ fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
 }
 
 fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
-    let audio = read_wav_to_16k_mono(&args.input, args.enable_dfn3)?;
+    let audio = prepare_audio_for_process(&args.input, args.enable_dfn3)?;
     let mut pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
     let mut components = build_components()?;
     let cfg = PipelineConfig::default();
     let gate = GateConfig::default();
-    let result = process_offline(&audio, &mut pool, &cfg, &gate, &mut components)
-        .map_err(|e| CliError::Pipeline(format!("process: {e}")))?;
-    write_wav_16k_mono(&args.output, &result.audio)?;
+    let result = process_offline(
+        &audio,
+        OUTPUT_SAMPLE_RATE,
+        &mut pool,
+        &cfg,
+        &gate,
+        &mut components,
+    )
+    .map_err(|e| CliError::Pipeline(format!("process: {e}")))?;
+    write_wav_mono(&args.output, &result.audio, OUTPUT_SAMPLE_RATE)?;
     let on_frames = result.gate_per_frame.iter().filter(|&&v| v).count();
     let total = result.gate_per_frame.len().max(1);
     println!(
         "wrote {} ({:.2}s @ {} Hz, gate duty cycle {}%)",
         args.output.display(),
-        result.audio.len() as f32 / REQUIRED_SAMPLE_RATE as f32,
-        REQUIRED_SAMPLE_RATE,
+        result.audio.len() as f32 / OUTPUT_SAMPLE_RATE as f32,
+        OUTPUT_SAMPLE_RATE,
         on_frames * 100 / total,
     );
     if let Some(diag_path) = args.gate_decisions {
         let payload = serde_json::json!({
             "version": 1,
-            "sample_rate": REQUIRED_SAMPLE_RATE,
+            "sample_rate": DECISION_SAMPLE_RATE,
+            "audio_sample_rate": OUTPUT_SAMPLE_RATE,
             "vad_frame_samples": 512,
             "gate_per_frame": result.gate_per_frame,
             "score_per_frame": result.score_per_frame,
@@ -339,7 +391,8 @@ fn cmd_info() {
     let dfn3 = std::env::var("MELLONELLA_DFN3_ONNX").unwrap_or_else(|_| "<unset>".into());
     let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| "<unset>".into());
     println!("mellonella-cli");
-    println!("  required sample rate : {REQUIRED_SAMPLE_RATE} Hz, mono, 16-bit signed");
+    println!("  output sample rate    : {OUTPUT_SAMPLE_RATE} Hz, mono, 16-bit signed");
+    println!("  decision sample rate  : {DECISION_SAMPLE_RATE} Hz (internal, VAD/ECAPA/F0)");
     println!("  MELLONELLA_ECAPA_ONNX = {ecapa}");
     println!("  MELLONELLA_VAD_ONNX   = {vad}");
     println!("  MELLONELLA_DFN3_ONNX  = {dfn3}");
