@@ -198,7 +198,7 @@ impl LiveSession {
             None => None,
         };
         if dfn3.is_some() {
-            eprintln!("[audio-io] noise suppression: ENABLED (+ ~1.02 s buffering latency)",);
+            eprintln!("[audio-io] noise suppression: ENABLED (+ ~1.02 s buffering latency)");
         }
 
         let worker = spawn_worker(
