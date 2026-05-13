@@ -249,6 +249,7 @@ impl MellonellaApp {
     fn render_run_controls(&mut self, ui: &mut egui::Ui) {
         let running = self.state.is_running();
         let can_start = self.state.can_start();
+        let dfn3_available = self.state.dfn3_available();
         ui.horizontal(|ui| {
             let label = if running { "Stop" } else { "Start" };
             let enabled = if running { true } else { can_start };
@@ -273,6 +274,22 @@ impl MellonellaApp {
                 egui::RichText::new("○ idle").color(egui::Color32::DARK_GRAY)
             };
             ui.label(status);
+        });
+        ui.horizontal(|ui| {
+            let tooltip = if dfn3_available {
+                "Run DFN3 noise suppression on the live audio path. Adds ~1.02 s buffering latency."
+            } else {
+                "Set MELLONELLA_DFN3_ONNX to enable noise suppression."
+            };
+            ui.add_enabled_ui(!running && dfn3_available, |ui| {
+                ui.checkbox(&mut self.state.enable_dfn3, "Enable noise suppression")
+                    .on_hover_text(tooltip);
+            });
+            if !dfn3_available {
+                ui.weak("(MELLONELLA_DFN3_ONNX not set)");
+            } else if self.state.enable_dfn3 {
+                ui.weak("+ ~1.02 s latency");
+            }
         });
     }
 

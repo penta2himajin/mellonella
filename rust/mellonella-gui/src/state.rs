@@ -65,6 +65,10 @@ pub struct AppState {
     /// selection survives a device-list refresh.
     pub selected_input: Option<String>,
     pub selected_output: Option<String>,
+    /// User-toggled "Enable noise suppression". Honoured only when
+    /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
+    /// otherwise (see [`Self::dfn3_available`]).
+    pub enable_dfn3: bool,
     pub session: Option<LiveSession>,
     pub recorder: Option<Recorder>,
     pub last_error: Option<String>,
@@ -85,11 +89,26 @@ impl Default for AppState {
             available_outputs,
             selected_input: None,
             selected_output: None,
+            enable_dfn3: false,
             session: None,
             recorder: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
         }
+    }
+}
+
+/// `Some(path)` when `MELLONELLA_DFN3_ONNX` is set and the file
+/// exists. Used by the UI to decide whether to enable the "Enable
+/// noise suppression" checkbox.
+#[must_use]
+pub fn dfn3_path_from_env() -> Option<PathBuf> {
+    let raw = std::env::var_os("MELLONELLA_DFN3_ONNX")?;
+    let p = PathBuf::from(raw);
+    if p.exists() {
+        Some(p)
+    } else {
+        None
     }
 }
 
@@ -272,6 +291,18 @@ impl AppState {
                 return;
             }
         };
+        let dfn3_onnx_path = if self.enable_dfn3 {
+            if let Some(p) = dfn3_path_from_env() {
+                Some(p)
+            } else {
+                self.last_error = Some(
+                    "MELLONELLA_DFN3_ONNX env var not set — can't enable noise suppression".into(),
+                );
+                return;
+            }
+        } else {
+            None
+        };
         let cfg = SessionConfig {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
@@ -282,6 +313,7 @@ impl AppState {
                 diagnostics: false,
             },
             ring_capacity_samples: 0,
+            dfn3_onnx_path,
         };
         match LiveSession::new(pool, components, cfg) {
             Ok(s) => {
@@ -337,6 +369,15 @@ impl AppState {
     #[must_use]
     pub fn can_start(&self) -> bool {
         self.pool.is_some() && self.session.is_none() && self.recorder.is_none()
+    }
+
+    /// Whether DFN3 noise suppression is reachable in this process
+    /// (env var set, file exists). The UI greys the toggle when
+    /// this returns `false`.
+    #[must_use]
+    #[allow(clippy::unused_self)] // method form is more discoverable from app.rs
+    pub fn dfn3_available(&self) -> bool {
+        dfn3_path_from_env().is_some()
     }
 }
 
