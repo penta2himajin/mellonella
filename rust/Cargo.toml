@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "mellonella-core",
     "mellonella-cli",
+    "mellonella-audio-io",
 ]
 
 [workspace.package]
@@ -23,6 +24,9 @@ deep_filter = { version = "0.2", default-features = false, features = ["transfor
 clap = { version = "4", features = ["derive"] }
 hound = "3"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+cpal = "0.15"
+crossbeam-channel = "0.5"
+ctrlc = "3"
 
 [profile.release]
 lto = "fat"
