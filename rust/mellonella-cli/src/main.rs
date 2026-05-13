@@ -109,10 +109,10 @@ struct LiveArgs {
     #[arg(long)]
     output_device: Option<String>,
     /// Run DFN3 noise suppression on the live audio path. Requires
-    /// `MELLONELLA_DFN3_ONNX`. **Adds ~1.02 s of buffering latency**
-    /// (DFN3's patched ONNX export is shape-locked to 102 STFT
-    /// frames per inference, so the worker has to accumulate that
-    /// much audio before the first enhanced sample is emitted).
+    /// `MELLONELLA_DFN3_ONNX` (the stateful per-frame export
+    /// produced by `scripts/export_dfn3_onnx.py`). Adds ~30 ms of
+    /// algorithmic latency (2-frame `conv_lookahead` + ~10 ms model
+    /// time) on top of the no-NS path.
     #[arg(long)]
     enable_dfn3: bool,
 }

@@ -47,16 +47,12 @@ pub struct SessionConfig {
     pub ring_capacity_samples: usize,
     /// When `Some(path)`, the worker runs DFN3 noise suppression on
     /// the captured audio (at 48 kHz) before handing it to the
-    /// streaming pipeline. `None` → no NS (current behaviour from
-    /// step 12).
+    /// streaming pipeline. `None` → no NS.
     ///
-    /// **Latency trade-off**: DFN3's patched ONNX export is locked
-    /// to 102 STFT frames per inference, which means the worker
-    /// has to buffer up to ~1.02 s of audio before the first
-    /// enhanced sample is available. Surface this trade-off to
-    /// users in the UI — the GUI's "Enable noise suppression"
-    /// checkbox tooltip and the CLI's `--enable-dfn3` flag both
-    /// document it.
+    /// Latency cost: the stateful per-frame DFN3 wrapper introduced
+    /// in step 13.5 adds ~30 ms of algorithmic latency (2-frame
+    /// conv lookahead + ~10 ms model). Negligible compared to the
+    /// previous 1.02 s the 102-frame export forced.
     pub dfn3_onnx_path: Option<PathBuf>,
 }
 
@@ -198,7 +194,7 @@ impl LiveSession {
             None => None,
         };
         if dfn3.is_some() {
-            eprintln!("[audio-io] noise suppression: ENABLED (+ ~1.02 s buffering latency)");
+            eprintln!("[audio-io] noise suppression: ENABLED (+ ~30 ms latency)");
         }
 
         let worker = spawn_worker(
