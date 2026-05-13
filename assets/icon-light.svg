@@ -13,14 +13,14 @@
       <ellipse cx="32" cy="32" rx="2" ry="12"/>
     </g>
     <g stroke="#f5f5f5" stroke-width="1.4" stroke-linecap="round" fill="none">
-      <path d="M30.8 21 L28.5 17"/>
-      <path d="M33.2 21 L35.5 17"/>
+      <path d="M30.8 20.5 L29.2 18"/>
+      <path d="M33.2 20.5 L34.8 18"/>
     </g>
     <g fill="none" stroke="#f5f5f5" stroke-width="2.2" stroke-linecap="round">
-      <path d="M27 13 Q32 9 37 13"/>
-      <path d="M25 8 Q32 3 39 8" opacity="0.5"/>
-      <path d="M27 51 Q32 55 37 51"/>
-      <path d="M25 56 Q32 61 39 56" opacity="0.5"/>
+      <path d="M27 16 Q32 12 37 16"/>
+      <path d="M25 12 Q32 7 39 12" opacity="0.5"/>
+      <path d="M27 48 Q32 52 37 48"/>
+      <path d="M25 52 Q32 57 39 52" opacity="0.5"/>
     </g>
   </g>
 </svg>
