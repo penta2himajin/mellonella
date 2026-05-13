@@ -118,6 +118,29 @@ pub struct PipelineConfig {
     /// default. Phase 3.5 step 7 introduced this for sub-100 ms
     /// streaming RTF (see `docs/benchmarks.md`).
     pub async_refresh: bool,
+    /// Force the gate off after this many ms of continuous VAD-silence,
+    /// regardless of `last_score`. The default `0.0` keeps the legacy
+    /// behaviour where the gate is purely score-driven (and so stays
+    /// open across silence as long as a previous refresh produced a
+    /// score above `theta_pass`).
+    ///
+    /// In clean DFN3 environments the noise that used to reset
+    /// `last_score` via VAD-positive noise frames is suppressed, so the
+    /// gate gets stuck open during silence. Setting this to e.g.
+    /// `1000.0` ms makes the gate fall after one second of detected
+    /// silence — a no-op in noisy environments (since
+    /// `silence_ms_since_speech` resets the moment VAD flips on) and
+    /// surgical for the denoised-silence case.
+    pub silence_force_off_ms: f32,
+    /// EMA smoothing factor applied to `last_score` on every refresh:
+    /// `last_score = alpha * new_score + (1 - alpha) * last_score`.
+    /// `1.0` (default) disables smoothing — the new score replaces the
+    /// old one as it always did. Lower values smooth out brief dips
+    /// (e.g. an embedding shift at speech-onset transients) that would
+    /// otherwise drag the gate below `theta_pass` for one refresh
+    /// cycle. The first refresh always overwrites (no smoothing
+    /// against the initial zero).
+    pub score_ema_alpha: f32,
 }
 
 impl Default for PipelineConfig {
@@ -131,6 +154,8 @@ impl Default for PipelineConfig {
             sv_min_new_samples_after_silence: 4_000,
             pre_roll_ms: 100,
             async_refresh: false,
+            silence_force_off_ms: 0.0,
+            score_ema_alpha: 1.0,
         }
     }
 }
@@ -186,6 +211,21 @@ pub enum AutoLearnKind {
     /// `EmbeddingPool::maybe_reset` cleared the auto-learn FIFO due to
     /// drift.
     Reset,
+}
+
+/// EMA smoothing for `last_score`: `alpha * new + (1 - alpha) * old`,
+/// with two shortcuts:
+///
+/// * `alpha >= 1.0` (or any value outside `[0, 1)`) → replace.
+/// * `last_score == 0.0` → also replace, so the first refresh seeds
+///   the smoother instead of blending against the initial zero.
+#[inline]
+#[must_use]
+pub(crate) fn smooth_score(last_score: f32, new_score: f32, alpha: f32) -> f32 {
+    if !(0.0..1.0).contains(&alpha) || last_score == 0.0 {
+        return new_score;
+    }
+    alpha * new_score + (1.0 - alpha) * last_score
 }
 
 /// Result of a single offline pipeline run.
@@ -487,6 +527,7 @@ fn process_offline_async(
     let mut new_speech_samples_after_silence = 0_usize;
     let mut prev_speech = false;
     let mut consecutive_speech_ms = 0.0_f32;
+    let mut silence_ms_since_speech = 0.0_f32;
     let mut last_score = 0.0_f32;
     let mut last_cs = 0.0_f32;
     let mut last_fm = 1.0_f32;
@@ -587,6 +628,11 @@ fn process_offline_async(
                 silence_seen_since_refresh = true;
                 new_speech_samples_after_silence = 0;
             }
+            if now_speech {
+                silence_ms_since_speech = 0.0;
+            } else {
+                silence_ms_since_speech += dt_ms;
+            }
             prev_speech = now_speech;
             samples_since_update += vad_frame;
 
@@ -635,6 +681,7 @@ fn process_offline_async(
                             cohort,
                             gate_cfg,
                             pipeline_cfg.enable_auto_learn,
+                            pipeline_cfg.score_ema_alpha,
                             &mut last_score,
                             &mut last_cs,
                             &mut last_fm,
@@ -655,7 +702,14 @@ fn process_offline_async(
                 }
             }
 
-            let is_on = gate_state.update(last_score, dt_ms);
+            let effective_score = if pipeline_cfg.silence_force_off_ms > 0.0
+                && silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms
+            {
+                0.0
+            } else {
+                last_score
+            };
+            let is_on = gate_state.update(effective_score, dt_ms);
             per_frame.push(is_on);
             score_per_frame.push(last_score);
             cs_per_frame.push(last_cs);
@@ -689,6 +743,7 @@ fn process_offline_async(
                 cohort,
                 gate_cfg,
                 pipeline_cfg.enable_auto_learn,
+                pipeline_cfg.score_ema_alpha,
                 &mut last_score,
                 &mut last_cs,
                 &mut last_fm,
@@ -756,6 +811,7 @@ pub(crate) fn apply_refresh_result(
     cohort: &[Vec<f32>],
     gate_cfg: &GateConfig,
     enable_auto_learn: bool,
+    score_ema_alpha: f32,
     last_score: &mut f32,
     last_cs: &mut f32,
     last_fm: &mut f32,
@@ -771,11 +827,12 @@ pub(crate) fn apply_refresh_result(
     let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
     *last_cs = cs;
     *last_fm = fm;
-    *last_score = if gate_cfg.use_as_norm && !cohort.is_empty() {
+    let new_score = if gate_cfg.use_as_norm && !cohort.is_empty() {
         as_norm_score(&embedding, cs, cohort, 20)
     } else {
         cs
     };
+    *last_score = smooth_score(*last_score, new_score, score_ema_alpha);
 
     if enable_auto_learn
         && should_admit_auto_learn(*last_score, fm, consecutive_speech_ms, gate_cfg)

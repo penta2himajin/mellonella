@@ -485,11 +485,20 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
         None
     };
 
+    // Live mode opts into the silence force-off + score EMA smoothing
+    // that the library defaults leave dormant. Without these, the gate
+    // can stick open during DFN3-cleaned silence and flicker at speech
+    // onset — see project-mellonella-first-smoke for the diagnosis.
+    let live_pipeline_cfg = PipelineConfig {
+        silence_force_off_ms: 1000.0,
+        score_ema_alpha: 0.7,
+        ..PipelineConfig::default()
+    };
     let session_cfg = SessionConfig {
         input_device: args.input_device,
         output_device: args.output_device,
         streaming: StreamingConfig {
-            pipeline: PipelineConfig::default(),
+            pipeline: live_pipeline_cfg,
             gate: GateConfig::default(),
             audio_sample_rate: OUTPUT_SAMPLE_RATE,
             diagnostics: false,

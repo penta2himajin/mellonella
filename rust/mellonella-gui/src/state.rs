@@ -108,12 +108,32 @@ impl Default for AppState {
             enable_dfn3: false,
             record_duration_secs: DEFAULT_RECORD_SECS,
             gate_cfg: GateConfig::default(),
-            pipeline_cfg: PipelineConfig::default(),
+            pipeline_cfg: default_live_pipeline_cfg(),
             session: None,
             recorder: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
         }
+    }
+}
+
+/// Live-tuned `PipelineConfig` for GUI sessions: takes the library
+/// defaults and overrides the two fields whose library defaults are
+/// backward-compat no-ops (so existing tests against
+/// `PipelineConfig::default()` keep passing) but that matter for
+/// real-time mic use:
+///
+/// * `silence_force_off_ms = 1000` — close the gate after 1 s of
+///   continuous VAD-silence so it doesn't stick open under DFN3 (the
+///   bug surfaced after 2026-05-14 smoke).
+/// * `score_ema_alpha = 0.7` — smooth `last_score` updates across
+///   refreshes to ride out one-refresh dips at speech onset.
+#[must_use]
+pub fn default_live_pipeline_cfg() -> PipelineConfig {
+    PipelineConfig {
+        silence_force_off_ms: 1000.0,
+        score_ema_alpha: 0.7,
+        ..PipelineConfig::default()
     }
 }
 
