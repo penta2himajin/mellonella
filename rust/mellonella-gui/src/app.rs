@@ -68,6 +68,8 @@ impl MellonellaApp {
             ui.add_space(8.0);
             self.render_run_controls(ui);
             ui.add_space(8.0);
+            self.render_meters(ui);
+            ui.add_space(6.0);
             self.render_status(ui);
             ui.add_space(6.0);
             self.render_error_row(ui);
@@ -303,6 +305,42 @@ impl MellonellaApp {
         ));
     }
 
+    /// Step 18: live level meter + gate light. Renders two thin
+    /// progress bars (input RMS, output RMS) and a coloured circle
+    /// for the gate state. RMS is mapped via a log-ish scale so
+    /// quiet speech (~-30 dBFS) still shows movement.
+    fn render_meters(&self, ui: &mut egui::Ui) {
+        let running = self.state.is_running();
+        let in_rms = self.state.input_rms();
+        let out_rms = self.state.output_rms();
+        let gate_on = self.state.gate_on();
+
+        ui.horizontal(|ui| {
+            ui.label("Mic:");
+            ui.add(
+                egui::ProgressBar::new(rms_to_bar(in_rms))
+                    .desired_width(160.0)
+                    .desired_height(10.0)
+                    .fill(egui::Color32::from_rgb(80, 160, 220)),
+            );
+            ui.label("Out:");
+            ui.add(
+                egui::ProgressBar::new(rms_to_bar(out_rms))
+                    .desired_width(160.0)
+                    .desired_height(10.0)
+                    .fill(egui::Color32::from_rgb(180, 180, 80)),
+            );
+            let (gate_label, gate_colour) = if !running {
+                ("○ off", egui::Color32::DARK_GRAY)
+            } else if gate_on {
+                ("● gate ON", egui::Color32::from_rgb(80, 200, 120))
+            } else {
+                ("○ gate", egui::Color32::from_rgb(160, 80, 80))
+            };
+            ui.label(egui::RichText::new(gate_label).color(gate_colour));
+        });
+    }
+
     fn render_error_row(&self, ui: &mut egui::Ui) {
         if let Some(err) = &self.state.last_error {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
@@ -345,4 +383,17 @@ impl eframe::App for MellonellaApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// Map RMS in `[0, 1]` to a `[0, 1]` progress-bar reading via a
+/// pseudo-log scale: -60 dBFS → 0.0, 0 dBFS → 1.0. Conversational
+/// speech sits around -25 dBFS which lights about half the bar —
+/// the sweet spot for a level meter that "moves visibly" without
+/// pinning at the top.
+fn rms_to_bar(rms: f32) -> f32 {
+    if rms <= 1e-6 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }

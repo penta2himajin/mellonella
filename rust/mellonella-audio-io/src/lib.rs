@@ -63,7 +63,8 @@
     clippy::needless_pass_by_value,
     clippy::must_use_candidate,
     clippy::missing_errors_doc,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::too_many_lines
 )]
 
 mod devices;

@@ -385,6 +385,26 @@ impl AppState {
         dfn3_path_from_env().is_some()
     }
 
+    /// Latest input RMS from the worker (0.0 when no session is
+    /// running). Used by the GUI's level meter.
+    #[must_use]
+    pub fn input_rms(&self) -> f32 {
+        self.session.as_ref().map_or(0.0, LiveSession::input_rms)
+    }
+
+    /// Latest output (gate × envelope) RMS from the worker.
+    #[must_use]
+    pub fn output_rms(&self) -> f32 {
+        self.session.as_ref().map_or(0.0, LiveSession::output_rms)
+    }
+
+    /// Latest gate state — `true` when audio is currently being
+    /// passed through. `false` for both "gated off" and "no session".
+    #[must_use]
+    pub fn gate_on(&self) -> bool {
+        self.session.as_ref().is_some_and(LiveSession::gate_on)
+    }
+
     /// Estimated end-to-end output latency for the current
     /// configuration, in milliseconds. Used by the GUI status row
     /// so users can verify the live filter is in the right
