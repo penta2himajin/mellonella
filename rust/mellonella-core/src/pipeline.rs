@@ -430,8 +430,8 @@ pub fn process_offline(
     // head of each utterance survives muting. Streaming decisions are
     // at audio rate, so the shift is computed at audio rate.
     if pipeline_cfg.pre_roll_ms > 0 {
-        let shift_audio = (u64::from(pipeline_cfg.pre_roll_ms) * u64::from(audio_sample_rate)
-            / 1000) as usize;
+        let shift_audio =
+            (u64::from(pipeline_cfg.pre_roll_ms) * u64::from(audio_sample_rate) / 1000) as usize;
         shift_off_on_decisions_back(&mut decisions, shift_audio);
         head.audio = apply_envelope_dual_rate(
             audio,
@@ -965,12 +965,7 @@ mod tests {
     fn shift_off_on_collapses_zero_length_runs() {
         // OFF at 0, ON at 500, OFF at 600, ON at 800 → shift 200 →
         // second ON lands on 600 (== prior OFF). The OFF disappears.
-        let mut d = vec![
-            (0_usize, false),
-            (500, true),
-            (600, false),
-            (800, true),
-        ];
+        let mut d = vec![(0_usize, false), (500, true), (600, false), (800, true)];
         shift_off_on_decisions_back(&mut d, 200);
         assert_eq!(d, vec![(0, false), (300, true), (600, true)]);
     }

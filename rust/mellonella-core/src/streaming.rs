@@ -1334,7 +1334,13 @@ mod tests {
         // Buffer length stays at the cap; the oldest entries got
         // dropped to make room.
         assert_eq!(state.speech_buffer.len(), cap);
-        let last_512: Vec<f32> = state.speech_buffer.iter().rev().take(512).copied().collect();
+        let last_512: Vec<f32> = state
+            .speech_buffer
+            .iter()
+            .rev()
+            .take(512)
+            .copied()
+            .collect();
         assert!(last_512.iter().all(|&s| (s - 0.9).abs() < 1e-9));
     }
 
