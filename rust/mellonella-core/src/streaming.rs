@@ -522,10 +522,7 @@ impl StreamingState {
     ) -> Result<StreamingOutput, PipelineError> {
         self.audio_ring.extend(samples.iter().copied());
         let mut out = StreamingOutput::default();
-        loop {
-            let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? else {
-                break;
-            };
+        while let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? {
             self.step_one_frame(
                 &audio_chunk,
                 &decision_chunk,
@@ -559,10 +556,9 @@ impl StreamingState {
         let mut out = StreamingOutput::default();
         // Drain remaining whole frames (may be > 1 if the caller
         // pushed a chunk that's just shy of multiple frames).
-        while self.audio_ring.len() >= self.input_per_frame() {
-            let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? else {
-                break;
-            };
+        // `drain_one_frame` itself returns `None` when the ring no
+        // longer has a full frame's worth of samples.
+        while let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? {
             self.step_one_frame(
                 &audio_chunk,
                 &decision_chunk,
