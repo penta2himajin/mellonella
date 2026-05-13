@@ -1,23 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="mellonella">
   <title>mellonella</title>
-  <desc>A stylized greater wax moth (Galleria mellonella) with ultrasonic sound waves radiating from each side, representing a real-time single-target voice filter.</desc>
-  <g fill="currentColor" stroke="none">
-    <circle cx="32" cy="21.5" r="2.4"/>
-    <ellipse cx="32" cy="38" rx="2.1" ry="11.8"/>
-    <path d="M32 26.2 C24 22.4, 17.5 25.6, 16.4 35.2 C20.8 40.4, 28 39.2, 32 36.2 Z"/>
-    <path d="M32 26.2 C40 22.4, 46.5 25.6, 47.6 35.2 C43.2 40.4, 36 39.2, 32 36.2 Z"/>
-    <path d="M32 38 C26 39.6, 21.6 45.4, 24.6 51.2 C29.6 52.4, 32 47.4, 32 43.4 Z"/>
-    <path d="M32 38 C38 39.6, 42.4 45.4, 39.4 51.2 C34.4 52.4, 32 47.4, 32 43.4 Z"/>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-    <path d="M30.6 19.8 Q27 15 23.8 12"/>
-    <path d="M33.4 19.8 Q37 15 40.2 12"/>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2">
-    <path d="M51.4 27 Q56.4 32 51.4 37"/>
-    <path d="M55.6 22 Q62.6 32 55.6 42" opacity="0.55"/>
-    <path d="M12.6 27 Q7.6 32 12.6 37"/>
-    <path d="M8.4 22 Q1.4 32 8.4 42" opacity="0.55"/>
+  <desc>A stylized lateral silhouette of the greater wax moth (Galleria mellonella): elongated wedge-shaped folded forewing tapering to a sharp apex at the back, a beak-like labial palp projecting forward, and a long swept-back filiform antenna. Ultrasonic sound waves radiate ahead, evoking the species' wide-band hearing.</desc>
+  <path fill="currentColor" fill-rule="evenodd" d="M3 39 C4 31, 9 21, 24 16 C36 12.5, 45 15, 47 22 C47.8 26, 47.4 30, 46.4 32 L46.4 33 Q47.6 34, 49 34.4 Q53.6 34.6, 54 36 Q53.2 37, 50 37 L45 37 Q40 38, 30 38.6 L3 39 Z M46.2 30.4 m-1 0 a1 1 0 1 0 2 0 a1 1 0 1 0 -2 0 Z"/>
+  <g fill="none" stroke="currentColor" stroke-linecap="round">
+    <path d="M46 28 C40 18, 28 11, 12 10" stroke-width="1.5"/>
+    <path d="M56 30 Q60 36 56 42" stroke-width="2.2"/>
+    <path d="M59 24 Q63.8 36 59 48" stroke-width="2.2" opacity="0.55"/>
   </g>
 </svg>
