@@ -21,6 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: install ALSA headers (cpal Linux backend)
+        # mellonella-audio-io depends on cpal; on Linux cpal builds
+        # against ALSA, which needs the dev headers + pkg-config
+        # metadata in addition to the runtime lib that runners ship
+        # with.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

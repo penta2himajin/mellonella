@@ -41,7 +41,14 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use clap::{Args, Parser, Subcommand};
+use mellonella_audio_io::{
+    list_input_devices, list_output_devices, LiveSession, SessionConfig, SessionEvent,
+};
 use mellonella_core::dfn3::{Dfn3Pipeline, DFN3_SR, SAMPLES_PER_CHUNK};
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
@@ -51,6 +58,7 @@ use mellonella_core::pipeline::{
     enroll_from_recording, process_offline, PipelineComponents, PipelineConfig,
 };
 use mellonella_core::resample::resample_to;
+use mellonella_core::streaming::StreamingConfig;
 use mellonella_core::vad::SileroVad;
 
 /// Internal decision rate (ECAPA-TDNN's training rate). The pipeline
@@ -81,8 +89,25 @@ enum Cmd {
     Enroll(EnrollArgs),
     /// Apply the offline pipeline to a recording.
     Process(ProcessArgs),
+    /// List input / output audio devices (cpal default host).
+    Devices,
+    /// Run the live filter end-to-end: mic → pipeline → speaker.
+    Live(LiveArgs),
     /// Print resolved configuration + ONNX model paths.
     Info,
+}
+
+#[derive(Args, Debug)]
+struct LiveArgs {
+    /// Enrollment JSON produced by `mellonella enroll`.
+    enrollment: PathBuf,
+    /// Input device name (see `mellonella devices`). Defaults to the
+    /// host default input.
+    #[arg(long)]
+    input_device: Option<String>,
+    /// Output device name. Defaults to the host default output.
+    #[arg(long)]
+    output_device: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -385,6 +410,86 @@ fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn cmd_devices() -> Result<(), CliError> {
+    let inputs =
+        list_input_devices().map_err(|e| CliError::Pipeline(format!("list input devices: {e}")))?;
+    let outputs = list_output_devices()
+        .map_err(|e| CliError::Pipeline(format!("list output devices: {e}")))?;
+    println!("Input devices (* = default):");
+    if inputs.is_empty() {
+        println!("  (none)");
+    }
+    for d in &inputs {
+        println!("{d}");
+    }
+    println!();
+    println!("Output devices (* = default):");
+    if outputs.is_empty() {
+        println!("  (none)");
+    }
+    for d in &outputs {
+        println!("{d}");
+    }
+    Ok(())
+}
+
+fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
+    let pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
+        .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
+    let components = build_components()?;
+
+    let session_cfg = SessionConfig {
+        input_device: args.input_device,
+        output_device: args.output_device,
+        streaming: StreamingConfig {
+            pipeline: PipelineConfig::default(),
+            gate: GateConfig::default(),
+            audio_sample_rate: OUTPUT_SAMPLE_RATE,
+            diagnostics: false,
+        },
+        ring_capacity_samples: 0, // accept the audio-io default
+    };
+
+    let session = LiveSession::new(pool, components, session_cfg)
+        .map_err(|e| CliError::Pipeline(format!("open live session: {e}")))?;
+    eprintln!("[live] running. Ctrl+C to stop.");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    })
+    .map_err(|e| CliError::Pipeline(format!("install ctrl-c handler: {e}")))?;
+
+    let mut last_status = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(SessionEvent::Error(msg)) = session.try_recv_event() {
+            eprintln!("[live] pipeline error: {msg}");
+            break;
+        }
+        if last_status.elapsed() >= Duration::from_secs(2) {
+            let s = session.stats_snapshot();
+            let secs = s.samples_processed as f32 / OUTPUT_SAMPLE_RATE as f32;
+            eprintln!(
+                "[live] processed {:.1} s, overruns={} underruns={}",
+                secs, s.input_overruns, s.output_underruns,
+            );
+            last_status = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let final_stats = session
+        .stop()
+        .map_err(|e| CliError::Pipeline(format!("stop live session: {e}")))?;
+    let secs = final_stats.samples_processed as f32 / OUTPUT_SAMPLE_RATE as f32;
+    eprintln!(
+        "[live] stopped. processed {:.1} s, overruns={} underruns={}",
+        secs, final_stats.input_overruns, final_stats.output_underruns,
+    );
+    Ok(())
+}
+
 fn cmd_info() {
     let ecapa = std::env::var("MELLONELLA_ECAPA_ONNX").unwrap_or_else(|_| "<unset>".into());
     let vad = std::env::var("MELLONELLA_VAD_ONNX").unwrap_or_else(|_| "<unset>".into());
@@ -415,6 +520,8 @@ fn run() -> Result<(), CliError> {
     match Cli::parse().cmd {
         Cmd::Enroll(args) => cmd_enroll(args),
         Cmd::Process(args) => cmd_process(args),
+        Cmd::Devices => cmd_devices(),
+        Cmd::Live(args) => cmd_live(args),
         Cmd::Info => {
             cmd_info();
             Ok(())
