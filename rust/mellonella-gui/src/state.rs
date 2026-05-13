@@ -2,20 +2,27 @@
 //!
 //! Modelled as one flat struct rather than a `SessionState` enum
 //! because the UI inspects most fields independently of whether a
-//! live session is currently running (enrollment path, device
-//! selection, last error are all sticky across start/stop cycles).
+//! live session is currently running (enrollment, device selection,
+//! last error are all sticky across start/stop cycles).
+//!
+//! Enrollment is held as an **in-memory `EmbeddingPool`** rather
+//! than a path: the GUI offers WAV-file and mic-recording flows
+//! that build the pool directly without round-tripping through the
+//! enrollment JSON on disk. The JSON load / save buttons are
+//! exposed as power-user controls for CLI interop.
 
 use std::path::{Path, PathBuf};
 
 use mellonella_audio_io::{
-    list_input_devices, list_output_devices, AudioDevice, LiveSession, LiveSessionStats,
+    list_input_devices, list_output_devices, AudioDevice, LiveSession, LiveSessionStats, Recorder,
     SessionConfig, SessionEvent,
 };
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
 use mellonella_core::gating::GateConfig;
-use mellonella_core::pipeline::{PipelineComponents, PipelineConfig};
+use mellonella_core::pipeline::{enroll_from_recording, PipelineComponents, PipelineConfig};
+use mellonella_core::resample::resample_to;
 use mellonella_core::streaming::StreamingConfig;
 use mellonella_core::vad::SileroVad;
 
@@ -26,8 +33,28 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 /// Decision sample rate for VAD / ECAPA / F0 inside the pipeline.
 pub const DECISION_SAMPLE_RATE: u32 = 16_000;
 
+/// Default recording duration for the "Record" button. ECAPA's
+/// `EmbeddingPoolConfig::default()` accepts a 1 s window minimum,
+/// so 5 s is a comfortable margin that gives the model a chance to
+/// see speech variability without making the user wait.
+pub const DEFAULT_RECORD_SECS: f32 = 5.0;
+
+/// Where the current enrollment came from. Surfaced in the UI so
+/// users see "Recorded 5.0 s" vs "Loaded from voice.wav" vs
+/// "Loaded enrollment.json".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentOrigin {
+    None,
+    Wav(PathBuf),
+    Mic { secs: u32 },
+    Json(PathBuf),
+}
+
 pub struct AppState {
-    pub enrollment_path: Option<PathBuf>,
+    /// Current speaker pool. `None` until the user enrolls a voice.
+    /// Held in-memory so `Start` doesn't have to re-read JSON.
+    pub pool: Option<EmbeddingPool>,
+    pub origin: EnrollmentOrigin,
     pub pool_anchors: usize,
     pub pool_f0_mu: f32,
     pub pool_f0_sigma: f32,
@@ -39,6 +66,7 @@ pub struct AppState {
     pub selected_input: Option<String>,
     pub selected_output: Option<String>,
     pub session: Option<LiveSession>,
+    pub recorder: Option<Recorder>,
     pub last_error: Option<String>,
     pub last_stats: LiveSessionStats,
 }
@@ -48,7 +76,8 @@ impl Default for AppState {
         let available_inputs = list_input_devices().unwrap_or_default();
         let available_outputs = list_output_devices().unwrap_or_default();
         Self {
-            enrollment_path: None,
+            pool: None,
+            origin: EnrollmentOrigin::None,
             pool_anchors: 0,
             pool_f0_mu: 0.0,
             pool_f0_sigma: 0.0,
@@ -57,6 +86,7 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             session: None,
+            recorder: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
         }
@@ -64,29 +94,6 @@ impl Default for AppState {
 }
 
 impl AppState {
-    /// Try to load the enrollment JSON at `path`. On success records
-    /// metadata used by the UI (anchor count, F0 stats). On failure
-    /// clears any cached metadata and surfaces the error to the user.
-    pub fn load_enrollment(&mut self, path: &Path) {
-        match EmbeddingPool::load(path, EmbeddingPoolConfig::default()) {
-            Ok(pool) => {
-                let m = pool.metadata();
-                self.enrollment_path = Some(path.to_path_buf());
-                self.pool_anchors = pool.anchors().len();
-                self.pool_f0_mu = m.f0_mu;
-                self.pool_f0_sigma = m.f0_sigma;
-                self.last_error = None;
-            }
-            Err(e) => {
-                self.enrollment_path = None;
-                self.pool_anchors = 0;
-                self.pool_f0_mu = 0.0;
-                self.pool_f0_sigma = 0.0;
-                self.last_error = Some(format!("load enrollment: {e}"));
-            }
-        }
-    }
-
     /// Re-enumerate input/output devices from cpal. Preserves the
     /// existing selection if the named device is still present.
     pub fn refresh_devices(&mut self) {
@@ -105,8 +112,6 @@ impl AppState {
     }
 
     /// Build a fresh `PipelineComponents` from the ONNX env vars.
-    /// Used on every start (one ECAPA / VAD session per live run so
-    /// stopping fully releases ORT resources).
     fn build_components() -> Result<PipelineComponents, String> {
         let ecapa_path = std::env::var("MELLONELLA_ECAPA_ONNX")
             .map_err(|_| "MELLONELLA_ECAPA_ONNX env var not set".to_string())?;
@@ -125,23 +130,140 @@ impl AppState {
         })
     }
 
-    /// Spin up a `LiveSession`. Requires an enrollment to have been
-    /// loaded first. On failure records the message and leaves the
-    /// session field unchanged.
+    fn store_pool(&mut self, pool: EmbeddingPool, origin: EnrollmentOrigin) {
+        let m = pool.metadata();
+        self.pool_anchors = pool.anchors().len();
+        self.pool_f0_mu = m.f0_mu;
+        self.pool_f0_sigma = m.f0_sigma;
+        self.origin = origin;
+        self.pool = Some(pool);
+        self.last_error = None;
+    }
+
+    fn clear_pool(&mut self) {
+        self.pool = None;
+        self.origin = EnrollmentOrigin::None;
+        self.pool_anchors = 0;
+        self.pool_f0_mu = 0.0;
+        self.pool_f0_sigma = 0.0;
+    }
+
+    /// Load a pre-computed enrollment JSON (the CLI's
+    /// `mellonella enroll` output). Power-user path for parity with
+    /// the CLI workflow.
+    pub fn load_enrollment_json(&mut self, path: &Path) {
+        match EmbeddingPool::load(path, EmbeddingPoolConfig::default()) {
+            Ok(pool) => self.store_pool(pool, EnrollmentOrigin::Json(path.to_path_buf())),
+            Err(e) => {
+                self.clear_pool();
+                self.last_error = Some(format!("load enrollment: {e}"));
+            }
+        }
+    }
+
+    /// Save the current enrollment to JSON so it can be re-used
+    /// from the CLI or a future session.
+    pub fn save_enrollment_json(&mut self, path: &Path) {
+        let Some(pool) = self.pool.as_ref() else {
+            self.last_error = Some("nothing to save — enrol a voice first".into());
+            return;
+        };
+        match pool.save(path) {
+            Ok(()) => {
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.last_error = Some(format!("save enrollment: {e}"));
+            }
+        }
+    }
+
+    /// Read a clean voice recording from `path` (16-bit signed mono
+    /// WAV at any sample rate; resampled to 16 kHz internally), run
+    /// `enroll_from_recording`, and store the resulting pool.
+    pub fn enroll_from_wav(&mut self, path: &Path) {
+        match read_wav_to_16k_mono(path) {
+            Ok(audio) => self.run_enrollment(&audio, EnrollmentOrigin::Wav(path.to_path_buf())),
+            Err(e) => {
+                self.clear_pool();
+                self.last_error = Some(format!("read WAV: {e}"));
+            }
+        }
+    }
+
+    /// Kick off a mic recording of `secs` seconds at 16 kHz mono.
+    /// Call `poll_recorder` once per frame to detect completion.
+    pub fn start_recording(&mut self, secs: f32) {
+        if self.recorder.is_some() {
+            return;
+        }
+        match Recorder::start(self.selected_input.clone(), DECISION_SAMPLE_RATE, secs) {
+            Ok(r) => {
+                self.recorder = Some(r);
+                self.last_error = None;
+            }
+            Err(e) => self.last_error = Some(format!("start recording: {e}")),
+        }
+    }
+
+    /// Cancel an in-flight recording. The worker still returns
+    /// whatever it has collected, which the next `poll_recorder`
+    /// converts into an enrollment.
+    pub fn cancel_recording(&mut self) {
+        if let Some(r) = self.recorder.as_ref() {
+            r.cancel();
+        }
+    }
+
+    /// Poll the active recorder for completion. On success runs
+    /// enrolment on the captured buffer and stores the resulting
+    /// pool. Returns silently when no recorder is active or it's
+    /// still capturing.
+    pub fn poll_recorder(&mut self) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        let Some(result) = recorder.try_finish() else {
+            return;
+        };
+        // Recorder finished; pull it out and consume the result.
+        let target_secs = recorder.target_seconds().round() as u32;
+        self.recorder = None;
+        match result {
+            Ok(audio) => {
+                if audio.len() < DECISION_SAMPLE_RATE as usize {
+                    self.last_error =
+                        Some("recording too short for ECAPA enrolment (need ≥ 1 s)".to_string());
+                    return;
+                }
+                self.run_enrollment(&audio, EnrollmentOrigin::Mic { secs: target_secs });
+            }
+            Err(e) => self.last_error = Some(format!("recording failed: {e}")),
+        }
+    }
+
+    fn run_enrollment(&mut self, audio_16k: &[f32], origin: EnrollmentOrigin) {
+        let mut components = match Self::build_components() {
+            Ok(c) => c,
+            Err(e) => {
+                self.last_error = Some(e);
+                return;
+            }
+        };
+        match enroll_from_recording(audio_16k, &mut components, EmbeddingPoolConfig::default()) {
+            Ok(pool) => self.store_pool(pool, origin),
+            Err(e) => self.last_error = Some(format!("enrol: {e}")),
+        }
+    }
+
+    /// Spin up a `LiveSession` using the current in-memory pool.
     pub fn start(&mut self) {
         if self.session.is_some() {
             return;
         }
-        let Some(path) = self.enrollment_path.clone() else {
-            self.last_error = Some("load an enrollment JSON first".into());
+        let Some(pool) = self.pool.clone() else {
+            self.last_error = Some("enrol a voice first".into());
             return;
-        };
-        let pool = match EmbeddingPool::load(&path, EmbeddingPoolConfig::default()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.last_error = Some(format!("reload enrollment: {e}"));
-                return;
-            }
         };
         let components = match Self::build_components() {
             Ok(c) => c,
@@ -198,8 +320,6 @@ impl AppState {
         self.last_stats = session.stats_snapshot();
         if let Some(SessionEvent::Error(msg)) = session.try_recv_event() {
             self.last_error = Some(format!("pipeline error: {msg}"));
-            // Worker is dead; tear down the session shell so the UI
-            // returns to the Ready state.
             self.stop();
         }
     }
@@ -210,9 +330,42 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn can_start(&self) -> bool {
-        self.enrollment_path.is_some() && self.session.is_none()
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
     }
+
+    #[must_use]
+    pub fn can_start(&self) -> bool {
+        self.pool.is_some() && self.session.is_none() && self.recorder.is_none()
+    }
+}
+
+/// Decode a 16-bit signed mono WAV at any common rate into f32
+/// samples at 16 kHz mono — the rate `enroll_from_recording`
+/// expects. Mirrors the CLI's `read_wav_mono` + resample helper but
+/// inline so the GUI doesn't pull the CLI binary in as a dep.
+fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        return Err(format!("expected mono, got {} channels", spec.channels));
+    }
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err(format!(
+            "expected 16-bit signed int, got {:?} {}-bit",
+            spec.sample_format, spec.bits_per_sample
+        ));
+    }
+    let scale = 1.0_f32 / f32::from(i16::MAX);
+    let samples: Vec<f32> = reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| f32::from(v) * scale))
+        .collect::<Result<Vec<f32>, _>>()
+        .map_err(|e| e.to_string())?;
+    if spec.sample_rate == DECISION_SAMPLE_RATE {
+        return Ok(samples);
+    }
+    resample_to(&samples, spec.sample_rate, DECISION_SAMPLE_RATE).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -222,9 +375,11 @@ mod tests {
     #[test]
     fn default_state_is_idle() {
         let s = AppState::default();
-        assert!(s.enrollment_path.is_none());
+        assert!(s.pool.is_none());
         assert_eq!(s.pool_anchors, 0);
+        assert!(matches!(s.origin, EnrollmentOrigin::None));
         assert!(!s.is_running());
+        assert!(!s.is_recording());
         assert!(!s.can_start());
         assert!(s.last_error.is_none());
     }
@@ -232,25 +387,32 @@ mod tests {
     #[test]
     fn loading_a_missing_enrollment_records_an_error() {
         let mut s = AppState::default();
-        s.load_enrollment(std::path::Path::new(
+        s.load_enrollment_json(std::path::Path::new(
             "/no/such/enrollment-mellonella-gui-test.json",
         ));
         assert!(s.last_error.is_some(), "expected an error to be recorded");
-        assert!(s.enrollment_path.is_none());
+        assert!(s.pool.is_none());
+        assert!(matches!(s.origin, EnrollmentOrigin::None));
         assert!(!s.can_start());
+    }
+
+    #[test]
+    fn enroll_from_missing_wav_records_an_error() {
+        let mut s = AppState::default();
+        s.enroll_from_wav(std::path::Path::new(
+            "/no/such/audio-mellonella-gui-test.wav",
+        ));
+        assert!(s.last_error.is_some());
+        assert!(s.pool.is_none());
     }
 
     #[test]
     fn refresh_devices_clears_invalid_selection() {
         let mut s = AppState {
-            // A device name that won't be in any real enumeration.
             selected_input: Some("__not-a-real-device__".into()),
             ..AppState::default()
         };
         s.refresh_devices();
-        // The double-underscore-bracketed name is reserved for tests;
-        // no real cpal device will share it, so after refresh it must
-        // be cleared.
         assert!(s.selected_input.is_none());
     }
 

@@ -45,8 +45,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 280.0])
-            .with_min_inner_size([320.0, 200.0])
+            .with_inner_size([520.0, 340.0])
+            .with_min_inner_size([420.0, 280.0])
             .with_title("Mellonella"),
         ..Default::default()
     };
