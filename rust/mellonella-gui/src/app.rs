@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::state::{AppState, EnrollmentOrigin, DEFAULT_RECORD_SECS, OUTPUT_SAMPLE_RATE};
+use crate::state::{AppState, EnrollmentOrigin, OUTPUT_SAMPLE_RATE};
 use crate::tray::{TrayCommand, TrayHandles};
 
 pub struct MellonellaApp {
@@ -106,16 +106,26 @@ impl MellonellaApp {
                     self.state.enroll_from_wav(&path);
                 }
             }
+            let record_secs = self.state.record_duration_secs;
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(format!("Record ({DEFAULT_RECORD_SECS:.0}s)")),
+                    egui::Button::new(format!("Record ({record_secs:.0}s)")),
                 )
                 .on_hover_text("Record from the selected input device.")
                 .clicked()
             {
-                self.state.start_recording(DEFAULT_RECORD_SECS);
+                self.state.start_recording(record_secs);
             }
+            ui.add_enabled(
+                !busy,
+                egui::DragValue::new(&mut self.state.record_duration_secs)
+                    .speed(0.5)
+                    .range(1.0..=30.0)
+                    .suffix(" s")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Recording duration (1 – 30 s)");
             ui.separator();
             if ui
                 .add_enabled(!busy, egui::Button::new("Load JSON…"))
@@ -151,7 +161,7 @@ impl MellonellaApp {
             .state
             .recorder
             .as_ref()
-            .map_or((0.0, DEFAULT_RECORD_SECS, 0.0), |r| {
+            .map_or((0.0, self.state.record_duration_secs, 0.0), |r| {
                 (r.elapsed_seconds(), r.target_seconds(), r.progress())
             });
         ui.horizontal(|ui| {
