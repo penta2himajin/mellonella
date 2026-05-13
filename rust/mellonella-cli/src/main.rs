@@ -115,6 +115,40 @@ struct LiveArgs {
     /// time) on top of the no-NS path.
     #[arg(long)]
     enable_dfn3: bool,
+    /// Multi-channel input downmix strategy. `average` (default)
+    /// folds all channels together; `0` / `1` / `n` picks a
+    /// specific channel (0-indexed) for setups like a podcast
+    /// interface where one channel is the target signal.
+    #[arg(long, default_value = "average")]
+    input_channel: InputChannelArg,
+}
+
+#[derive(Clone, Debug)]
+enum InputChannelArg {
+    Average,
+    Channel(u16),
+}
+
+impl std::str::FromStr for InputChannelArg {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim().to_ascii_lowercase();
+        if s == "average" || s == "avg" || s == "mean" {
+            return Ok(Self::Average);
+        }
+        s.parse::<u16>()
+            .map(Self::Channel)
+            .map_err(|_| format!("expected 'average' or a non-negative channel index, got {s:?}"))
+    }
+}
+
+impl From<InputChannelArg> for mellonella_audio_io::ChannelStrategy {
+    fn from(v: InputChannelArg) -> Self {
+        match v {
+            InputChannelArg::Average => Self::Average,
+            InputChannelArg::Channel(n) => Self::Channel(n),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -462,6 +496,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
         },
         ring_capacity_samples: 0, // accept the audio-io default
         dfn3_onnx_path,
+        input_channel: args.input_channel.into(),
     };
 
     let session = LiveSession::new(pool, components, session_cfg)

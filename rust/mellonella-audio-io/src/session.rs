@@ -22,7 +22,7 @@ use rubato::{
 };
 
 use crate::devices::DeviceKind;
-use crate::{AudioIoError, INTERNAL_SAMPLE_RATE};
+use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
@@ -54,6 +54,13 @@ pub struct SessionConfig {
     /// conv lookahead + ~10 ms model). Negligible compared to the
     /// previous 1.02 s the 102-frame export forced.
     pub dfn3_onnx_path: Option<PathBuf>,
+    /// How to fold a multi-channel input device's interleaved
+    /// frames down to mono. Default `Average` — same as step 12's
+    /// hard-coded behaviour. Use `Channel(n)` to pick a specific
+    /// channel for setups where one channel is the target signal
+    /// and the others are room mics / reference channels (podcast
+    /// interface with host on ch 0, guest on ch 1, etc.).
+    pub input_channel: ChannelStrategy,
 }
 
 /// Stats surfaced when [`LiveSession::stop`] returns. Useful as a
@@ -169,6 +176,7 @@ impl LiveSession {
             input_sr,
             input_tx,
             input_overruns.clone(),
+            config.input_channel,
         )?;
         let output_stream = build_output_stream(
             &output_dev,
@@ -406,6 +414,7 @@ fn build_input_stream(
     device_sr: u32,
     input_tx: Sender<Vec<f32>>,
     overruns: Arc<AtomicU64>,
+    channel_strategy: ChannelStrategy,
 ) -> Result<Stream, AudioIoError> {
     let mut resampler = build_resampler(device_sr, INTERNAL_SAMPLE_RATE)?;
     let channels_usize = channels as usize;
@@ -414,19 +423,7 @@ fn build_input_stream(
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Downmix interleaved frames to mono by averaging.
-                let mut mono = Vec::with_capacity(data.len() / channels_usize);
-                let mut sum = 0.0_f32;
-                let mut count = 0_usize;
-                for (i, &s) in data.iter().enumerate() {
-                    sum += s;
-                    count += 1;
-                    if (i + 1) % channels_usize == 0 {
-                        mono.push(sum / count as f32);
-                        sum = 0.0;
-                        count = 0;
-                    }
-                }
+                let mono = channel_strategy.downmix(data, channels_usize);
                 let processed = match &mut resampler {
                     Some(r) => resample_one(r, &mono),
                     None => Ok(mono),
