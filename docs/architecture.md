@@ -161,3 +161,54 @@ That is, *decision responsiveness* and *absolute output latency* are managed sep
 - Internal decision: 16 kHz (ECAPA-TDNN's native rate).
 
 The post-DFN3 48 kHz signal is downsampled to 16 kHz for the decision step; the output stays at 48 kHz. This preserves final output quality while keeping the decision-stage models on their training distribution.
+
+## Streaming API (Phase 3.5 step 8 — design, step 9 — implementation)
+
+The offline `mellonella_core::pipeline::process_offline` function consumes a contiguous `&[f32]`. For live microphone use, GUI integrations, and any caller that produces samples incrementally, the engine also exposes a stateful streaming counterpart in `mellonella_core::streaming`.
+
+### Surface
+
+```text
+StreamingConfig { pipeline: PipelineConfig, gate: GateConfig, diagnostics: bool }
+
+StreamingPipeline::new(pool, config, components) -> Result<Self, PipelineError>
+    .push_samples(&[f32])               -> Result<StreamingOutput, PipelineError>
+    .flush()                            -> Result<StreamingOutput, PipelineError>
+    .pool() / .pool_mut() / .reset() / .into_parts()
+
+StreamingOutput { audio, events, [gate|score|cos_sim_max|f0_match]_per_frame }
+```
+
+The full Rustdoc — including the buffering model, parity contract against `process_offline`, and ownership rules — lives on the module itself. This section is the architectural-level summary; the source is the canonical spec.
+
+### Buffering model
+
+- **Input granularity**: any length, any cadence. Callers may push 1-sample or 100 000-sample chunks.
+- **Internal alignment**: VAD frames are 512 samples (32 ms @ 16 kHz, `vad::CHUNK_SAMPLES_16K`). Sub-frame residue is buffered in an internal ring until enough samples accumulate.
+- **Output granularity**: a multiple of 512 samples per call, plus envelope attack/release tail. Sub-frame residue produces zero output until the next call.
+- **Flush**: `flush()` zero-pads the residue to a full VAD frame so the trailing audio gets one last decision pass; intended for end-of-stream.
+
+### Parity contract
+
+With `async_refresh = false`, chunking the same audio differently must produce the **same concatenated output** as a single `process_offline` call. A `streaming_chunk_invariance` test (chunks of 100 / 333 / 512 / 1024 samples) enforces this in the implementation PR. The existing `pipeline_parity` Rust↔Python parity fixture continues to use `process_offline` directly.
+
+With `async_refresh = true`, the chunking-invariance property still holds within a single chunking strategy, but per-frame scores trail their refresh point by ≤ 1 ECAPA inference (~44 ms on the dev VM) — the same delay documented on `PipelineConfig::async_refresh`. The gate's `hangover_ms` already absorbs delays of that order, so audible behaviour is unchanged.
+
+### Diagnostics
+
+`StreamingConfig::diagnostics` (default `false`) gates the per-VAD-frame trace arrays on `StreamingOutput`. The live hot path skips the allocation; the GUI can opt in only while a "live status" panel is open.
+
+### Migration path for the offline pipeline
+
+`process_offline` will be re-expressed as a thin wrapper that builds a `StreamingPipeline`, calls `push_samples` once with the whole buffer, then `flush`. The wrapper concatenates outputs into the existing `ProcessResult` shape, preserving the Rust↔Python parity fixture byte-for-byte. The migration lands in the same PR as the streaming implementation.
+
+### Latency budget (streaming)
+
+The latency table above describes per-sample output latency, which the streaming path inherits unchanged. Additionally:
+
+| Source | Streaming contribution |
+|---|---|
+| Internal VAD frame alignment | up to one VAD frame (32 ms) of buffering when the caller pushes mid-frame chunks |
+| `flush()` zero-pad | one VAD frame of synthetic audio at end-of-stream |
+
+The caller controls input cadence (audio device callback size). For typical 10 ms callbacks, alignment buffering averages ~16 ms (half a VAD frame), well inside the 50–65 ms total latency budget.
