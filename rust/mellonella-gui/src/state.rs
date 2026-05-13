@@ -69,6 +69,11 @@ pub struct AppState {
     /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
     /// otherwise (see [`Self::dfn3_available`]).
     pub enable_dfn3: bool,
+    /// Mic-enrollment recording duration in seconds. Step 20 made
+    /// this user-configurable from the GUI (a slider next to the
+    /// Record button); default matches the previous fixed
+    /// [`DEFAULT_RECORD_SECS`] value.
+    pub record_duration_secs: f32,
     /// User-adjustable gate / envelope parameters. Sliders in the
     /// Settings panel mutate these in place; `start()` reads them
     /// when building the `SessionConfig`. Defaults match
@@ -100,6 +105,7 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             enable_dfn3: false,
+            record_duration_secs: DEFAULT_RECORD_SECS,
             gate_cfg: GateConfig::default(),
             pipeline_cfg: PipelineConfig::default(),
             session: None,
