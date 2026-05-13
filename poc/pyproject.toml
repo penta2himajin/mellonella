@@ -26,6 +26,7 @@ models = [
     "silero-vad>=5.1",
     "deepfilternet>=0.5.6",
     "librosa>=0.10",
+    "onnx>=1.16",
     "onnxruntime>=1.17",
 ]
 dev = [
