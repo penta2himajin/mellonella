@@ -314,6 +314,11 @@ impl AppState {
             },
             ring_capacity_samples: 0,
             dfn3_onnx_path,
+            // GUI uses the safe default; multi-channel mic users
+            // who want a specific channel use the CLI's
+            // `mellonella live --input-channel N` for now. A GUI
+            // dropdown is a small follow-up.
+            input_channel: mellonella_audio_io::ChannelStrategy::default(),
         };
         match LiveSession::new(pool, components, cfg) {
             Ok(s) => {

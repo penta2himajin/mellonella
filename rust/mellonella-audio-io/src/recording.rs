@@ -240,22 +240,11 @@ fn run_recording(
 }
 
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return data.to_vec();
-    }
-    let mut mono = Vec::with_capacity(data.len() / channels);
-    let mut sum = 0.0_f32;
-    let mut count = 0_usize;
-    for (i, &s) in data.iter().enumerate() {
-        sum += s;
-        count += 1;
-        if (i + 1) % channels == 0 {
-            mono.push(sum / count as f32);
-            sum = 0.0;
-            count = 0;
-        }
-    }
-    mono
+    // Recorder is shared between the GUI's mic-enrollment flow and
+    // potential future uses; it always averages because the
+    // typical "register my voice" scenario doesn't carry a
+    // channel-selection UI.
+    crate::ChannelStrategy::Average.downmix(data, channels)
 }
 
 fn build_resampler(src_sr: u32, dst_sr: u32) -> Result<Option<SincFixedIn<f32>>, AudioIoError> {
