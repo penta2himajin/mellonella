@@ -118,21 +118,29 @@ impl Default for AppState {
 }
 
 /// Live-tuned `PipelineConfig` for GUI sessions: takes the library
-/// defaults and overrides the two fields whose library defaults are
+/// defaults and overrides the fields whose library defaults are
 /// backward-compat no-ops (so existing tests against
 /// `PipelineConfig::default()` keep passing) but that matter for
 /// real-time mic use:
 ///
-/// * `silence_force_off_ms = 1000` — close the gate after 1 s of
-///   continuous VAD-silence so it doesn't stick open under DFN3 (the
-///   bug surfaced after 2026-05-14 smoke).
+/// * `silence_force_off_ms = 400` — close the gate immediately after
+///   400 ms of continuous VAD-silence. Longer than a typical
+///   inter-word pause (~250 ms) so normal speech doesn't trip it,
+///   but short enough that the gate closes within ~500 ms of the
+///   user actually stopping (400 ms + 100 ms envelope `release_ms`).
 /// * `score_ema_alpha = 0.7` — smooth `last_score` updates across
 ///   refreshes to ride out one-refresh dips at speech onset.
+/// * `sv_min_new_samples_after_silence = 1600` — fire the
+///   post-silence early refresh after only 100 ms of new speech
+///   (instead of the library-default 250 ms) so `last_score` catches
+///   up to the current speaker faster on resume. Cheap for a
+///   single-target system since there's no cross-speaker risk.
 #[must_use]
 pub fn default_live_pipeline_cfg() -> PipelineConfig {
     PipelineConfig {
-        silence_force_off_ms: 1000.0,
+        silence_force_off_ms: 400.0,
         score_ema_alpha: 0.7,
+        sv_min_new_samples_after_silence: 1_600,
         ..PipelineConfig::default()
     }
 }

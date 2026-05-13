@@ -118,19 +118,26 @@ pub struct PipelineConfig {
     /// default. Phase 3.5 step 7 introduced this for sub-100 ms
     /// streaming RTF (see `docs/benchmarks.md`).
     pub async_refresh: bool,
-    /// Force the gate off after this many ms of continuous VAD-silence,
-    /// regardless of `last_score`. The default `0.0` keeps the legacy
-    /// behaviour where the gate is purely score-driven (and so stays
-    /// open across silence as long as a previous refresh produced a
-    /// score above `theta_pass`).
+    /// Independent VAD-silence hangover: when `silence_ms_since_speech`
+    /// reaches this value, the gate is forced off **immediately**
+    /// regardless of `last_score` — bypassing `hangover_ms` rather
+    /// than stacking on top of it. The two hangovers combine via AND
+    /// (`is_on = score_gate AND silence_ms_since_speech <
+    /// silence_force_off_ms`), so the close time is exactly this
+    /// value plus the envelope's `release_ms` fade, not
+    /// `silence_force_off_ms + hangover_ms + release_ms`.
     ///
-    /// In clean DFN3 environments the noise that used to reset
-    /// `last_score` via VAD-positive noise frames is suppressed, so the
-    /// gate gets stuck open during silence. Setting this to e.g.
-    /// `1000.0` ms makes the gate fall after one second of detected
-    /// silence — a no-op in noisy environments (since
-    /// `silence_ms_since_speech` resets the moment VAD flips on) and
-    /// surgical for the denoised-silence case.
+    /// Default `0.0` disables the VAD-silence path entirely, leaving
+    /// the legacy purely-score-driven behaviour. Live callers (GUI,
+    /// CLI `live`) opt into a positive value because in clean DFN3
+    /// environments the noise that used to reset `last_score` via
+    /// VAD-positive noise frames is suppressed, so the score-side
+    /// gate stays open indefinitely on whatever the previous refresh
+    /// scored.
+    ///
+    /// Tuning: pick a value larger than typical inter-word pauses
+    /// (~250 ms) so normal speech doesn't trip the hangover; values
+    /// below ~200 ms flicker on natural mid-sentence breath.
     pub silence_force_off_ms: f32,
     /// EMA smoothing factor applied to `last_score` on every refresh:
     /// `last_score = alpha * new_score + (1 - alpha) * last_score`.
@@ -702,14 +709,10 @@ fn process_offline_async(
                 }
             }
 
-            let effective_score = if pipeline_cfg.silence_force_off_ms > 0.0
-                && silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms
-            {
-                0.0
-            } else {
-                last_score
-            };
-            let is_on = gate_state.update(effective_score, dt_ms);
+            let is_on_score = gate_state.update(last_score, dt_ms);
+            let is_on = is_on_score
+                && !(pipeline_cfg.silence_force_off_ms > 0.0
+                    && silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
             per_frame.push(is_on);
             score_per_frame.push(last_score);
             cs_per_frame.push(last_cs);

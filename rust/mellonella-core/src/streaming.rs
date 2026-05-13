@@ -780,14 +780,10 @@ impl StreamingState {
             }
         }
 
-        let effective_score = if pipeline_cfg.silence_force_off_ms > 0.0
-            && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms
-        {
-            0.0
-        } else {
-            self.last_score
-        };
-        let is_on = self.gate_state.update(effective_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on = is_on_score
+            && !(pipeline_cfg.silence_force_off_ms > 0.0
+                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
             out.score_per_frame.push(self.last_score);
@@ -911,14 +907,10 @@ impl StreamingState {
             }
         }
 
-        let effective_score = if pipeline_cfg.silence_force_off_ms > 0.0
-            && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms
-        {
-            0.0
-        } else {
-            self.last_score
-        };
-        let is_on = self.gate_state.update(effective_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on = is_on_score
+            && !(pipeline_cfg.silence_force_off_ms > 0.0
+                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
             out.score_per_frame.push(self.last_score);
