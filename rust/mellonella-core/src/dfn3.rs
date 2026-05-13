@@ -35,6 +35,7 @@
     clippy::match_same_arms
 )]
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 // The `deep_filter` crate is published as the `df` lib (see its
@@ -282,6 +283,103 @@ impl Dfn3Pipeline {
     }
 }
 
+/// Streaming wrapper around [`Dfn3Pipeline`] for live use.
+///
+/// `Dfn3Pipeline::process` requires a fixed [`SAMPLES_PER_CHUNK`]
+/// (48 960 samples ≈ 1.02 s @ 48 kHz) buffer because the patched
+/// DFN3 ONNX export is shape-locked to 102 STFT frames. Live audio
+/// callbacks deliver much smaller chunks (5–50 ms typical), so the
+/// streaming wrapper:
+///
+/// 1. accumulates incoming samples in an internal queue,
+/// 2. fires `Dfn3Pipeline::process` once a full chunk's worth is
+///    queued,
+/// 3. emits the enhanced audio in the same call,
+/// 4. on `flush`, zero-pads any residue to the next chunk boundary
+///    so the tail of a recording is still suppressed.
+///
+/// # Added latency
+///
+/// Because the ONNX export forces a 1.02-s window, the live path
+/// holds back **up to [`SAMPLES_PER_CHUNK`] samples worth of
+/// latency** on top of the existing 50–65 ms gating envelope
+/// budget. Live callers should surface this trade-off to users —
+/// the CLI's `--enable-dfn3` flag and the GUI's "Enable noise
+/// suppression" toggle both document it. A future export with a
+/// symbolic time dimension will let the wrapper drop the latency
+/// to the DFN3 model's intrinsic ~30 ms.
+pub struct Dfn3Streamer {
+    pipeline: Dfn3Pipeline,
+    /// Holds at most `SAMPLES_PER_CHUNK - 1` un-consumed samples
+    /// between `push_samples` calls. Grows briefly during a push
+    /// before whole-chunk units are drained.
+    input_buffer: VecDeque<f32>,
+}
+
+impl Dfn3Streamer {
+    /// Build a streamer that loads the DFN3 ONNX from `path`.
+    ///
+    /// # Errors
+    /// Forwards [`EmbeddingError`] from
+    /// [`Dfn3Pipeline::from_onnx_path`].
+    pub fn from_onnx_path(path: impl AsRef<Path>) -> Result<Self, EmbeddingError> {
+        Ok(Self {
+            pipeline: Dfn3Pipeline::from_onnx_path(path)?,
+            input_buffer: VecDeque::with_capacity(SAMPLES_PER_CHUNK * 2),
+        })
+    }
+
+    /// Append `samples` to the internal queue and emit any complete
+    /// enhanced chunks. The returned vector is a multiple of
+    /// [`SAMPLES_PER_CHUNK`] samples long (possibly empty when the
+    /// queue hasn't yet filled).
+    ///
+    /// # Errors
+    /// Forwards [`EmbeddingError`] from the underlying ONNX call.
+    pub fn push_samples(&mut self, samples: &[f32]) -> Result<Vec<f32>, EmbeddingError> {
+        self.input_buffer.extend(samples.iter().copied());
+        let mut out: Vec<f32> = Vec::new();
+        while self.input_buffer.len() >= SAMPLES_PER_CHUNK {
+            let chunk: Vec<f32> = self.input_buffer.drain(..SAMPLES_PER_CHUNK).collect();
+            let enhanced = self.pipeline.process(&chunk)?;
+            out.extend_from_slice(&enhanced);
+        }
+        Ok(out)
+    }
+
+    /// Drain any sub-chunk residue: zero-pad to one full chunk,
+    /// process it, and return the enhanced output. Returns an empty
+    /// `Vec` when the queue was already drained.
+    ///
+    /// # Errors
+    /// Forwards [`EmbeddingError`] from the underlying ONNX call.
+    pub fn flush(&mut self) -> Result<Vec<f32>, EmbeddingError> {
+        if self.input_buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut chunk = vec![0.0_f32; SAMPLES_PER_CHUNK];
+        for (i, s) in self.input_buffer.drain(..).enumerate() {
+            chunk[i] = s;
+        }
+        self.pipeline.process(&chunk)
+    }
+
+    /// Reset STFT memory + EMA states and clear the input queue.
+    /// Use between independent recordings; not needed between
+    /// consecutive frames of the same recording.
+    pub fn reset(&mut self) {
+        self.pipeline.reset();
+        self.input_buffer.clear();
+    }
+
+    /// Sub-chunk residue currently buffered (in samples). Useful
+    /// for the GUI's latency display once it lands.
+    #[must_use]
+    pub fn buffered_samples(&self) -> usize {
+        self.input_buffer.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +429,54 @@ mod tests {
         let feat_spec = vec![0.0_f32; FRAMES_PER_CHUNK * NB_DF * 2];
         let res = model.enhance_spec(&bad, &feat_erb, &feat_spec);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn streamer_invariants_dont_need_onnx() {
+        // Compile-time assertions of the chunk-size contract. Catches
+        // a future export that accidentally changes
+        // `SAMPLES_PER_CHUNK` without updating call sites that rely
+        // on the 1.02 s figure.
+        assert_eq!(SAMPLES_PER_CHUNK, FRAMES_PER_CHUNK * DFN3_HOP);
+        assert_eq!(SAMPLES_PER_CHUNK, 48_960);
+        // 1.02 s @ 48 kHz, to two decimals.
+        let secs = SAMPLES_PER_CHUNK as f32 / DFN3_SR as f32;
+        assert!((secs - 1.02).abs() < 0.01, "expected ~1.02 s, got {secs}");
+    }
+
+    #[test]
+    fn streamer_push_and_flush_round_trip() {
+        let Some(path) = skip_unless_onnx_available() else {
+            return;
+        };
+        let mut streamer = Dfn3Streamer::from_onnx_path(&path).expect("load DFN3 ONNX");
+        // Push less than one chunk — should emit nothing.
+        let head = vec![0.0_f32; 1024];
+        let out = streamer.push_samples(&head).expect("push");
+        assert!(out.is_empty(), "first sub-chunk push must hold output");
+        assert_eq!(streamer.buffered_samples(), 1024);
+
+        // Push enough to complete one chunk (1024 + remainder = SAMPLES_PER_CHUNK).
+        let body = vec![0.0_f32; SAMPLES_PER_CHUNK - 1024];
+        let out = streamer.push_samples(&body).expect("push");
+        assert_eq!(out.len(), SAMPLES_PER_CHUNK, "one full chunk should emit");
+        assert_eq!(streamer.buffered_samples(), 0);
+
+        // Trailing residue + flush.
+        let tail = vec![0.0_f32; 480];
+        let out = streamer.push_samples(&tail).expect("push");
+        assert!(
+            out.is_empty(),
+            "residue smaller than one chunk shouldn't emit"
+        );
+        let flushed = streamer.flush().expect("flush");
+        assert_eq!(
+            flushed.len(),
+            SAMPLES_PER_CHUNK,
+            "flush zero-pads to a full chunk"
+        );
+        // After flush the queue is empty; a second flush yields nothing.
+        let again = streamer.flush().expect("flush idempotent");
+        assert!(again.is_empty());
     }
 }

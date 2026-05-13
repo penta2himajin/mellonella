@@ -108,6 +108,13 @@ struct LiveArgs {
     /// Output device name. Defaults to the host default output.
     #[arg(long)]
     output_device: Option<String>,
+    /// Run DFN3 noise suppression on the live audio path. Requires
+    /// `MELLONELLA_DFN3_ONNX`. **Adds ~1.02 s of buffering latency**
+    /// (DFN3's patched ONNX export is shape-locked to 102 STFT
+    /// frames per inference, so the worker has to accumulate that
+    /// much audio before the first enhanced sample is emitted).
+    #[arg(long)]
+    enable_dfn3: bool,
 }
 
 #[derive(Args, Debug)]
@@ -438,6 +445,12 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
     let components = build_components()?;
 
+    let dfn3_onnx_path = if args.enable_dfn3 {
+        Some(env_path("MELLONELLA_DFN3_ONNX")?)
+    } else {
+        None
+    };
+
     let session_cfg = SessionConfig {
         input_device: args.input_device,
         output_device: args.output_device,
@@ -448,6 +461,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
             diagnostics: false,
         },
         ring_capacity_samples: 0, // accept the audio-io default
+        dfn3_onnx_path,
     };
 
     let session = LiveSession::new(pool, components, session_cfg)
