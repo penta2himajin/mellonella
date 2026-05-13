@@ -384,6 +384,32 @@ impl AppState {
     pub fn dfn3_available(&self) -> bool {
         dfn3_path_from_env().is_some()
     }
+
+    /// Estimated end-to-end output latency for the current
+    /// configuration, in milliseconds. Used by the GUI status row
+    /// so users can verify the live filter is in the right
+    /// ballpark for their use case (e.g. ≪ 100 ms for headphone
+    /// monitoring, < 200 ms for call apps).
+    ///
+    /// Breakdown:
+    ///
+    /// * resampler: ~5 ms
+    /// * VAD: < 10 ms (assume 8 ms)
+    /// * envelope attack: `gate.attack_ms`
+    /// * DFN3: ~30 ms when `enable_dfn3` is on, else 0
+    ///
+    /// This is the architecture doc's published budget — values
+    /// are conservative upper bounds, not measured per-frame on
+    /// the host. Useful as a sanity check, not a benchmark.
+    #[must_use]
+    pub fn estimated_latency_ms(&self) -> f32 {
+        let gate_cfg = GateConfig::default();
+        let mut total = 5.0_f32 + 8.0 + gate_cfg.attack_ms;
+        if self.enable_dfn3 && self.dfn3_available() {
+            total += 30.0;
+        }
+        total
+    }
 }
 
 /// Decode a 16-bit signed mono WAV at any common rate into f32
@@ -469,5 +495,33 @@ mod tests {
             mellonella_audio_io::INTERNAL_SAMPLE_RATE,
             "OUTPUT_SAMPLE_RATE must match mellonella-audio-io's INTERNAL_SAMPLE_RATE",
         );
+    }
+
+    #[test]
+    fn estimated_latency_without_dfn3_is_under_50_ms() {
+        let s = AppState::default();
+        let latency = s.estimated_latency_ms();
+        assert!(
+            (15.0..=50.0).contains(&latency),
+            "without DFN3 the budget should be in the 15–50 ms range, got {latency}"
+        );
+    }
+
+    #[test]
+    fn estimated_latency_increases_with_dfn3() {
+        let mut s = AppState::default();
+        let without = s.estimated_latency_ms();
+        s.enable_dfn3 = true;
+        let with = s.estimated_latency_ms();
+        // DFN3 only counts when the env var also points at a real
+        // file — which `default()` doesn't guarantee. Either the
+        // values are equal (env unset) or DFN3 adds ~30 ms.
+        if with > without {
+            let delta = with - without;
+            assert!(
+                (25.0..=35.0).contains(&delta),
+                "DFN3 should add ~30 ms, got {delta}"
+            );
+        }
     }
 }
