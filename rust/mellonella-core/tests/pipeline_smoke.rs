@@ -91,8 +91,15 @@ fn process_offline_runs_end_to_end() {
 
     let pipeline_cfg = PipelineConfig::default();
     let gate_cfg = GateConfig::default();
-    let result = process_offline(&audio, &mut pool, &pipeline_cfg, &gate_cfg, &mut components)
-        .expect("pipeline runs without error");
+    let result = process_offline(
+        &audio,
+        16_000,
+        &mut pool,
+        &pipeline_cfg,
+        &gate_cfg,
+        &mut components,
+    )
+    .expect("pipeline runs without error");
 
     // Output audio is the same length as input (no resample, no DFN3).
     assert_eq!(result.audio.len(), audio.len());
@@ -156,8 +163,15 @@ fn process_offline_async_runs_end_to_end() {
         ..PipelineConfig::default()
     };
     let gate_cfg = GateConfig::default();
-    let result = process_offline(&audio, &mut pool, &pipeline_cfg, &gate_cfg, &mut components)
-        .expect("async pipeline runs without error");
+    let result = process_offline(
+        &audio,
+        16_000,
+        &mut pool,
+        &pipeline_cfg,
+        &gate_cfg,
+        &mut components,
+    )
+    .expect("async pipeline runs without error");
 
     assert_eq!(result.audio.len(), audio.len());
     assert_eq!(result.gate_per_frame.len(), result.score_per_frame.len());

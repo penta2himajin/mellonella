@@ -162,14 +162,27 @@ That is, *decision responsiveness* and *absolute output latency* are managed sep
 
 The post-DFN3 48 kHz signal is downsampled to 16 kHz for the decision step; the output stays at 48 kHz. This preserves final output quality while keeping the decision-stage models on their training distribution.
 
+### Implementation
+
+In the Rust port this is realised by the dual-rate split inside `mellonella_core::pipeline`:
+
+- `process_offline` (and its `async_refresh` variant) take an `audio_sample_rate: u32` parameter alongside the `PipelineConfig::sample_rate` field. The former is the rate of the audio path (the WAV the caller hands in and the WAV the caller gets back); the latter is the rate of the decision path (16 kHz, fixed by ECAPA / VAD training distribution).
+- When the two rates differ, the pipeline resamples the input *once* to the decision rate, runs VAD / ECAPA / F0 on the downsampled copy, and applies the envelope to the **original-rate** audio. Decision-rate boundaries are mapped onto the audio-rate axis via integer scaling (`scale_to_audio_rate`) with half-up rounding to avoid drift on non-integer ratios.
+- The `mellonella` CLI sets `audio_sample_rate = 48_000` for `process`, so output WAVs are always 48 kHz mono 16-bit signed. Inputs at any common sample rate are resampled to 48 kHz on the way in. The same rate is the default for the future audio-IO crate and the GUI.
+
 ## Streaming API (Phase 3.5 step 8 — design, step 9 — implementation)
 
-The offline `mellonella_core::pipeline::process_offline` function consumes a contiguous `&[f32]`. For live microphone use, GUI integrations, and any caller that produces samples incrementally, the engine also exposes a stateful streaming counterpart in `mellonella_core::streaming`.
+The offline `mellonella_core::pipeline::process_offline` function consumes a contiguous `&[f32]`. For live microphone use, GUI integrations, and any caller that produces samples incrementally, the engine also exposes a stateful streaming counterpart in `mellonella_core::streaming`. It inherits the dual-rate split described above: callers push audio at the output rate (typically 48 kHz), the pipeline downsamples internally to 16 kHz for the decision path, and emits envelope-gated audio at the input rate.
 
 ### Surface
 
 ```text
-StreamingConfig { pipeline: PipelineConfig, gate: GateConfig, diagnostics: bool }
+StreamingConfig {
+    pipeline: PipelineConfig,            // decision-side cadence (sample_rate = 16 kHz)
+    gate: GateConfig,
+    audio_sample_rate: u32,              // audio-path rate (default 48 kHz)
+    diagnostics: bool,
+}
 
 StreamingPipeline::new(pool, config, components) -> Result<Self, PipelineError>
     .push_samples(&[f32])               -> Result<StreamingOutput, PipelineError>
@@ -183,14 +196,14 @@ The full Rustdoc — including the buffering model, parity contract against `pro
 
 ### Buffering model
 
-- **Input granularity**: any length, any cadence. Callers may push 1-sample or 100 000-sample chunks.
-- **Internal alignment**: VAD frames are 512 samples (32 ms @ 16 kHz, `vad::CHUNK_SAMPLES_16K`). Sub-frame residue is buffered in an internal ring until enough samples accumulate.
-- **Output granularity**: a multiple of 512 samples per call, plus envelope attack/release tail. Sub-frame residue produces zero output until the next call.
+- **Input granularity**: any length, any cadence, at `audio_sample_rate` (default 48 kHz). Callers may push 1-sample or 100 000-sample chunks.
+- **Internal alignment**: the audio is resampled to 16 kHz internally for the decision path; VAD frames are 512 samples (32 ms @ 16 kHz, `vad::CHUNK_SAMPLES_16K`). Sub-frame residue is buffered in a ring at the audio rate until enough samples accumulate.
+- **Output granularity**: a multiple of one VAD frame's audio-rate equivalent per call (e.g. 1536 samples @ 48 kHz, the integer scaling of 512 @ 16 kHz), plus envelope attack/release tail. Sub-frame residue produces zero output until the next call.
 - **Flush**: `flush()` zero-pads the residue to a full VAD frame so the trailing audio gets one last decision pass; intended for end-of-stream.
 
 ### Parity contract
 
-With `async_refresh = false`, chunking the same audio differently must produce the **same concatenated output** as a single `process_offline` call. A `streaming_chunk_invariance` test (chunks of 100 / 333 / 512 / 1024 samples) enforces this in the implementation PR. The existing `pipeline_parity` Rust↔Python parity fixture continues to use `process_offline` directly.
+With `async_refresh = false`, chunking the same audio differently must produce the **same concatenated output** as a single `process_offline` call (at the same `audio_sample_rate`). A `streaming_chunk_invariance` test (chunks of 100 / 333 / 512 / 1024 samples) enforces this in the implementation PR. The existing `pipeline_parity` Rust↔Python parity fixture continues to use `process_offline` directly.
 
 With `async_refresh = true`, the chunking-invariance property still holds within a single chunking strategy, but per-frame scores trail their refresh point by ≤ 1 ECAPA inference (~44 ms on the dev VM) — the same delay documented on `PipelineConfig::async_refresh`. The gate's `hangover_ms` already absorbs delays of that order, so audible behaviour is unchanged.
 
@@ -200,7 +213,7 @@ With `async_refresh = true`, the chunking-invariance property still holds within
 
 ### Migration path for the offline pipeline
 
-`process_offline` will be re-expressed as a thin wrapper that builds a `StreamingPipeline`, calls `push_samples` once with the whole buffer, then `flush`. The wrapper concatenates outputs into the existing `ProcessResult` shape, preserving the Rust↔Python parity fixture byte-for-byte. The migration lands in the same PR as the streaming implementation.
+`process_offline` will be re-expressed as a thin wrapper that builds a `StreamingPipeline` (with `audio_sample_rate` forwarded from the call), calls `push_samples` once with the whole buffer, then `flush`. The wrapper concatenates outputs into the existing `ProcessResult` shape, preserving the Rust↔Python parity fixture byte-for-byte. The migration lands in the same PR as the streaming implementation.
 
 ### Latency budget (streaming)
 

@@ -26,6 +26,8 @@
 
 use std::collections::VecDeque;
 
+use std::borrow::Cow;
+
 use crate::embedding::{EcapaTdnn, EmbeddingError};
 use crate::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
@@ -34,6 +36,7 @@ use crate::gating::{
     apply_envelope, as_norm_score, cos_sim_max_iter, f0_match, should_admit_auto_learn,
     ApplyEnvelopeError, GateConfig, GateState,
 };
+use crate::resample::{resample_to, ResampleError};
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 /// SV-side cadence for the offline pipeline.
@@ -180,6 +183,7 @@ pub struct ProcessResult {
 pub enum PipelineError {
     Embedding(EmbeddingError),
     Envelope(ApplyEnvelopeError),
+    Resample(ResampleError),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -187,6 +191,7 @@ impl std::fmt::Display for PipelineError {
         match self {
             Self::Embedding(e) => write!(f, "embedding error: {e}"),
             Self::Envelope(e) => write!(f, "envelope error: {e}"),
+            Self::Resample(e) => write!(f, "resample error: {e}"),
         }
     }
 }
@@ -196,6 +201,7 @@ impl std::error::Error for PipelineError {
         match self {
             Self::Embedding(e) => Some(e),
             Self::Envelope(_) => None,
+            Self::Resample(e) => Some(e),
         }
     }
 }
@@ -210,6 +216,70 @@ impl From<ApplyEnvelopeError> for PipelineError {
     fn from(e: ApplyEnvelopeError) -> Self {
         Self::Envelope(e)
     }
+}
+
+impl From<ResampleError> for PipelineError {
+    fn from(e: ResampleError) -> Self {
+        Self::Resample(e)
+    }
+}
+
+/// Resample `audio` from `audio_sr` to `decision_sr` for the
+/// decision-path consumers (VAD / ECAPA / F0). When the two rates
+/// match we borrow the input slice and avoid the
+/// `audio.to_vec()` round-trip baked into [`resample_to`]'s
+/// identity branch.
+fn audio_for_decisions(
+    audio: &[f32],
+    audio_sr: u32,
+    decision_sr: u32,
+) -> Result<Cow<'_, [f32]>, PipelineError> {
+    if audio_sr == decision_sr {
+        Ok(Cow::Borrowed(audio))
+    } else {
+        Ok(Cow::Owned(resample_to(audio, audio_sr, decision_sr)?))
+    }
+}
+
+/// Map a decision-rate sample index onto the audio-rate axis using a
+/// rounding integer formula (`u64` to avoid intermediate overflow on
+/// long offline clips). Identity-equivalent when the two rates match.
+fn scale_to_audio_rate(s_decision: usize, decision_sr: u32, audio_sr: u32) -> usize {
+    if decision_sr == audio_sr {
+        return s_decision;
+    }
+    let num = s_decision as u64 * u64::from(audio_sr);
+    let denom = u64::from(decision_sr);
+    // Round half-to-positive — symmetric and dependency-free.
+    let rounded = (num + denom / 2) / denom;
+    rounded as usize
+}
+
+/// Apply [`apply_envelope`] at the audio rate using decisions
+/// emitted in the decision-rate sample space. The first decision is
+/// always anchored at 0 (the offline orchestrators enforce that),
+/// and subsequent boundaries are scaled into the audio-rate axis
+/// before invocation. Output length matches `audio_out.len()` so
+/// downstream WAV writers can encode at the audio rate unchanged.
+fn apply_envelope_dual_rate(
+    audio_out: &[f32],
+    decisions_decision_rate: &[(usize, bool)],
+    audio_sr: u32,
+    decision_sr: u32,
+    gate_cfg: GateConfig,
+) -> Result<Vec<f32>, ApplyEnvelopeError> {
+    if audio_sr == decision_sr {
+        return apply_envelope(audio_out, decisions_decision_rate, audio_sr, gate_cfg);
+    }
+    let n_out = audio_out.len();
+    let mut scaled: Vec<(usize, bool)> = decisions_decision_rate
+        .iter()
+        .map(|&(s, on)| (scale_to_audio_rate(s, decision_sr, audio_sr).min(n_out), on))
+        .collect();
+    // De-duplicate boundaries that collapse after rounding so
+    // `apply_envelope`'s monotonic-boundary precondition holds.
+    scaled.dedup_by(|next, prev| next.0 == prev.0);
+    apply_envelope(audio_out, &scaled, audio_sr, gate_cfg)
 }
 
 /// Run the offline gating pipeline on a 16 kHz mono buffer.
@@ -227,17 +297,31 @@ impl From<ApplyEnvelopeError> for PipelineError {
 ///   surfaced to keep the contract explicit)
 pub fn process_offline(
     audio: &[f32],
+    audio_sample_rate: u32,
     pool: &mut EmbeddingPool,
     pipeline_cfg: &PipelineConfig,
     gate_cfg: &GateConfig,
     components: &mut PipelineComponents,
 ) -> Result<ProcessResult, PipelineError> {
     if pipeline_cfg.async_refresh {
-        return process_offline_async(audio, pool, pipeline_cfg, gate_cfg, components);
+        return process_offline_async(
+            audio,
+            audio_sample_rate,
+            pool,
+            pipeline_cfg,
+            gate_cfg,
+            components,
+        );
     }
     let vad_frame = CHUNK_SAMPLES_16K;
     let sv_sr = pipeline_cfg.sample_rate;
     let dt_ms = pipeline_cfg.vad_frame_ms();
+
+    // Decision-path buffer at the model-native (16 kHz) rate. The
+    // envelope is applied to the original-rate audio at the bottom
+    // so output quality stays at `audio_sample_rate`.
+    let decision_audio = audio_for_decisions(audio, audio_sample_rate, sv_sr)?;
+    let audio_dec: &[f32] = decision_audio.as_ref();
 
     // Ring buffer for the SV speech accumulator. VecDeque keeps drop-
     // oldest in O(1) so we don't pay an O(N) Vec::drain shift every
@@ -270,8 +354,8 @@ pub fn process_offline(
 
     let mut frame_start = 0_usize;
     let mut frame_idx = 0_usize;
-    while frame_start + vad_frame <= audio.len() {
-        let frame = &audio[frame_start..frame_start + vad_frame];
+    while frame_start + vad_frame <= audio_dec.len() {
+        let frame = &audio_dec[frame_start..frame_start + vad_frame];
 
         let speech_prob = components.vad.score(frame)?;
         let now_speech = speech_prob > pipeline_cfg.vad_threshold;
@@ -394,7 +478,8 @@ pub fn process_offline(
         decisions.insert(0, (0, first_on));
     }
 
-    let audio_out = apply_envelope(audio, &decisions, sv_sr, *gate_cfg)?;
+    let audio_out =
+        apply_envelope_dual_rate(audio, &decisions, audio_sample_rate, sv_sr, *gate_cfg)?;
     Ok(ProcessResult {
         audio: audio_out,
         gate_decisions: decisions,
@@ -419,6 +504,7 @@ pub fn process_offline(
 /// trade-off.
 fn process_offline_async(
     audio: &[f32],
+    audio_sample_rate: u32,
     pool: &mut EmbeddingPool,
     pipeline_cfg: &PipelineConfig,
     gate_cfg: &GateConfig,
@@ -427,6 +513,9 @@ fn process_offline_async(
     let vad_frame = CHUNK_SAMPLES_16K;
     let sv_sr = pipeline_cfg.sample_rate;
     let dt_ms = pipeline_cfg.vad_frame_ms();
+
+    let decision_audio = audio_for_decisions(audio, audio_sample_rate, sv_sr)?;
+    let audio_dec: &[f32] = decision_audio.as_ref();
 
     let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
     let mut samples_since_update = 0_usize;
@@ -500,8 +589,8 @@ fn process_offline_async(
         let mut frame_start = 0_usize;
         let mut frame_idx = 0_usize;
 
-        while frame_start + vad_frame <= audio.len() {
-            let frame = &audio[frame_start..frame_start + vad_frame];
+        while frame_start + vad_frame <= audio_dec.len() {
+            let frame = &audio_dec[frame_start..frame_start + vad_frame];
 
             let speech_prob = vad.score(frame)?;
             let now_speech = speech_prob > pipeline_cfg.vad_threshold;
@@ -641,7 +730,8 @@ fn process_offline_async(
         decisions.insert(0, (0, first_on));
     }
 
-    let audio_out = apply_envelope(audio, &decisions, sv_sr, *gate_cfg)?;
+    let audio_out =
+        apply_envelope_dual_rate(audio, &decisions, audio_sample_rate, sv_sr, *gate_cfg)?;
     Ok(ProcessResult {
         audio: audio_out,
         gate_decisions: decisions,
@@ -774,4 +864,106 @@ pub fn enroll_from_recording(
     pool.add_anchors(anchors);
     pool.set_f0_stats(f0_mu, f0_sigma);
     Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_to_audio_rate_identity() {
+        assert_eq!(scale_to_audio_rate(0, 16_000, 16_000), 0);
+        assert_eq!(scale_to_audio_rate(512, 16_000, 16_000), 512);
+        assert_eq!(scale_to_audio_rate(1_000_000, 48_000, 48_000), 1_000_000);
+    }
+
+    #[test]
+    fn scale_to_audio_rate_16k_to_48k_is_exact_triple() {
+        // 16 kHz → 48 kHz is the audio-path ratio when the CLI runs
+        // the pipeline. Multiplication is exact integer, no rounding.
+        assert_eq!(scale_to_audio_rate(0, 16_000, 48_000), 0);
+        assert_eq!(scale_to_audio_rate(512, 16_000, 48_000), 1536);
+        assert_eq!(scale_to_audio_rate(8000, 16_000, 48_000), 24_000);
+    }
+
+    #[test]
+    fn scale_to_audio_rate_rounds_half_up() {
+        // 16 kHz → 44.1 kHz is non-integer; verify boundary at 0.5
+        // rounds up (avoids the always-floor drift bias).
+        // 1 * 44100 / 16000 = 2.75625 → 3
+        assert_eq!(scale_to_audio_rate(1, 16_000, 44_100), 3);
+        // 100 * 44100 / 16000 = 275.625 → 276
+        assert_eq!(scale_to_audio_rate(100, 16_000, 44_100), 276);
+    }
+
+    #[test]
+    fn apply_envelope_dual_rate_identity_matches_apply_envelope() {
+        // When audio_sr == decision_sr the helper must be a pure
+        // pass-through to `apply_envelope` so existing parity fixtures
+        // stay byte-identical.
+        let audio = vec![0.5_f32; 1024];
+        let decisions = vec![(0_usize, true)];
+        let gate_cfg = GateConfig::default();
+        let envelope_direct = apply_envelope(&audio, &decisions, 16_000, gate_cfg).expect("direct");
+        let envelope_dual =
+            apply_envelope_dual_rate(&audio, &decisions, 16_000, 16_000, gate_cfg).expect("dual");
+        assert_eq!(envelope_direct, envelope_dual);
+    }
+
+    #[test]
+    fn apply_envelope_dual_rate_output_length_matches_audio_rate() {
+        // 1 s of 48 kHz audio (= 48 000 samples) with a single decision
+        // at 16 kHz boundary 0 must yield exactly 48 000 output samples.
+        let audio_48k = vec![0.5_f32; 48_000];
+        let decisions_16k = vec![(0_usize, true)];
+        let gate_cfg = GateConfig::default();
+        let out = apply_envelope_dual_rate(&audio_48k, &decisions_16k, 48_000, 16_000, gate_cfg)
+            .expect("dual-rate envelope");
+        assert_eq!(out.len(), 48_000);
+    }
+
+    #[test]
+    fn apply_envelope_dual_rate_collapses_rounding_dupes() {
+        // Two consecutive decisions whose decision-rate indices map to
+        // the same audio-rate sample after rounding (rare but possible
+        // for non-integer ratios with very dense decisions) must
+        // collapse so the monotonic-boundary precondition of
+        // `apply_envelope` holds. Construct an artificial case at a
+        // weird ratio.
+        let audio = vec![0.5_f32; 64];
+        // Decisions at 0 and 1 sample @ 16 kHz, output rate 1 kHz: both
+        // map to sample 0. After dedup we keep the first only and
+        // `apply_envelope` accepts the input.
+        let decisions = vec![(0_usize, false), (1_usize, true)];
+        let gate_cfg = GateConfig::default();
+        let out = apply_envelope_dual_rate(&audio, &decisions, 1_000, 16_000, gate_cfg)
+            .expect("dual-rate envelope tolerates collapsed boundaries");
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn audio_for_decisions_borrows_when_rates_match() {
+        let audio = vec![0.1_f32, 0.2, 0.3];
+        let cow = audio_for_decisions(&audio, 16_000, 16_000).expect("identity");
+        assert!(matches!(cow, Cow::Borrowed(_)));
+        assert_eq!(cow.as_ref(), audio.as_slice());
+    }
+
+    #[test]
+    fn audio_for_decisions_resamples_when_rates_differ() {
+        // 1 s @ 48 kHz of silence → roughly 16 kHz worth of samples after
+        // the windowed-sinc downsampler. The exact length is bounded by
+        // `resample_to`'s tests; we just verify the borrow/owned split.
+        let audio = vec![0.0_f32; 48_000];
+        let cow = audio_for_decisions(&audio, 48_000, 16_000).expect("downsample");
+        assert!(matches!(cow, Cow::Owned(_)));
+        let dec = cow.as_ref();
+        let expected = 16_000_i32;
+        let slack = expected / 100;
+        let got = dec.len() as i32;
+        assert!(
+            (got - expected).abs() <= slack,
+            "expected ≈ {expected} samples (±{slack}), got {got}"
+        );
+    }
 }

@@ -5,6 +5,13 @@
 //! microphone use, GUI integrations, and any caller that produces
 //! samples incrementally rather than as one contiguous buffer.
 //!
+//! It inherits the **dual-rate split** that
+//! [`crate::pipeline::process_offline`] lands in step 8: callers
+//! push audio at `StreamingConfig::audio_sample_rate` (default
+//! 48 kHz, full-band quality), the pipeline downsamples internally
+//! to 16 kHz for the VAD / ECAPA / F0 decision path, and emits
+//! envelope-gated audio at the input rate.
+//!
 //! # Status
 //!
 //! The types in this module are **API signatures only** — the bodies
@@ -17,16 +24,20 @@
 //!
 //! # Buffering model
 //!
-//! * **Input granularity**: any length, any cadence. Callers may push
+//! * **Input granularity**: any length, any cadence, at
+//!   `StreamingConfig::audio_sample_rate`. Callers may push
 //!   1-sample or 100 000-sample chunks and the pipeline does the
 //!   right thing.
 //! * **Internal alignment**: VAD frames are 512 samples (32 ms @
-//!   16 kHz, [`crate::vad::CHUNK_SAMPLES_16K`]). Sub-frame residue is
-//!   held in an internal ring buffer until enough samples accumulate.
-//! * **Output granularity**: a multiple of 512 samples per
-//!   `push_samples` call, plus whatever the envelope's
-//!   attack/release tail produces. Sub-frame residue produces zero
-//!   output until the next call.
+//!   16 kHz, [`crate::vad::CHUNK_SAMPLES_16K`]). The audio is
+//!   resampled to 16 kHz on the decision path; sub-frame residue is
+//!   held in an internal ring at the audio rate until enough
+//!   samples accumulate.
+//! * **Output granularity**: a multiple of one VAD frame's
+//!   audio-rate equivalent per `push_samples` call (e.g. 1536
+//!   samples @ 48 kHz, the integer scaling of 512 @ 16 kHz), plus
+//!   whatever the envelope's attack/release tail produces.
+//!   Sub-frame residue produces zero output until the next call.
 //! * **Flush**: [`StreamingPipeline::flush`] zero-pads any residual
 //!   sub-frame samples to a full VAD frame so the trailing audio
 //!   gets one last decision pass.
@@ -35,7 +46,8 @@
 //!
 //! With `StreamingConfig::pipeline.async_refresh == false`, chunking
 //! the same audio differently must produce the **same concatenated
-//! output** as one call to `process_offline`. This is enforced by a
+//! output** as one call to `process_offline` at the same
+//! `audio_sample_rate`. This is enforced by a
 //! `streaming_chunk_invariance` test introduced alongside the
 //! implementation PR.
 //!
@@ -70,23 +82,43 @@ use crate::pipeline::{AutoLearnEvent, PipelineComponents, PipelineConfig, Pipeli
 /// Configuration for [`StreamingPipeline`].
 ///
 /// `pipeline` and `gate` are the same structs the offline pipeline
-/// consumes; `diagnostics` is new — it gates per-VAD-frame trace
-/// arrays on the output struct so the GUI hot path doesn't allocate
-/// when those traces aren't needed.
-#[derive(Debug, Clone, Default)]
+/// consumes; `audio_sample_rate` and `diagnostics` are streaming-
+/// specific.
+#[derive(Debug, Clone)]
 pub struct StreamingConfig {
     /// Pipeline-side cadence (window / refresh / VAD threshold /
-    /// auto-learn switch / async refresh).
+    /// auto-learn switch / async refresh). `pipeline.sample_rate`
+    /// is the **decision** rate (16 kHz) — see the module
+    /// "Buffering model" doc for the dual-rate split.
     pub pipeline: PipelineConfig,
     /// Gate-side parameters (hangover, attack/release, score
     /// threshold, F0 weight).
     pub gate: GateConfig,
+    /// Sample rate of the audio path — the rate the caller pushes
+    /// into [`StreamingPipeline::push_samples`] and the rate the
+    /// returned envelope-gated audio is at. Default 48 000 Hz
+    /// (DFN3's native, full-band rate, per the
+    /// `docs/architecture.md` Sampling-rate policy). The pipeline
+    /// resamples internally to `pipeline.sample_rate` (16 kHz) for
+    /// the decision path.
+    pub audio_sample_rate: u32,
     /// When `true`, [`StreamingOutput`] populates
     /// `gate_per_frame` / `score_per_frame` /
     /// `cos_sim_max_per_frame` / `f0_match_per_frame`. Default
     /// `false` to avoid the per-call allocation in the live path —
     /// the GUI can opt in only while a "live status" panel is open.
     pub diagnostics: bool,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            pipeline: PipelineConfig::default(),
+            gate: GateConfig::default(),
+            audio_sample_rate: 48_000,
+            diagnostics: false,
+        }
+    }
 }
 
 /// Output of a single [`StreamingPipeline::push_samples`] or
@@ -102,8 +134,12 @@ pub struct StreamingConfig {
 /// [`StreamingConfig::diagnostics`] is `true`.
 #[derive(Debug, Default, Clone)]
 pub struct StreamingOutput {
-    /// Envelope-gated audio at 16 kHz mono, for the just-pushed
-    /// chunk. Length is a multiple of [`crate::vad::CHUNK_SAMPLES_16K`].
+    /// Envelope-gated audio at the pipeline's configured
+    /// [`StreamingConfig::audio_sample_rate`] (default 48 kHz),
+    /// mono, for the just-pushed chunk. Length is a multiple of one
+    /// VAD frame's audio-rate equivalent (e.g. 1536 samples @
+    /// 48 kHz, the integer scaling of
+    /// [`crate::vad::CHUNK_SAMPLES_16K`] = 512 @ 16 kHz).
     pub audio: Vec<f32>,
     /// Auto-learn admission / rejection / reset events that occurred
     /// during this call, in chronological order.
@@ -160,13 +196,15 @@ impl StreamingPipeline {
         unimplemented!("Phase 3.5 step 9 — implementation lands in a follow-up PR")
     }
 
-    /// Push an arbitrary-length chunk of 16 kHz f32 mono samples
-    /// (range `[-1.0, 1.0]`).
+    /// Push an arbitrary-length chunk of `audio_sample_rate` Hz f32
+    /// mono samples (range `[-1.0, 1.0]`).
     ///
-    /// Returns the gated output corresponding to all VAD frames that
-    /// could be completed with the new samples. Residue smaller than
-    /// one VAD frame (512 samples) is buffered internally; it
-    /// produces no output until the next call (or a [`Self::flush`]).
+    /// Returns the gated output, at the same sample rate, corresponding
+    /// to all VAD frames that could be completed with the new samples.
+    /// Internally the pipeline resamples to 16 kHz for the decision
+    /// path; residue smaller than one VAD frame's audio-rate
+    /// equivalent (e.g. 1536 samples @ 48 kHz) is buffered and produces
+    /// no output until the next call (or a [`Self::flush`]).
     ///
     /// # Errors
     ///
