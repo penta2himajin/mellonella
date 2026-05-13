@@ -318,6 +318,25 @@ impl eframe::App for MellonellaApp {
         self.state.poll_session();
         self.state.poll_recorder();
         self.drain_tray_commands(ctx);
+
+        // Step 17: minimise-to-tray. When the user clicks the
+        // window's close button AND the tray is available,
+        // intercept the close so the live session keeps running in
+        // the background. Without a tray (Linux without
+        // AppIndicator, etc.) we fall through to the OS default
+        // (close = quit) so users aren't trapped in a headless app.
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+        }
+
+        // Step 17: keep the tray icon's visual state in sync with
+        // the live-session state.
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_running(self.state.is_running());
+        }
+
         self.render_central_panel(ctx);
 
         // Repaint at ~10 Hz so the counter / recording progress
