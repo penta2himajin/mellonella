@@ -218,6 +218,17 @@ pub(crate) struct StreamingState {
     /// SV-rate (16 kHz) speech accumulator — frames with
     /// `speech_prob > vad_threshold` flow in here.
     speech_buffer: VecDeque<f32>,
+    /// Decision-rate (16 kHz) lookback ring holding the last
+    /// `PipelineConfig::pre_roll_ms` of audio. Every decision frame
+    /// is pushed in (excess popped from the front); on every VAD
+    /// OFF→ON transition the ring's contents are **prepended** to
+    /// `speech_buffer` so the first ECAPA refresh after onset
+    /// includes the pre-trigger audio. Empty when
+    /// `pre_roll_ms == 0`.
+    pre_roll_ring: VecDeque<f32>,
+    /// Cached capacity of `pre_roll_ring` so the hot loop avoids
+    /// recomputing `pre_roll_ms * sample_rate / 1000` per frame.
+    pre_roll_capacity: usize,
     /// Reusable contiguous staging slice for Fbank / F0 input.
     sv_window_scratch: Vec<f32>,
     /// SV refresh cadence + VAD-edge early-refresh state — mirrors
@@ -455,12 +466,15 @@ impl StreamingState {
                 Some(vec![vec![0.0_f32; CHUNK_SAMPLES_16K]]),
             )
         };
+        let pre_roll_capacity = config.pipeline.pre_roll_samples_decision();
         Ok(Self {
             audio_ring: VecDeque::with_capacity(audio_sr as usize), // ~1 s
             resampler,
             resampler_in,
             resampler_out,
             speech_buffer: VecDeque::with_capacity(config.pipeline.sv_window_samples),
+            pre_roll_ring: VecDeque::with_capacity(pre_roll_capacity),
+            pre_roll_capacity,
             sv_window_scratch: Vec::with_capacity(config.pipeline.sv_window_samples),
             samples_since_update: 0,
             silence_seen_since_refresh: false,
@@ -519,6 +533,7 @@ impl StreamingState {
             r.reset();
         }
         self.speech_buffer.clear();
+        self.pre_roll_ring.clear();
         self.sv_window_scratch.clear();
         self.samples_since_update = 0;
         self.silence_seen_since_refresh = false;
@@ -533,6 +548,42 @@ impl StreamingState {
         self.current_decision = None;
         self.frame_idx = 0;
         self.audio_samples_emitted = 0;
+    }
+
+    /// Push a decision-rate frame into the pre-roll lookback ring,
+    /// dropping the oldest samples once `pre_roll_capacity` is
+    /// reached. No-op when pre-roll is disabled
+    /// (`pre_roll_capacity == 0`).
+    fn push_pre_roll(&mut self, decision_frame: &[f32]) {
+        if self.pre_roll_capacity == 0 {
+            return;
+        }
+        for &sample in decision_frame {
+            if self.pre_roll_ring.len() == self.pre_roll_capacity {
+                self.pre_roll_ring.pop_front();
+            }
+            self.pre_roll_ring.push_back(sample);
+        }
+    }
+
+    /// Drain the pre-roll ring into the back of `speech_buffer` in
+    /// chronological order, capped at `sv_window_samples` (excess
+    /// pops from the front of the speech buffer). Called once on
+    /// every VAD OFF→ON transition so the next ECAPA refresh sees
+    /// the pre-trigger audio (issue #80). After this call the ring
+    /// is **left in place** — overlapping pre-roll with the first
+    /// frames of speech doesn't hurt and clearing would force the
+    /// ring to refill from scratch on rapid re-onsets.
+    fn prepend_pre_roll_to_speech_buffer(&mut self, sv_window_samples: usize) {
+        if self.pre_roll_ring.is_empty() {
+            return;
+        }
+        for &sample in &self.pre_roll_ring {
+            if self.speech_buffer.len() == sv_window_samples {
+                self.speech_buffer.pop_front();
+            }
+            self.speech_buffer.push_back(sample);
+        }
     }
 
     /// Audio-rate samples needed to drive one VAD frame at the
@@ -606,6 +657,12 @@ impl StreamingState {
         let speech_prob = components.vad.score(decision_frame)?;
         let now_speech = speech_prob > pipeline_cfg.vad_threshold;
         if now_speech {
+            if !self.prev_speech {
+                // VAD OFF→ON: fold the pre-roll ring into the speech
+                // buffer so the next ECAPA refresh sees the pre-trigger
+                // audio. Issue #80.
+                self.prepend_pre_roll_to_speech_buffer(pipeline_cfg.sv_window_samples);
+            }
             for &sample in decision_frame {
                 if self.speech_buffer.len() == pipeline_cfg.sv_window_samples {
                     self.speech_buffer.pop_front();
@@ -625,6 +682,11 @@ impl StreamingState {
         }
         self.prev_speech = now_speech;
         self.samples_since_update += vad_frame;
+
+        // Update the pre-roll ring with the just-processed frame *after*
+        // the OFF→ON prepend check above so the ring never contains the
+        // trigger frame itself.
+        self.push_pre_roll(decision_frame);
 
         let due_normal = self.samples_since_update >= pipeline_cfg.sv_update_samples;
         let due_early = self.silence_seen_since_refresh
@@ -756,6 +818,9 @@ impl StreamingState {
         let speech_prob = vad.score(decision_frame)?;
         let now_speech = speech_prob > pipeline_cfg.vad_threshold;
         if now_speech {
+            if !self.prev_speech {
+                self.prepend_pre_roll_to_speech_buffer(pipeline_cfg.sv_window_samples);
+            }
             for &sample in decision_frame {
                 if self.speech_buffer.len() == pipeline_cfg.sv_window_samples {
                     self.speech_buffer.pop_front();
@@ -775,6 +840,8 @@ impl StreamingState {
         }
         self.prev_speech = now_speech;
         self.samples_since_update += vad_frame;
+
+        self.push_pre_roll(decision_frame);
 
         // Submit a refresh window to the worker when due — same
         // cadence rule as the sync path.
@@ -1187,6 +1254,94 @@ mod tests {
         let cfg = StreamingConfig::default();
         let state = StreamingState::new(&cfg).expect("dual-rate state");
         assert!(state.resampler.is_some());
+    }
+
+    #[test]
+    fn state_new_initialises_pre_roll_capacity_from_config() {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate; // identity, simpler
+        cfg.pipeline.pre_roll_ms = 200;
+        let state = StreamingState::new(&cfg).expect("state");
+        // 200 ms * 16 000 Hz / 1000 = 3 200 samples
+        assert_eq!(state.pre_roll_capacity, 3_200);
+        assert!(state.pre_roll_ring.is_empty());
+    }
+
+    #[test]
+    fn push_pre_roll_caps_at_capacity() {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate;
+        cfg.pipeline.pre_roll_ms = 32; // 32 ms = 512 samples = 1 frame
+        let mut state = StreamingState::new(&cfg).expect("state");
+        let frame = vec![1.0_f32; CHUNK_SAMPLES_16K];
+        state.push_pre_roll(&frame);
+        assert_eq!(state.pre_roll_ring.len(), 512);
+        // Pushing a second frame must keep the cap.
+        let frame2 = vec![2.0_f32; CHUNK_SAMPLES_16K];
+        state.push_pre_roll(&frame2);
+        assert_eq!(state.pre_roll_ring.len(), 512);
+        // After two pushes the ring should contain only the second
+        // frame's samples (oldest popped).
+        assert!(state.pre_roll_ring.iter().all(|&s| (s - 2.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn push_pre_roll_is_noop_when_disabled() {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate;
+        cfg.pipeline.pre_roll_ms = 0;
+        let mut state = StreamingState::new(&cfg).expect("state");
+        let frame = vec![1.0_f32; CHUNK_SAMPLES_16K];
+        state.push_pre_roll(&frame);
+        assert!(state.pre_roll_ring.is_empty());
+        assert_eq!(state.pre_roll_capacity, 0);
+    }
+
+    #[test]
+    fn prepend_pre_roll_pushes_ring_into_speech_buffer_back() {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate;
+        cfg.pipeline.pre_roll_ms = 32;
+        let mut state = StreamingState::new(&cfg).expect("state");
+        // Populate the ring with a marker value.
+        let frame = vec![0.5_f32; CHUNK_SAMPLES_16K];
+        state.push_pre_roll(&frame);
+        assert_eq!(state.pre_roll_ring.len(), 512);
+        // Speech buffer empty before the OFF→ON transition.
+        assert!(state.speech_buffer.is_empty());
+        state.prepend_pre_roll_to_speech_buffer(cfg.pipeline.sv_window_samples);
+        // Ring contents are now at the back of the speech buffer in
+        // chronological order. Subsequent frames append after.
+        assert_eq!(state.speech_buffer.len(), 512);
+        assert!(state.speech_buffer.iter().all(|&s| (s - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn prepend_pre_roll_respects_sv_window_cap() {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate;
+        cfg.pipeline.pre_roll_ms = 32;
+        let mut state = StreamingState::new(&cfg).expect("state");
+        // Pre-fill the speech buffer to one short of the cap.
+        let cap = cfg.pipeline.sv_window_samples;
+        for _ in 0..(cap - 100) {
+            state.speech_buffer.push_back(0.1);
+        }
+        // Fill the ring with 512 samples of a different marker.
+        let frame = vec![0.9_f32; CHUNK_SAMPLES_16K];
+        state.push_pre_roll(&frame);
+        state.prepend_pre_roll_to_speech_buffer(cap);
+        // Buffer length stays at the cap; the oldest entries got
+        // dropped to make room.
+        assert_eq!(state.speech_buffer.len(), cap);
+        let last_512: Vec<f32> = state
+            .speech_buffer
+            .iter()
+            .rev()
+            .take(512)
+            .copied()
+            .collect();
+        assert!(last_512.iter().all(|&s| (s - 0.9).abs() < 1e-9));
     }
 
     #[test]

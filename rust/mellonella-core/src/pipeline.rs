@@ -81,6 +81,28 @@ pub struct PipelineConfig {
     /// `pipeline_parity` test fixture uses `vad_threshold = -1.0`,
     /// so silence never fires and the trigger stays dormant).
     pub sv_min_new_samples_after_silence: usize,
+    /// VAD pre-roll (lookback) window length in milliseconds. The
+    /// streaming engine keeps the last `pre_roll_ms` of decision-rate
+    /// audio in a ring; on every VAD OFF→ON transition the ring is
+    /// **prepended** to the speech buffer so the next ECAPA refresh
+    /// includes the pre-onset audio (issue #80). Default 100 ms — a
+    /// compromise between covering weak fricative onsets (/s/, /f/,
+    /// /h/, typical onset 30–100 ms) and limiting cross-speaker
+    /// bleed on turn boundaries.
+    ///
+    /// In the **offline** path ([`crate::pipeline::process_offline`]),
+    /// the same window is also used to **shift OFF→ON gate decisions
+    /// back by `pre_roll_ms`** before applying the audio envelope, so
+    /// the head of each utterance survives muting. The streaming
+    /// engine does **not** apply that shift — doing so would require
+    /// delaying live output by `pre_roll_ms`, which would break the
+    /// sub-100 ms KPI from issue #66. Live callers that want the
+    /// head-cut fix in audio output should buffer + reapply
+    /// `apply_envelope` on the gate decisions returned by the engine.
+    ///
+    /// Set to 0 to disable both effects (identical to pre-#80
+    /// behaviour).
+    pub pre_roll_ms: u32,
     /// When `true`, ECAPA / Fbank / F0 for each refresh are dispatched
     /// to a worker thread so the VAD main loop can keep running while
     /// inference is in flight. Default `false` to preserve byte-equiv
@@ -107,6 +129,7 @@ impl Default for PipelineConfig {
             vad_threshold: 0.5,
             enable_auto_learn: true,
             sv_min_new_samples_after_silence: 4_000,
+            pre_roll_ms: 100,
             async_refresh: false,
         }
     }
@@ -119,6 +142,14 @@ impl PipelineConfig {
     #[must_use]
     pub fn vad_frame_ms(&self) -> f32 {
         1000.0 * CHUNK_SAMPLES_16K as f32 / self.sample_rate as f32
+    }
+
+    /// Pre-roll ring capacity in decision-rate samples — `pre_roll_ms`
+    /// converted to samples at [`Self::sample_rate`]. Zero when
+    /// pre-roll is disabled.
+    #[must_use]
+    pub fn pre_roll_samples_decision(&self) -> usize {
+        (u64::from(self.pre_roll_ms) * u64::from(self.sample_rate) / 1000) as usize
     }
 }
 
@@ -256,6 +287,48 @@ fn scale_to_audio_rate(s_decision: usize, decision_sr: u32, audio_sr: u32) -> us
     rounded as usize
 }
 
+/// Shift every OFF→ON boundary in `decisions` backwards by `shift`
+/// samples (floored at the preceding boundary). Used in the offline
+/// paths only — the streaming engine never rewinds emitted audio
+/// (see [`PipelineConfig::pre_roll_ms`] for the trade-off).
+///
+/// Issue #80: VAD declares speech a few frames into the actual onset,
+/// so the envelope's fade-in starts late and the head of each
+/// utterance is muted. Shifting the boundary back lets the audio
+/// preceding the trigger frame survive the envelope.
+///
+/// Zero-length regions that collapse after the shift (an `OFF` at
+/// sample X immediately followed by an `ON` shifted onto the same X)
+/// are dropped so [`apply_envelope`]'s monotonic-boundary contract
+/// holds.
+fn shift_off_on_decisions_back(decisions: &mut Vec<(usize, bool)>, shift: usize) {
+    if shift == 0 || decisions.len() < 2 {
+        return;
+    }
+    // The first decision is anchored at sample 0 (see `process_offline`
+    // prefix normalisation); leave it alone.
+    for i in 1..decisions.len() {
+        let (idx, is_on) = decisions[i];
+        if !is_on {
+            continue;
+        }
+        let floor = decisions[i - 1].0;
+        let new_idx = idx.saturating_sub(shift).max(floor);
+        decisions[i].0 = new_idx;
+    }
+    // Drop OFF entries whose region collapsed to zero length after a
+    // following ON was shifted back onto them. Walk in reverse so
+    // indices stay valid.
+    let mut i = decisions.len();
+    while i >= 2 {
+        i -= 1;
+        if decisions[i].0 == decisions[i - 1].0 {
+            // Keep the later entry (which carries the new is_on state).
+            decisions.remove(i - 1);
+        }
+    }
+}
+
 /// Apply [`apply_envelope`] at the audio rate using decisions
 /// emitted in the decision-rate sample space. The first decision is
 /// always anchored at 0 (the offline orchestrators enforce that),
@@ -350,6 +423,25 @@ pub fn process_offline(
         decisions.insert(0, (0, first_on));
     }
 
+    // Pre-roll envelope shift (issue #80). The streaming engine
+    // already applied the unshifted envelope into `head.audio`; when
+    // `pre_roll_ms > 0`, we re-run `apply_envelope_dual_rate` over
+    // the original input audio with the shifted decisions so the
+    // head of each utterance survives muting. Streaming decisions are
+    // at audio rate, so the shift is computed at audio rate.
+    if pipeline_cfg.pre_roll_ms > 0 {
+        let shift_audio =
+            (u64::from(pipeline_cfg.pre_roll_ms) * u64::from(audio_sample_rate) / 1000) as usize;
+        shift_off_on_decisions_back(&mut decisions, shift_audio);
+        head.audio = apply_envelope_dual_rate(
+            audio,
+            &decisions,
+            audio_sample_rate,
+            audio_sample_rate,
+            *gate_cfg,
+        )?;
+    }
+
     Ok(ProcessResult {
         audio: head.audio,
         gate_decisions: decisions,
@@ -388,6 +480,8 @@ fn process_offline_async(
     let audio_dec: &[f32] = decision_audio.as_ref();
 
     let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
+    let pre_roll_capacity = pipeline_cfg.pre_roll_samples_decision();
+    let mut pre_roll_ring: VecDeque<f32> = VecDeque::with_capacity(pre_roll_capacity);
     let mut samples_since_update = 0_usize;
     let mut silence_seen_since_refresh = false;
     let mut new_speech_samples_after_silence = 0_usize;
@@ -465,6 +559,17 @@ fn process_offline_async(
             let speech_prob = vad.score(frame)?;
             let now_speech = speech_prob > pipeline_cfg.vad_threshold;
             if now_speech {
+                if !prev_speech && !pre_roll_ring.is_empty() {
+                    // VAD OFF→ON: fold the pre-roll ring into the
+                    // speech buffer (issue #80). Same semantics as the
+                    // sync streaming engine.
+                    for &sample in &pre_roll_ring {
+                        if speech_buffer.len() == pipeline_cfg.sv_window_samples {
+                            speech_buffer.pop_front();
+                        }
+                        speech_buffer.push_back(sample);
+                    }
+                }
                 for &sample in frame {
                     if speech_buffer.len() == pipeline_cfg.sv_window_samples {
                         speech_buffer.pop_front();
@@ -484,6 +589,15 @@ fn process_offline_async(
             }
             prev_speech = now_speech;
             samples_since_update += vad_frame;
+
+            if pre_roll_capacity > 0 {
+                for &sample in frame {
+                    if pre_roll_ring.len() == pre_roll_capacity {
+                        pre_roll_ring.pop_front();
+                    }
+                    pre_roll_ring.push_back(sample);
+                }
+            }
 
             let due_normal = samples_since_update >= pipeline_cfg.sv_update_samples;
             let due_early = silence_seen_since_refresh
@@ -598,6 +712,15 @@ fn process_offline_async(
     } else if decisions[0].0 != 0 {
         let first_on = decisions[0].1;
         decisions.insert(0, (0, first_on));
+    }
+
+    // Pre-roll envelope shift (issue #80). Async-path decisions are
+    // emitted in decision-rate sample-index space (`frame_start`),
+    // so the shift is computed at the decision rate before the
+    // dual-rate envelope scales boundaries onto the audio axis.
+    if pipeline_cfg.pre_roll_ms > 0 {
+        let shift_decision = pipeline_cfg.pre_roll_samples_decision();
+        shift_off_on_decisions_back(&mut decisions, shift_decision);
     }
 
     let audio_out =
@@ -809,6 +932,50 @@ mod tests {
         let out = apply_envelope_dual_rate(&audio, &decisions, 1_000, 16_000, gate_cfg)
             .expect("dual-rate envelope tolerates collapsed boundaries");
         assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn shift_off_on_noop_when_shift_is_zero() {
+        let mut d = vec![(0_usize, false), (1000, true), (2000, false)];
+        let snapshot = d.clone();
+        shift_off_on_decisions_back(&mut d, 0);
+        assert_eq!(d, snapshot);
+    }
+
+    #[test]
+    fn shift_off_on_moves_only_on_boundaries() {
+        // OFF at 0, ON at 1000, OFF at 2000 → shift 300 → ON moves to
+        // 700, the OFFs stay put.
+        let mut d = vec![(0_usize, false), (1000, true), (2000, false)];
+        shift_off_on_decisions_back(&mut d, 300);
+        assert_eq!(d, vec![(0, false), (700, true), (2000, false)]);
+    }
+
+    #[test]
+    fn shift_off_on_floors_at_prev_boundary() {
+        // ON at 500 with shift 1000 would underflow into the prior OFF
+        // region (0..500). The shift floors at 0 (the previous
+        // boundary), and the collapsed OFF entry at 0 is removed.
+        let mut d = vec![(0_usize, false), (500, true)];
+        shift_off_on_decisions_back(&mut d, 1000);
+        assert_eq!(d, vec![(0, true)]);
+    }
+
+    #[test]
+    fn shift_off_on_collapses_zero_length_runs() {
+        // OFF at 0, ON at 500, OFF at 600, ON at 800 → shift 200 →
+        // second ON lands on 600 (== prior OFF). The OFF disappears.
+        let mut d = vec![(0_usize, false), (500, true), (600, false), (800, true)];
+        shift_off_on_decisions_back(&mut d, 200);
+        assert_eq!(d, vec![(0, false), (300, true), (600, true)]);
+    }
+
+    #[test]
+    fn pre_roll_samples_decision_matches_default() {
+        // pre_roll_ms = 100 at 16 kHz = 1600 samples.
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.pre_roll_ms, 100);
+        assert_eq!(cfg.pre_roll_samples_decision(), 1_600);
     }
 
     #[test]

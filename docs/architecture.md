@@ -65,6 +65,7 @@ input (arbitrary SR, mono)
 - Silence frames are skipped, reducing SV compute cost.
 - Once the buffer reaches a fixed length (e.g. 1 s), trigger Stage 4.
 - During continuous speech, refresh on a sliding window (e.g. recompute the embedding over the most recent 1 s every 250 ms).
+- **VAD pre-roll (`PipelineConfig::pre_roll_ms`, default 100 ms, issue #80)**: silero-vad declares speech a few frames into the actual onset, so by default a parallel 100 ms ring of decision-rate audio is held in `StreamingState::pre_roll_ring`. On every VAD OFF→ON transition the ring is folded into the back of the speech buffer so the next ECAPA refresh covers the pre-trigger audio — important for weak fricative onsets (/s/, /f/, /h/, typical onset 30–100 ms) that the VAD threshold misses. In the **offline path** (`process_offline` / `process_offline_async`) the same window is also used to shift OFF→ON gate boundaries back by `pre_roll_ms` before applying the envelope, so the head of each utterance survives muting. The streaming engine does **not** apply the boundary shift in live mode — doing so would force the live envelope to lag by `pre_roll_ms`, breaking the sub-100 ms latency KPI from the streaming work. Set `pre_roll_ms = 0` to disable both effects.
 
 ### Stage 4: Speaker feature extraction
 
