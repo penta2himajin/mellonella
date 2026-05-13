@@ -277,7 +277,7 @@ impl MellonellaApp {
         });
         ui.horizontal(|ui| {
             let tooltip = if dfn3_available {
-                "Run DFN3 noise suppression on the live audio path. Adds ~1.02 s buffering latency."
+                "Run DFN3 noise suppression on the live audio path. Adds ~30 ms latency."
             } else {
                 "Set MELLONELLA_DFN3_ONNX to enable noise suppression."
             };
@@ -288,7 +288,7 @@ impl MellonellaApp {
             if !dfn3_available {
                 ui.weak("(MELLONELLA_DFN3_ONNX not set)");
             } else if self.state.enable_dfn3 {
-                ui.weak("+ ~1.02 s latency");
+                ui.weak("+ ~30 ms latency");
             }
         });
     }

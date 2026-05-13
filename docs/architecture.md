@@ -143,15 +143,15 @@ Three orderings were considered.
 | Stage | Latency contribution |
 |---|---|
 | Resampler | < 5 ms |
-| DFN3 (NS) | ~30 ms algorithmic, **~1.02 s in current ONNX export** (see note) |
+| DFN3 (NS) | ~20 ms (2-frame conv lookahead) + ~10 ms model = ~30 ms |
 | silero-vad | < 10 ms |
 | Envelope attack | 10–20 ms |
 | **Total (output latency, NS off)** | **~15–35 ms** (resampler + VAD + envelope) |
-| **Total (output latency, NS on)** | **~1.05–1.10 s** (NS dominates) |
+| **Total (output latency, NS on)** | **~45–65 ms** (matches the architecture target) |
 
 The ECAPA-TDNN embedding computation sets the decision-update interval (chunk shift = 250 ms) but does not affect output latency: the most recent decision is held until the next update.
 
-**DFN3 buffering note**: the patched ONNX exported by `scripts/export_dfn3_onnx.py` is shape-locked to 102 STFT frames (1.024 s @ 48 kHz). The model's algorithmic latency is ~30 ms, but the current ONNX wrapper has to accumulate one full chunk before the first sample emerges. The live path (`mellonella live --enable-dfn3` / GUI's "Enable noise suppression" toggle) surfaces this trade-off in its tooltip. A future export with a symbolic time dimension can drop the buffering latency back to ~30 ms.
+**DFN3 streaming**: the ONNX exported by `scripts/export_dfn3_onnx.py` is the *stateful per-frame* variant — one STFT frame in, one enhanced frame out, with the three GRU hidden states threaded across calls via explicit ONNX inputs/outputs. The wrapper's only buffering is the 2-frame future-feature queue the model's `conv_lookahead` mechanism requires; that's the source of the algorithmic ~20 ms part of the DFN3 budget. (Earlier code shipped a 102-frame ONNX export that added ~1.02 s of buffering latency; step 13.5 replaces it with the stateful per-frame export.)
 
 That is, *decision responsiveness* and *absolute output latency* are managed separately:
 

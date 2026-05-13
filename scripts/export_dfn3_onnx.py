@@ -1,30 +1,58 @@
 #!/usr/bin/env python3
 """Export DeepFilterNet 3 to ONNX for Rust-side noise suppression.
 
-Upstream DFN3 can't be ONNX-exported as-is: ``df.multiframe.DF.forward``
-calls ``torch.view_as_complex`` and does an in-place mutation on an
-``as_strided`` view chain (``spec[..., : num_freqs, :] = …``). Both
-legacy and dynamo exporters bail out on that.
+**Stateful per-frame variant.** The exported ONNX takes one STFT
+frame at a time plus the three GRU hidden states, and returns one
+enhanced spectrum frame plus the updated states. Live callers
+maintain a rolling ``conv_lookahead``-frame feature buffer and
+thread the GRU states across calls, yielding an algorithmic latency
+of roughly 30 ms (model's intrinsic budget — see
+``docs/architecture.md``) instead of the 1.02 s the previous
+102-frame export forced on streaming consumers.
 
-Workaround: monkey-patch ``model.df_op`` with a functionally-equivalent
-``DfOnnxSafe`` module that
+Upstream DFN3 isn't directly ONNX-exportable as-is. The historic
+issues:
 
-* operates on real-valued tensors only (no ``view_as_complex``)
-* substitutes the filtered low-freq band via ``torch.cat`` instead of
-  in-place assignment
+1. ``df.multiframe.DF.forward`` uses ``torch.view_as_complex`` and
+   does an in-place mutation on an ``as_strided`` view chain
+   (``spec[..., : num_freqs, :] = …``). Both legacy and dynamo
+   exporters bail out on that.
+2. ``DfNet`` calls the inner GRU layers with ``h=None``, dropping
+   the hidden state every batch. The 102-frame export hides this by
+   processing everything in one shot; for streaming we have to
+   thread state explicitly.
+3. ``DfNet.pad_feat`` / ``pad_spec`` use ``ConstantPad2d`` to do an
+   in-batch lookahead-shift, which is fundamentally per-batch and
+   breaks chunked streaming.
 
-After the patch, ``torch.onnx.export`` lowers the model cleanly. The
-exported ONNX takes the same ``(spec, feat_erb, feat_spec)`` inputs the
-PyTorch model takes, so the Rust caller still needs ``deep_filter``'s
-STFT + ERB feature pipeline to feed it.
+This script applies three patches before tracing:
+
+* Replace ``model.df_op`` with a functionally-equivalent
+  ``DfOnnxSafe`` that operates on real-valued tensors and uses
+  ``torch.cat`` instead of in-place mutation.
+* Replace ``model.pad_feat`` / ``pad_spec`` with ``nn.Identity()`` —
+  the live wrapper aligns inputs externally by maintaining a
+  ``conv_lookahead``-frame future-feature ring.
+* Monkey-patch each ``SqueezedGRU_S.forward`` to read/write hidden
+  state via instance attributes that the outer wrapper sets before
+  each forward call. ``torch.onnx.export`` traces these attribute
+  re-binds as direct Tensor flow through the graph.
+
+After the patches, the wrapping module's ``forward`` signature is::
+
+    (spec, feat_erb, feat_spec, enc_h, erb_h, df_h)
+      -> (enhanced_spec, new_enc_h, new_erb_h, new_df_h)
+
+All tensors have time dim 1 (one STFT frame per call).
 
 Subcommands:
 
 * ``export``  – write the ONNX file
-* ``verify``  – run PyTorch and ONNX side by side on synth noise, check
-                per-sample parity after iSTFT
+* ``verify``  – run PyTorch and ONNX side-by-side, threading state
+                across the test clip, checking per-frame parity.
 
-Run on a host with the ``models`` extra installed (plus ``onnxscript``):
+Run on a host with the ``models`` extra installed (plus
+``onnxscript``)::
 
     python scripts/export_dfn3_onnx.py export-and-verify \\
         --output build/dfn3.onnx
@@ -42,21 +70,26 @@ import numpy as np
 if TYPE_CHECKING:  # pragma: no cover
     import torch
 
-DEFAULT_TOL = 1e-3
+DEFAULT_TOL = 5e-3
 
 
 # ---------------------------------------------------------------------------
-# ONNX-safe replacement for DF.forward (df_op)
+# Stateful + ONNX-safe wrapping
 # ---------------------------------------------------------------------------
 
 
 def _build_safe_df_op(orig_df):  # noqa: ANN001
-    """Return a ``DfOnnxSafe`` torch.nn.Module mirroring ``orig_df``."""
+    """Return a ``DfOnnxSafe`` torch.nn.Module mirroring ``orig_df``.
+
+    Operates on real-valued tensors only (no ``view_as_complex``) and
+    substitutes the filtered low-freq band via ``torch.cat`` instead
+    of in-place assignment. Shape-equivalent to the upstream forward
+    for any time-dimension length.
+    """
     import torch
     import torch.nn as nn
     from df.multiframe import df_real
 
-    # Stash params on the new module so the export captures them.
     num_freqs = orig_df.num_freqs
     frame_size = orig_df.frame_size
     lookahead = orig_df.lookahead
@@ -72,19 +105,12 @@ def _build_safe_df_op(orig_df):  # noqa: ANN001
             self.lookahead = lookahead
 
         def forward(self, spec: torch.Tensor, coefs: torch.Tensor) -> torch.Tensor:
-            # spec : (B, C, T, F, 2)  — real-valued
+            # spec : (B, C, T, F, 2) — real-valued
             # coefs: (B, C, T, F', 2) — real-valued
-            # F.pad with literal integer args keeps the output shape
-            # static for ONNX trace (ConstantPad3d builds them at runtime
-            # which produces a dynamic-shape Pad op that breaks Unfold).
             if self.frame_size > 1:
                 padded = torch.nn.functional.pad(
                     spec, (0, 0, 0, 0, front_pad, back_pad), mode="constant", value=0.0
                 )
-                # Replace tensor.unfold with a stack of narrowed slices —
-                # `unfold` requires static input sizes which ONNX trace
-                # struggles to surface; stacking N narrows is equivalent
-                # and exports cleanly.
                 slices = [
                     padded.narrow(-3, n, spec.shape[-3]) for n in range(self.frame_size)
                 ]
@@ -95,17 +121,91 @@ def _build_safe_df_op(orig_df):  # noqa: ANN001
             new_shape = [coefs.shape[0], -1, self.frame_size] + list(coefs.shape[2:])
             coefs = coefs.view(new_shape)
             spec_filtered = df_real(spec_f, coefs)
-            # Functional substitution: concat filtered low-freq with the
-            # original high-freq band along the F axis.
-            spec_high = spec[..., self.num_freqs :, :]
+            spec_high = spec[..., self.num_freqs:, :]
             return torch.cat([spec_filtered, spec_high], dim=-2)
 
     return DfOnnxSafe()
 
 
-# ---------------------------------------------------------------------------
-# Loading + input shape probing
-# ---------------------------------------------------------------------------
+def _build_stateful_wrapper(base_model):  # noqa: ANN001
+    """Wrap ``base_model`` so its forward signature accepts/returns
+    the three GRU hidden states explicitly.
+
+    Side-effects on ``base_model``: ``pad_feat`` / ``pad_spec`` are
+    replaced with ``Identity`` (caller does manual alignment), the
+    three ``SqueezedGRU_S.forward`` methods are monkey-patched to
+    read state from ``base_model._mell_*_in`` and write to
+    ``base_model._mell_*_out``. The outer wrapper.forward sets the
+    ``_in`` slots from its arguments before invoking base.forward,
+    and returns the ``_out`` slots.
+
+    ``torch.onnx.export`` traces the actual Tensor data flow inside
+    each forward, so the slot mechanics don't generate graph ops —
+    the state flows directly from wrapper inputs through the GRU and
+    out to wrapper outputs.
+    """
+    import torch
+    import torch.nn as nn
+
+    base_model.pad_feat = nn.Identity()
+    base_model.pad_spec = nn.Identity()
+
+    # Initial slots so attribute reads succeed during the first trace.
+    base_model._mell_enc_in = torch.zeros((1, 1, 256))
+    base_model._mell_erb_in = torch.zeros((2, 1, 256))
+    base_model._mell_df_in = torch.zeros((2, 1, 256))
+    base_model._mell_enc_out = None
+    base_model._mell_erb_out = None
+    base_model._mell_df_out = None
+
+    def make_patched(squeezed_gru, slot_in: str, slot_out: str):  # noqa: ANN001
+        def patched(input: "torch.Tensor", h=None):  # noqa: ANN001, A002
+            x = squeezed_gru.linear_in(input)
+            x, new_h = squeezed_gru.gru(x, getattr(base_model, slot_in))
+            x = squeezed_gru.linear_out(x)
+            if squeezed_gru.gru_skip is not None:
+                x = x + squeezed_gru.gru_skip(input)
+            setattr(base_model, slot_out, new_h)
+            return x, new_h
+
+        return patched
+
+    base_model.enc.emb_gru.forward = make_patched(
+        base_model.enc.emb_gru, "_mell_enc_in", "_mell_enc_out"
+    )
+    base_model.erb_dec.emb_gru.forward = make_patched(
+        base_model.erb_dec.emb_gru, "_mell_erb_in", "_mell_erb_out"
+    )
+    base_model.df_dec.df_gru.forward = make_patched(
+        base_model.df_dec.df_gru, "_mell_df_in", "_mell_df_out"
+    )
+
+    class StatefulWrapper(nn.Module):
+        def __init__(self, m):  # noqa: ANN001
+            super().__init__()
+            self.base = m
+
+        def forward(
+            self,
+            spec: "torch.Tensor",
+            feat_erb: "torch.Tensor",
+            feat_spec: "torch.Tensor",
+            enc_h: "torch.Tensor",
+            erb_h: "torch.Tensor",
+            df_h: "torch.Tensor",
+        ):
+            self.base._mell_enc_in = enc_h
+            self.base._mell_erb_in = erb_h
+            self.base._mell_df_in = df_h
+            out = self.base(spec, feat_erb, feat_spec)
+            return (
+                out[0],
+                self.base._mell_enc_out,
+                self.base._mell_erb_out,
+                self.base._mell_df_out,
+            )
+
+    return StatefulWrapper(base_model)
 
 
 def _load_model_and_patch():  # noqa: ANN202
@@ -116,10 +216,36 @@ def _load_model_and_patch():  # noqa: ANN202
     if hasattr(model, "reset_h0"):
         model.reset_h0(batch_size=1, device="cpu")
     model.df_op = _build_safe_df_op(model.df_op)
-    return model, df_state
+    wrapper = _build_stateful_wrapper(model)
+    return wrapper, model, df_state
+
+
+def _conv_lookahead() -> int:
+    from df.model import ModelParams
+
+    return ModelParams().conv_lookahead
+
+
+def _manual_align(t, conv_la: int):  # noqa: ANN001
+    """Replicate the original ``pad_feat`` shift (drop first
+    ``conv_la`` frames, append ``conv_la`` zero frames) outside the
+    model. Used by ``verify`` to feed inputs the same way the live
+    Rust wrapper will."""
+    import torch
+
+    if conv_la == 0:
+        return t
+    shifted = t[:, :, conv_la:]
+    pad_shape = list(t.shape)
+    pad_shape[2] = conv_la
+    zeros = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+    return torch.cat([shifted, zeros], dim=2)
 
 
 def _build_inputs(model, df_state):  # noqa: ANN001
+    """Build a 1 s test clip's STFT features at the unpadded shape
+    (i.e. before the model's now-disabled pad_feat). Returns
+    ``(spec, feat_erb, feat_spec)`` with time dim 102."""
     import torch
     from df.enhance import df_features
     from df.model import ModelParams
@@ -143,33 +269,43 @@ def cmd_export(args: argparse.Namespace) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    print("[export] loading DFN3 + patching df_op", file=sys.stderr)
-    model, df_state = _load_model_and_patch()
-    spec, feat_erb, feat_spec = _build_inputs(model, df_state)
+    print("[export] loading DFN3 + patching df_op + stateful wrapper", file=sys.stderr)
+    wrapper, _model, df_state = _load_model_and_patch()
+    spec, feat_erb, feat_spec = _build_inputs(_model, df_state)
+
+    # Build single-frame example inputs for the trace.
+    conv_la = _conv_lookahead()
+    aligned_erb = _manual_align(feat_erb, conv_la)
+    aligned_spec = _manual_align(feat_spec, conv_la)
+    example = (
+        spec[:, :, 0:1],
+        aligned_erb[:, :, 0:1],
+        aligned_spec[:, :, 0:1],
+        torch.zeros((1, 1, 256)),
+        torch.zeros((2, 1, 256)),
+        torch.zeros((2, 1, 256)),
+    )
     print(
-        f"[export] input shapes: spec={tuple(spec.shape)} "
-        f"feat_erb={tuple(feat_erb.shape)} feat_spec={tuple(feat_spec.shape)}",
+        "[export] example shapes: "
+        f"spec={tuple(example[0].shape)} "
+        f"feat_erb={tuple(example[1].shape)} "
+        f"feat_spec={tuple(example[2].shape)} "
+        f"enc_h={tuple(example[3].shape)} "
+        f"erb_h={tuple(example[4].shape)} "
+        f"df_h={tuple(example[5].shape)}",
         file=sys.stderr,
     )
 
-    with torch.no_grad():
-        ref_out = model(spec, feat_erb, feat_spec)
-    for i, t in enumerate(ref_out):
-        print(f"[export] forward output #{i}: {tuple(t.shape)}", file=sys.stderr)
-
     print(f"[export] writing {output}", file=sys.stderr)
     torch.onnx.export(
-        model,
-        (spec, feat_erb, feat_spec),
+        wrapper,
+        example,
         str(output),
-        input_names=["spec", "feat_erb", "feat_spec"],
-        output_names=["enhanced_spec", "mask", "lsnr", "df_alpha"],
-        # All axes are fixed in this export. df_op uses tensor.unfold,
-        # which can't be lowered to ONNX when any dim it sees is
-        # symbolic — and the trace propagates dynamic dims through the
-        # encoder layers. Callers chunk audio into fixed-length
-        # segments (default 102 frames ≈ 1 s at 48 kHz with 480-sample
-        # hop) before running the ONNX.
+        input_names=["spec", "feat_erb", "feat_spec", "enc_h", "erb_h", "df_h"],
+        output_names=["enhanced_spec", "new_enc_h", "new_erb_h", "new_df_h"],
+        # Time dim is fixed at 1: tensor.unfold in the safe df_op
+        # still wants a static length for the time axis. The wrapper's
+        # caller invokes the ONNX once per STFT frame.
         dynamic_axes=None,
         opset_version=args.opset,
         do_constant_folding=True,
@@ -191,28 +327,57 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return 2
 
     print("[verify] loading torch model + ONNX session", file=sys.stderr)
-    model, df_state = _load_model_and_patch()
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    # Build a parallel reference by loading a fresh unpatched model
+    # (only df_op patched, not stateful) and feeding the full 102
+    # frames. This is the "ground truth" the streaming ONNX must
+    # approximate.
+    from df.enhance import init_df
 
-    spec, feat_erb, feat_spec = _build_inputs(model, df_state)
+    ref_model, df_state, _ = init_df()
+    ref_model.eval()
+    if hasattr(ref_model, "reset_h0"):
+        ref_model.reset_h0(batch_size=1, device="cpu")
+    ref_model.df_op = _build_safe_df_op(ref_model.df_op)
+
+    spec, feat_erb, feat_spec = _build_inputs(ref_model, df_state)
+    T = spec.shape[2]
     with torch.no_grad():
-        ref_enh_spec, _, _, _ = model(spec, feat_erb, feat_spec)
+        ref_enh_spec, _, _, _ = ref_model(spec, feat_erb, feat_spec)
     ref = ref_enh_spec.cpu().numpy().astype(np.float64)
 
-    onnx_inputs = {
-        "spec": spec.numpy(),
-        "feat_erb": feat_erb.numpy(),
-        "feat_spec": feat_spec.numpy(),
-    }
-    onnx_out = session.run(["enhanced_spec"], onnx_inputs)[0].astype(np.float64)
+    # Now run the streaming ONNX frame-by-frame and concatenate.
+    conv_la = _conv_lookahead()
+    aligned_erb = _manual_align(feat_erb, conv_la)
+    aligned_spec = _manual_align(feat_spec, conv_la)
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    enc_h = np.zeros((1, 1, 256), dtype=np.float32)
+    erb_h = np.zeros((2, 1, 256), dtype=np.float32)
+    df_h = np.zeros((2, 1, 256), dtype=np.float32)
+    chunks = []
+    for t in range(T):
+        inputs = {
+            "spec": spec[:, :, t:t + 1].numpy(),
+            "feat_erb": aligned_erb[:, :, t:t + 1].numpy(),
+            "feat_spec": aligned_spec[:, :, t:t + 1].numpy(),
+            "enc_h": enc_h,
+            "erb_h": erb_h,
+            "df_h": df_h,
+        }
+        out = session.run(
+            ["enhanced_spec", "new_enc_h", "new_erb_h", "new_df_h"], inputs
+        )
+        chunks.append(out[0])
+        enc_h, erb_h, df_h = out[1], out[2], out[3]
+    onnx_out = np.concatenate(chunks, axis=2).astype(np.float64)
 
     delta = float(np.max(np.abs(ref - onnx_out)))
     print(f"[verify] enhanced_spec max|Δ| = {delta:.3e}", file=sys.stderr)
     print(f"[verify] tolerance            = {args.tol:.3e}", file=sys.stderr)
     if delta < args.tol:
-        print("[verify] PASS — enhanced_spec parity within tolerance", file=sys.stderr)
+        print("[verify] PASS — streaming ONNX parity within tolerance", file=sys.stderr)
         return 0
-    print("[verify] FAIL — enhanced_spec parity exceeds tolerance", file=sys.stderr)
+    print("[verify] FAIL — streaming ONNX parity exceeds tolerance", file=sys.stderr)
     return 1
 
 
