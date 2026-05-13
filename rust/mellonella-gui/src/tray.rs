@@ -2,6 +2,11 @@
 //! Show / Toggle / Quit menu and forwards user clicks to the eframe
 //! app via a non-blocking channel.
 //!
+//! Step 17 polish: two icon variants (idle / running) so users can
+//! tell at a glance whether the live filter is active without
+//! opening the window. The app calls [`TrayHandles::set_running`]
+//! whenever the session state changes.
+//!
 //! Platforms vary in how well the system tray is supported. On
 //! macOS / Windows the icon shows up in the global tray. On Linux,
 //! `tray-icon` uses the AppIndicator / DBus protocol — works on KDE,
@@ -31,9 +36,7 @@ pub enum TrayCommand {
 /// the user clicks menu items. Keep this alive for the whole app
 /// lifetime; dropping it removes the tray icon.
 pub struct TrayHandles {
-    // The TrayIcon itself isn't read after construction, but must
-    // live as long as the tray is desired (drop = remove).
-    _tray: TrayIcon,
+    tray: TrayIcon,
     rx: Receiver<TrayCommand>,
     // IDs let the menu-event poller route clicks to the right
     // TrayCommand. Kept here to avoid lazy_static / global maps.
@@ -41,6 +44,13 @@ pub struct TrayHandles {
     toggle_id: String,
     quit_id: String,
     forwarder_tx: Sender<TrayCommand>,
+    /// Cached icon variants — building these once on init avoids
+    /// re-allocating + re-encoding the 32×32 RGBA buffer every
+    /// time the session toggles.
+    idle_icon: Icon,
+    running_icon: Icon,
+    /// Last `set_running` value, to skip redundant icon swaps.
+    is_running: bool,
 }
 
 impl TrayHandles {
@@ -49,7 +59,12 @@ impl TrayHandles {
     /// initialisation fails — the caller falls back to a
     /// window-only experience.
     pub fn try_new() -> Option<Self> {
-        let icon = build_default_icon().ok()?;
+        let idle_icon = build_icon(IconKind::Idle).ok()?;
+        let running_icon = build_icon(IconKind::Running).ok()?;
+        // Clone here so we can keep both originals for later
+        // re-application — `tray-icon` consumes the Icon on each
+        // `set_icon` call.
+        let idle_icon_init = build_icon(IconKind::Idle).ok()?;
 
         let menu = Menu::new();
         let show_item = MenuItem::new("Show window", true, None);
@@ -60,9 +75,9 @@ impl TrayHandles {
         menu.append(&quit_item).ok()?;
 
         let tray = TrayIconBuilder::new()
-            .with_tooltip("Mellonella")
+            .with_tooltip("Mellonella — idle")
             .with_menu(Box::new(menu))
-            .with_icon(icon)
+            .with_icon(idle_icon_init)
             .build()
             .ok()?;
 
@@ -71,13 +86,32 @@ impl TrayHandles {
         let toggle_id = toggle_item.id().0.clone();
         let quit_id = quit_item.id().0.clone();
         Some(Self {
-            _tray: tray,
+            tray,
             rx,
             show_id,
             toggle_id,
             quit_id,
             forwarder_tx: tx,
+            idle_icon,
+            running_icon,
+            is_running: false,
         })
+    }
+
+    /// Switch the tray icon + tooltip to reflect the live-session
+    /// state. No-op when the state hasn't changed.
+    pub fn set_running(&mut self, running: bool) {
+        if self.is_running == running {
+            return;
+        }
+        self.is_running = running;
+        let (icon, tooltip) = if running {
+            (&self.running_icon, "Mellonella — running")
+        } else {
+            (&self.idle_icon, "Mellonella — idle")
+        };
+        let _ = self.tray.set_icon(Some(icon.clone()));
+        let _ = self.tray.set_tooltip(Some(tooltip));
     }
 
     /// Drain any pending tray-menu events into the local channel,
@@ -107,27 +141,49 @@ impl TrayHandles {
     }
 }
 
-/// Build a 32×32 RGBA icon procedurally: a yellowish disc on a
-/// transparent background. Step 16 keeps the asset in code so the
-/// crate doesn't have to vendor a binary PNG for one icon. A nicer
-/// SVG-rendered icon can land in a follow-up step.
-fn build_default_icon() -> Result<Icon, tray_icon::BadIcon> {
+/// Tray-icon visual variant: the live-session is idle (filter off)
+/// or running (filter on). Procedurally drawn so we don't ship two
+/// PNG assets for one binary.
+#[derive(Debug, Clone, Copy)]
+enum IconKind {
+    Idle,
+    Running,
+}
+
+/// Build a 32×32 RGBA icon procedurally. Idle is the wax-moth-
+/// yellow disc that's shipped since step 16; Running adds a
+/// green outer ring on top of the yellow disc so the tray-area
+/// "is the filter on?" status is glanceable.
+fn build_icon(kind: IconKind) -> Result<Icon, tray_icon::BadIcon> {
     const SIZE: u32 = 32;
     let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
     let cx = SIZE as f32 / 2.0 - 0.5;
     let cy = SIZE as f32 / 2.0 - 0.5;
-    let radius = SIZE as f32 / 2.0 - 1.0;
+    let outer_r = SIZE as f32 / 2.0 - 1.0;
+    // Inner disc shrinks slightly for the running variant so the
+    // outer green ring is visible.
+    let inner_r = match kind {
+        IconKind::Idle => outer_r,
+        IconKind::Running => outer_r - 4.0,
+    };
+
     for y in 0..SIZE {
         for x in 0..SIZE {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             let d = (dx * dx + dy * dy).sqrt();
             let idx = ((y * SIZE + x) * 4) as usize;
-            if d <= radius {
+            if d <= inner_r {
                 // mellonella → wax-moth yellow.
                 rgba[idx] = 230;
                 rgba[idx + 1] = 200;
                 rgba[idx + 2] = 80;
+                rgba[idx + 3] = 255;
+            } else if matches!(kind, IconKind::Running) && d <= outer_r {
+                // Green ring for "live session active".
+                rgba[idx] = 80;
+                rgba[idx + 1] = 200;
+                rgba[idx + 2] = 120;
                 rgba[idx + 3] = 255;
             }
         }
