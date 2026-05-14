@@ -33,8 +33,8 @@ use crate::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
-    apply_envelope, as_norm_score, cos_sim_max_iter, f0_match, should_admit_auto_learn,
-    ApplyEnvelopeError, GateConfig, GateState,
+    apply_envelope, as_norm_score, f0_match, should_admit_auto_learn, ApplyEnvelopeError,
+    GateConfig, GateState,
 };
 use crate::resample::{resample_to, ResampleError};
 use crate::streaming::{StreamingConfig, StreamingState};
@@ -141,12 +141,21 @@ pub struct PipelineConfig {
     pub silence_force_off_ms: f32,
     /// EMA smoothing factor applied to `last_score` on every refresh:
     /// `last_score = alpha * new_score + (1 - alpha) * last_score`.
-    /// `1.0` (default) disables smoothing — the new score replaces the
-    /// old one as it always did. Lower values smooth out brief dips
-    /// (e.g. an embedding shift at speech-onset transients) that would
+    /// `1.0` disables smoothing — the new score replaces the old one.
+    /// Lower values smooth out brief dips (e.g. an embedding shift at
+    /// speech-onset transients, or one noisy refresh window) that would
     /// otherwise drag the gate below `theta_pass` for one refresh
     /// cycle. The first refresh always overwrites (no smoothing
     /// against the initial zero).
+    ///
+    /// Default `0.6` (#117): moderate smoothing — 60 % new score, 40 %
+    /// carried-over, time constant ≈ one refresh (500 ms). The score
+    /// only updates per refresh, so this is the *only* place per-frame
+    /// jitter can be damped (frame-level filtering is a no-op while the
+    /// score is held constant between refreshes). The value is a
+    /// starting point pending calibration; `1.0` restores the original
+    /// no-smoothing behaviour and is pinned by the `pipeline_parity`
+    /// fixture so the Rust↔Python byte-equal contract is unaffected.
     pub score_ema_alpha: f32,
 }
 
@@ -162,7 +171,7 @@ impl Default for PipelineConfig {
             pre_roll_ms: 100,
             async_refresh: false,
             silence_force_off_ms: 0.0,
-            score_ema_alpha: 1.0,
+            score_ema_alpha: 0.6,
         }
     }
 }
@@ -820,13 +829,7 @@ pub(crate) fn apply_refresh_result(
     last_fm: &mut f32,
     auto_learn_events: &mut Vec<AutoLearnEvent>,
 ) {
-    let cs = cos_sim_max_iter(
-        &embedding,
-        pool.anchors()
-            .iter()
-            .chain(pool.auto_learn().iter())
-            .map(Vec::as_slice),
-    );
+    let cs = pool.match_score(&embedding);
     let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
     *last_cs = cs;
     *last_fm = fm;

@@ -24,7 +24,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::gating::cos_similarity;
+use crate::gating::{cos_sim_max_iter, cos_similarity};
 
 /// Persistence-schema version. Incremented if the on-disk shape ever
 /// changes; readers reject any payload whose `version` field differs.
@@ -71,6 +71,35 @@ pub struct EmbeddingPool {
     anchors: Vec<Vec<f32>>,
     auto_learn: VecDeque<Vec<f32>>,
     metadata: EnrollmentMetadata,
+    /// Element-wise mean of `anchors`, recomputed whenever the anchor
+    /// set changes. `None` while there are no anchors. Cached because
+    /// anchors are immutable after enrollment, so the centroid only
+    /// has to be recomputed on `add_anchors` / deserialisation rather
+    /// than on every score lookup. See [`Self::match_score`] (#117).
+    anchor_centroid: Option<Vec<f32>>,
+}
+
+/// Element-wise mean of `anchors`, or `None` for an empty slice.
+///
+/// For a single anchor the mean is that anchor verbatim (multiplying
+/// each f32 by `1.0` is exact), so a single-anchor pool scores
+/// byte-identically to the pre-#117 `cos_sim_max` path.
+fn compute_anchor_centroid(anchors: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let dim = anchors.first()?.len();
+    let mut sum = vec![0.0f32; dim];
+    for a in anchors {
+        debug_assert_eq!(a.len(), dim, "anchor embeddings must share a dimension");
+        for (s, &x) in sum.iter_mut().zip(a.iter()) {
+            *s += x;
+        }
+    }
+    // Anchor count is a handful (5–10 enrollment windows), exact in f32.
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / anchors.len() as f32;
+    for s in &mut sum {
+        *s *= inv;
+    }
+    Some(sum)
 }
 
 impl EmbeddingPool {
@@ -81,6 +110,7 @@ impl EmbeddingPool {
             anchors: Vec::new(),
             auto_learn: VecDeque::new(),
             metadata: EnrollmentMetadata::default(),
+            anchor_centroid: None,
         }
     }
 
@@ -131,6 +161,37 @@ impl EmbeddingPool {
         for emb in embeddings {
             self.anchors.push(emb.into());
         }
+        self.anchor_centroid = compute_anchor_centroid(&self.anchors);
+    }
+
+    /// Element-wise mean of the anchor embeddings, or `None` when the
+    /// pool has no anchors yet. The reference used by
+    /// [`Self::match_score`].
+    #[must_use]
+    pub fn anchor_centroid(&self) -> Option<&[f32]> {
+        self.anchor_centroid.as_deref()
+    }
+
+    /// Pool match score for `emb` (#117): cosine similarity against the
+    /// anchor centroid, maxed with the per-entry max over the
+    /// auto-learn FIFO.
+    ///
+    /// Replaces the previous "max cosine over every anchor + auto-learn
+    /// entry" rule. The anchors all come from one enrollment recording
+    /// of the same speaker, so their centroid is a stabler reference
+    /// than the single best-matching anchor (one outlier anchor or a
+    /// noisy refresh window no longer swings the score). The auto-learn
+    /// FIFO keeps the max so distinct runtime vocal modes are still
+    /// captured. Floors at `0.0`, matching the old `cos_sim_max`
+    /// behaviour; returns `0.0` for an empty pool.
+    #[must_use]
+    pub fn match_score(&self, emb: &[f32]) -> f32 {
+        let anchor_score = self
+            .anchor_centroid
+            .as_deref()
+            .map_or(0.0, |c| cos_similarity(emb, c));
+        let auto_score = cos_sim_max_iter(emb, self.auto_learn.iter().map(Vec::as_slice));
+        anchor_score.max(auto_score)
     }
 
     pub fn set_f0_stats(&mut self, mu: f32, sigma: f32) {
@@ -298,11 +359,13 @@ impl PoolPayload {
         while auto_learn.len() > config.auto_learn_max_size {
             auto_learn.pop_front();
         }
+        let anchor_centroid = compute_anchor_centroid(&self.anchors);
         EmbeddingPool {
             config,
             anchors: self.anchors,
             auto_learn,
             metadata: self.metadata,
+            anchor_centroid,
         }
     }
 }
@@ -360,6 +423,92 @@ mod tests {
     fn anchor_distance_none_when_empty() {
         let pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
         assert!(pool.anchor_distance(&[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn anchor_centroid_none_when_empty() {
+        let pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        assert!(pool.anchor_centroid().is_none());
+    }
+
+    #[test]
+    fn anchor_centroid_single_anchor_is_verbatim() {
+        // Centroid of one anchor is that anchor byte-for-byte (each
+        // f32 multiplied by 1.0). This is what keeps `pipeline_parity`
+        // byte-equal under #117.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let anchor = unit(&[0.3, -0.7, 0.1, 0.64]);
+        pool.add_anchors([anchor.clone()]);
+        assert_eq!(pool.anchor_centroid().unwrap(), anchor.as_slice());
+    }
+
+    #[test]
+    fn anchor_centroid_is_elementwise_mean() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        pool.add_anchors([vec![1.0_f32, 3.0, -1.0], vec![3.0_f32, 1.0, 1.0]]);
+        assert_eq!(pool.anchor_centroid().unwrap(), &[2.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn add_anchors_recomputes_centroid() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        pool.add_anchors([vec![0.0_f32, 2.0]]);
+        assert_eq!(pool.anchor_centroid().unwrap(), &[0.0, 2.0]);
+        pool.add_anchors([vec![2.0_f32, 0.0]]);
+        assert_eq!(pool.anchor_centroid().unwrap(), &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn match_score_single_anchor_equals_cos_similarity() {
+        // Single anchor, no auto-learn: match_score reduces to
+        // cos_similarity against that anchor (the pre-#117 path).
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let anchor = unit(&[1.0, 0.0, 0.0]);
+        pool.add_anchors([anchor.clone()]);
+        let emb = unit(&[0.8, 0.6, 0.0]);
+        assert!((pool.match_score(&emb) - cos_similarity(&emb, &anchor)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn match_score_uses_centroid_not_best_anchor() {
+        // Two opposed anchors → centroid near the bisector. A probe
+        // aligned with one anchor scores against the *centroid*, which
+        // is lower than the old max-over-anchors would have given.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let a = unit(&[1.0, 1.0, 0.0]);
+        let b = unit(&[1.0, -1.0, 0.0]);
+        pool.add_anchors([a.clone(), b]);
+        let probe = a.clone();
+        let centroid = pool.anchor_centroid().unwrap();
+        let score = pool.match_score(&probe);
+        assert!((score - cos_similarity(&probe, centroid)).abs() < 1e-6);
+        // Old max-over-anchors would have returned cos(probe, a) = 1.0;
+        // the centroid score is strictly below that.
+        assert!(
+            score < 0.999,
+            "centroid score should be below the per-anchor max: {score}"
+        );
+    }
+
+    #[test]
+    fn match_score_maxes_centroid_with_auto_learn() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            anchor_distance_threshold: 1.0,
+            ..EmbeddingPoolConfig::default()
+        });
+        pool.add_anchors([unit(&[1.0, 0.0, 0.0])]);
+        let probe = unit(&[0.0, 1.0, 0.0]);
+        // Orthogonal to the anchor → centroid score ~0.
+        assert!(pool.match_score(&probe) < 1e-6);
+        // Admit an auto-learn entry that matches the probe → score jumps.
+        assert!(pool.add_auto_learn(probe.clone()));
+        assert!((pool.match_score(&probe) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn match_score_zero_for_empty_pool() {
+        let pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        assert_eq!(pool.match_score(&[1.0, 0.0, 0.0]), 0.0);
     }
 
     #[test]

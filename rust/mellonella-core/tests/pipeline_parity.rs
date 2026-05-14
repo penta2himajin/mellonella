@@ -89,6 +89,13 @@ fn process_offline_matches_python_reference() {
         // than the Python reference and the per-frame scores diverge.
         sv_update_samples: 4_000,
         enable_auto_learn: false,
+        // The dump script has no EMA smoothing; the live default is now
+        // 0.6 (#117). Pin to 1.0 so the per-frame scores stay byte-equal
+        // with the reference. (The #117 centroid scoring needs no pin —
+        // the fixture pool has a single anchor, whose centroid is that
+        // anchor verbatim, so `match_score` reduces to the old
+        // `cos_sim_max` exactly.)
+        score_ema_alpha: 1.0,
         ..PipelineConfig::default()
     };
     let gate_cfg = GateConfig::default();
