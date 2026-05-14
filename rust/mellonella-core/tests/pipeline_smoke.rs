@@ -112,8 +112,12 @@ fn process_offline_runs_end_to_end() {
     );
     assert_eq!(result.gate_per_frame.len(), result.f0_match_per_frame.len());
 
-    // Frame count matches the manual VAD chunking (audio.len() / vad_frame).
-    let n_frames_expected = audio.len() / CHUNK_SAMPLES_16K;
+    // Frame count: every full VAD frame, plus one zero-padded flush
+    // frame for the trailing sub-frame remainder. `process_offline` is
+    // a thin wrapper over the streaming engine, which flushes the tail
+    // (see streaming.rs) — so the count is `ceil`, not `floor`, of
+    // `audio.len() / vad_frame`.
+    let n_frames_expected = audio.len().div_ceil(CHUNK_SAMPLES_16K);
     assert_eq!(result.gate_per_frame.len(), n_frames_expected);
 
     // Decisions always start at sample 0.
@@ -175,6 +179,12 @@ fn process_offline_async_runs_end_to_end() {
 
     assert_eq!(result.audio.len(), audio.len());
     assert_eq!(result.gate_per_frame.len(), result.score_per_frame.len());
+    // `process_offline_async` still uses its own hand-rolled loop that
+    // drops the trailing sub-frame remainder (`floor`), unlike the sync
+    // path which wraps the streaming engine and flushes (`ceil`).
+    // Rewiring the async path onto the streaming engine is a documented
+    // follow-up (see the streaming.rs module docs); until then the two
+    // offline paths legitimately differ by at most one tail frame.
     let n_frames_expected = audio.len() / CHUNK_SAMPLES_16K;
     assert_eq!(result.gate_per_frame.len(), n_frames_expected);
     assert!(!result.gate_decisions.is_empty());
