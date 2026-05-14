@@ -12,6 +12,14 @@
       9.0,
       0.0
     ],
+    "vary_snr_schedule_db": [
+      15.0,
+      4.0,
+      12.0,
+      3.0,
+      14.0,
+      5.0
+    ],
     "seed": 0
   },
   "tolerances": {
@@ -19,34 +27,45 @@
     "fpr_relative": 0.05,
     "fpr_absolute_floor_when_zero": 0.05,
     "si_sdr_absolute_db": 1.0,
-    "other_rms_absolute_db": 3.0
+    "other_rms_absolute_db": 3.0,
+    "gate_transitions_absolute": 4
   },
   "metrics": {
     "snr_5_db": {
       "tpr": 0.6509,
       "fpr": 0.0,
       "si_sdr_db": 0.05,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 3
     },
     "snr_10_db": {
       "tpr": 0.7155,
       "fpr": 0.0,
       "si_sdr_db": 3.52,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 5
     },
     "snr_15_db": {
       "tpr": 0.6379,
       "fpr": 0.0,
       "si_sdr_db": 2.12,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 3
     },
     "sim4_9db": {
       "tpr": 0.6983,
-      "si_sdr_db": 2.89
+      "si_sdr_db": 2.89,
+      "gate_transitions": 4
     },
     "sim4_0db": {
       "tpr": 0.3534,
-      "si_sdr_db": -6.18
+      "si_sdr_db": -6.18,
+      "gate_transitions": 4
+    },
+    "vary_snr": {
+      "tpr": 0.6293,
+      "si_sdr_db": 0.34,
+      "gate_transitions": 4
     }
   }
 }
