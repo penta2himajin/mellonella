@@ -217,9 +217,9 @@ def test_loss_matches_bench_si_sdr_reference() -> None:
     bench_value = 10.0 * float(np.log10(num / den))
 
     torch_value = float(si_sdr(torch.from_numpy(ref_np), torch.from_numpy(est_np)))
-    assert abs(torch_value - bench_value) < 1e-2, (
-        f"torch SI-SDR {torch_value:.4f} disagrees with bench {bench_value:.4f}"
-    )
+    assert (
+        abs(torch_value - bench_value) < 1e-2
+    ), f"torch SI-SDR {torch_value:.4f} disagrees with bench {bench_value:.4f}"
 
 
 # ---------------------------------------------------------------------------
