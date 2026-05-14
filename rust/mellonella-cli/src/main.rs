@@ -121,6 +121,13 @@ struct LiveArgs {
     /// interface where one channel is the target signal.
     #[arg(long, default_value = "average")]
     input_channel: InputChannelArg,
+    /// Stage B low-latency profile: opt into the model-free
+    /// speaker-turn latency reduction (per-frame fast F0 cue + anchor
+    /// fusion, adaptive window / turn detection, offset fail-closed).
+    /// Off by default — with it off the pipeline is byte-identical to
+    /// the pre-Stage-B behaviour.
+    #[arg(long)]
+    low_latency: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +193,15 @@ struct ProcessArgs {
     /// granularity.
     #[arg(long)]
     gate_decisions: Option<PathBuf>,
+    /// Stage B low-latency profile: opt into the model-free
+    /// speaker-turn latency reduction (per-frame fast F0 cue + anchor
+    /// fusion, adaptive window / turn detection, offset fail-closed).
+    /// Off by default — with it off `process` is byte-identical to
+    /// the pre-Stage-B behaviour, so `ci_baseline_rust.json` is
+    /// unaffected. `bench/.../ci_accuracy.py --engine rust` passes
+    /// `--low-latency` to exercise the new path.
+    #[arg(long)]
+    low_latency: bool,
 }
 
 #[derive(Debug)]
@@ -392,12 +408,28 @@ fn cmd_enroll(args: EnrollArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Apply the Stage B low-latency profile to `cfg` when `enabled`.
+/// Flips all three opt-in knobs (`fast_cue_enabled`,
+/// `turn_detect_enabled`, `offset_fail_closed`) on at once; the
+/// per-knob defaults (`fast_cue_weight`, `turn_drop_delta`, the turn
+/// window / cadence) come from `PipelineConfig::default`. A no-op
+/// when `enabled` is false, so the default pipeline is unchanged.
+fn apply_low_latency_profile(cfg: &mut PipelineConfig, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    cfg.fast_cue_enabled = true;
+    cfg.turn_detect_enabled = true;
+    cfg.offset_fail_closed = true;
+}
+
 fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
     let audio = prepare_audio_for_process(&args.input, args.enable_dfn3)?;
     let mut pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
         .map_err(|e| CliError::Pipeline(format!("load enrollment: {e}")))?;
     let mut components = build_components()?;
-    let cfg = PipelineConfig::default();
+    let mut cfg = PipelineConfig::default();
+    apply_low_latency_profile(&mut cfg, args.low_latency);
     let gate = GateConfig::default();
     let result = process_offline(
         &audio,
@@ -493,12 +525,13 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
     // out one-refresh dips at speech onset, and a 100 ms post-silence
     // early-refresh trigger so `last_score` catches up quickly on
     // resume. See project-mellonella-first-smoke for the diagnosis.
-    let live_pipeline_cfg = PipelineConfig {
+    let mut live_pipeline_cfg = PipelineConfig {
         silence_force_off_ms: 400.0,
         score_ema_alpha: 0.7,
         sv_min_new_samples_after_silence: 1_600,
         ..PipelineConfig::default()
     };
+    apply_low_latency_profile(&mut live_pipeline_cfg, args.low_latency);
     let session_cfg = SessionConfig {
         input_device: args.input_device,
         output_device: args.output_device,

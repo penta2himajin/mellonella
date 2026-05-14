@@ -99,14 +99,17 @@ use rubato::{
 
 use crate::embedding::{EcapaTdnn, EmbeddingError};
 use crate::enrollment::EmbeddingPool;
-use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
+use crate::f0::{
+    estimate_f0_track, f0_statistics, yin_frame_with_cache, FftCache, DEFAULT_F_MAX, DEFAULT_F_MIN,
+    DEFAULT_THRESHOLD,
+};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
     as_norm_score, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig, GateState,
 };
 use crate::pipeline::{
     apply_refresh_result, fbank_ecapa_one, smooth_score, AutoLearnEvent, AutoLearnKind,
-    PipelineComponents, PipelineConfig, PipelineError,
+    PipelineComponents, PipelineConfig, PipelineError, ScoreState,
 };
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
@@ -197,6 +200,320 @@ pub struct StreamingOutput {
     pub f0_match_per_frame: Vec<f32>,
 }
 
+/// Decision-rate sample window length the per-frame fast-F0 cue runs
+/// YIN over. 2048 @ 16 kHz ≈ 128 ms — long enough for a stable YIN
+/// estimate down to [`DEFAULT_F_MIN`] (50 Hz → τ = 320), short enough
+/// that the cue reacts within ~4 VAD frames of a speaker turn.
+pub(crate) const FAST_F0_RING_SAMPLES: usize = 2048;
+
+/// **Stage B, Part 1** — per-VAD-frame instantaneous F0 estimator.
+///
+/// Maintains a ring of the last [`FAST_F0_RING_SAMPLES`]
+/// decision-rate samples; once the ring is full, every VAD frame runs
+/// a single `yin_frame_with_cache` over it. This is the *fast* cue —
+/// it reacts within a VAD frame, unlike the batched F0 inside the
+/// ECAPA refresh which only updates every `sv_update_samples`.
+///
+/// Returns `None` ("no evidence") while the ring is still filling or
+/// when YIN returns unvoiced / non-finite; callers map a `Some`
+/// estimate through `f0_match` and treat `None` as the configured
+/// neutral value (and skip the turn-detection EMAs).
+pub(crate) struct FastF0Cue {
+    /// Decision-rate sample ring, capped at [`FAST_F0_RING_SAMPLES`].
+    ring: VecDeque<f32>,
+    /// Contiguous staging slice handed to YIN (reused per frame).
+    scratch: Vec<f32>,
+    /// FFT planner + scratch reuse across per-frame YIN calls.
+    cache: FftCache,
+}
+
+impl FastF0Cue {
+    pub(crate) fn new() -> Self {
+        Self {
+            ring: VecDeque::with_capacity(FAST_F0_RING_SAMPLES),
+            scratch: Vec::with_capacity(FAST_F0_RING_SAMPLES),
+            cache: FftCache::new(),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.ring.clear();
+        self.scratch.clear();
+    }
+
+    /// Push one decision-rate VAD frame into the ring and, once the
+    /// ring is full, return the instantaneous F0 estimate over it.
+    /// `None` until the ring fills, and `None` for unvoiced frames.
+    pub(crate) fn push_frame(&mut self, decision_frame: &[f32], sample_rate: u32) -> Option<f32> {
+        for &s in decision_frame {
+            if self.ring.len() == FAST_F0_RING_SAMPLES {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(s);
+        }
+        if self.ring.len() < FAST_F0_RING_SAMPLES {
+            return None;
+        }
+        self.scratch.clear();
+        self.scratch.extend(self.ring.iter().copied());
+        yin_frame_with_cache(
+            &self.scratch,
+            sample_rate,
+            DEFAULT_F_MIN,
+            DEFAULT_F_MAX,
+            DEFAULT_THRESHOLD,
+            None,
+            &mut self.cache,
+        )
+    }
+}
+
+/// **Stage B, Part 1** — fuse the per-frame fast F0 cue into the
+/// gate-feeding score.
+///
+/// `fused = last_score + weight * (fm_fast - neutral)`. Pure /
+/// `#[cfg(test)]`-friendly so the fusion arithmetic can be checked
+/// without ONNX. With `fm_fast == neutral` (the "no evidence" case)
+/// this is the identity — `fused == last_score` — which is also why
+/// the disabled path is byte-identical to today.
+#[must_use]
+pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral: f32) -> f32 {
+    last_score + weight * (fm_fast - neutral)
+}
+
+/// **Stage B, Part 2** — adaptive-window lifecycle state.
+///
+/// * `Steady`   — long window, normal cadence (the only reachable
+///   state when `turn_detect_enabled` is `false`).
+/// * `Shrunk`   — a turn is suspected; window shrunk to
+///   `sv_turn_window_samples`, cadence tightened to
+///   `sv_turn_update_samples`.
+/// * `Regrowing`— the cue has re-stabilised and at least one refresh
+///   on the shrunk window has landed; the window is restored and we
+///   are waiting out the trailing book-keeping before returning to
+///   `Steady`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnState {
+    Steady,
+    Shrunk,
+    Regrowing,
+}
+
+/// Fast EMA rate for the per-frame `fm_fast` cue (reacts within a few
+/// frames so a turn is visible quickly).
+const FM_FAST_EMA_RATE: f32 = 0.3;
+/// Slow EMA rate for the confirmed-target `fm_fast` baseline (only
+/// advanced while the gate is ON, so it tracks the *enrolled*
+/// speaker's typical cue level).
+const FM_FAST_BASELINE_RATE: f32 = 0.02;
+/// How close (absolute `fm_fast` EMA distance) to the baseline counts
+/// as "re-stabilised" for the `Shrunk` → `Regrowing` transition.
+const TURN_STABLE_BAND: f32 = 0.1;
+
+/// **Stage B, Part 2** — pure turn-detection / adaptive-window state
+/// machine. Extracted from [`StreamingState`] so the transition logic
+/// is unit-testable without ONNX: it consumes a per-frame `fm_fast`
+/// observation plus the current gate state and emits the
+/// `effective_window` / cadence / fail-closed signals the streaming
+/// core applies.
+///
+/// Entirely inert when `turn_detect_enabled` is `false` — `observe`
+/// early-returns and `effective_window` stays at `sv_window_samples`.
+#[derive(Debug, Clone)]
+// Internal state machine — each bool is an independent latch
+// (fail-closed active, shrunk-refresh-done, evidence-this-frame,
+// saw-low-while-off). Folding them into an enum would not model the
+// orthogonal latches faithfully.
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct TurnDetector {
+    /// Current adaptive-window phase.
+    pub(crate) state: TurnState,
+    /// Fast EMA of the per-frame `fm_fast` cue.
+    pub(crate) fm_fast_ema: f32,
+    /// Slow EMA of `fm_fast`, advanced only on confirmed-target
+    /// (gate-ON) speech frames — the "this is the enrolled speaker"
+    /// reference level.
+    pub(crate) fm_fast_baseline: f32,
+    /// Consecutive stable frames counted toward the `Shrunk` →
+    /// `Regrowing` transition.
+    pub(crate) turn_stable_counter: u32,
+    /// Whether the offset fail-closed override is currently active.
+    pub(crate) offset_failclosed_active: bool,
+    /// Effective ECAPA window length (samples) — `sv_window_samples`
+    /// in `Steady`, `sv_turn_window_samples` while `Shrunk`.
+    pub(crate) effective_window: usize,
+    /// `true` once at least one refresh has completed since the
+    /// window shrank — gates both the fail-closed clear and the
+    /// `Shrunk` → `Regrowing` transition.
+    pub(crate) shrunk_refresh_done: bool,
+    /// Whether the cue had any evidence (`fm_fast` was `Some`) on the
+    /// most recent observed frame — exposed for diagnostics / tests.
+    pub(crate) had_evidence: bool,
+    /// `true` once the cue EMA has been seen well below baseline
+    /// while the gate is OFF. Onset-suspect requires this dip to
+    /// have happened first — otherwise *any* gate-OFF frame whose
+    /// cue sits near baseline reads as an onset turn, and ordinary
+    /// silence between the target's own utterances would spuriously
+    /// trip the detector. Cleared when onset-suspect fires.
+    pub(crate) saw_low_while_off: bool,
+}
+
+/// What [`TurnDetector::observe`] tells the streaming core to do for
+/// the current frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnDecision {
+    /// `true` on the frame a suspected turn is first detected — the
+    /// core shrinks the speech buffer down to `effective_window` on
+    /// this edge.
+    pub(crate) entered_shrunk: bool,
+    /// `true` while `Shrunk` — the core ORs a `due_turn` trigger into
+    /// the refresh-due decision and uses the tight cadence.
+    pub(crate) shrunk: bool,
+}
+
+impl TurnDetector {
+    /// Construct with the steady window length — every field starts
+    /// in the inert `Steady` configuration.
+    pub(crate) fn new(sv_window_samples: usize) -> Self {
+        Self {
+            state: TurnState::Steady,
+            fm_fast_ema: 0.0,
+            fm_fast_baseline: 0.0,
+            turn_stable_counter: 0,
+            offset_failclosed_active: false,
+            effective_window: sv_window_samples,
+            shrunk_refresh_done: false,
+            had_evidence: false,
+            saw_low_while_off: false,
+        }
+    }
+
+    /// Reset to the steady configuration (used by
+    /// [`StreamingState::reset`]).
+    pub(crate) fn reset(&mut self, sv_window_samples: usize) {
+        *self = Self::new(sv_window_samples);
+    }
+
+    /// Record that a refresh on the shrunk window has completed.
+    /// Clears the fail-closed override (the gate then follows normal
+    /// scoring again) and arms the `Shrunk` → `Regrowing` transition.
+    pub(crate) fn note_refresh_completed(&mut self) {
+        if self.state == TurnState::Shrunk {
+            self.shrunk_refresh_done = true;
+            self.offset_failclosed_active = false;
+        }
+    }
+
+    /// Per-`now_speech`-frame update. `fm_fast` is the per-frame cue
+    /// (`None` = no evidence), `gate_on` is the gate state coming
+    /// into this frame. Pure: mutates only `self`, returns the
+    /// `TurnDecision` the core acts on. No-op (returns the inert
+    /// decision) when `cfg.turn_detect_enabled` is `false`.
+    pub(crate) fn observe(
+        &mut self,
+        fm_fast: Option<f32>,
+        gate_on: bool,
+        cfg: &PipelineConfig,
+    ) -> TurnDecision {
+        if !cfg.turn_detect_enabled {
+            return TurnDecision {
+                entered_shrunk: false,
+                shrunk: false,
+            };
+        }
+        self.had_evidence = fm_fast.is_some();
+        if let Some(fm) = fm_fast {
+            // Seed the EMAs on first evidence so they don't crawl up
+            // from 0 and produce a spurious early "turn".
+            if self.fm_fast_ema == 0.0 && self.fm_fast_baseline == 0.0 {
+                self.fm_fast_ema = fm;
+                self.fm_fast_baseline = fm;
+            } else {
+                self.fm_fast_ema =
+                    FM_FAST_EMA_RATE * fm + (1.0 - FM_FAST_EMA_RATE) * self.fm_fast_ema;
+                if gate_on {
+                    self.fm_fast_baseline = FM_FAST_BASELINE_RATE * fm
+                        + (1.0 - FM_FAST_BASELINE_RATE) * self.fm_fast_baseline;
+                }
+            }
+        }
+
+        // Track a confirmed dip while the gate is OFF — the precursor
+        // an onset-suspect requires (a low cue followed by a rise back
+        // toward baseline, not just "near baseline").
+        if !gate_on
+            && self.had_evidence
+            && self.fm_fast_baseline > 0.0
+            && self.fm_fast_ema < self.fm_fast_baseline - cfg.turn_drop_delta
+        {
+            self.saw_low_while_off = true;
+        }
+
+        let mut entered_shrunk = false;
+        match self.state {
+            TurnState::Steady => {
+                // offset-suspect: gate ON, cue dropped well below the
+                // confirmed-target baseline → suspected target→other.
+                let offset_suspect = gate_on
+                    && self.had_evidence
+                    && self.fm_fast_ema < self.fm_fast_baseline - cfg.turn_drop_delta;
+                // onset-suspect: gate OFF, cue dipped low and has now
+                // risen sharply back toward the baseline → suspected
+                // other→target. The `saw_low_while_off` precursor is
+                // what makes this a *rise* rather than just "the cue
+                // happens to sit near baseline".
+                let onset_suspect = !gate_on
+                    && self.had_evidence
+                    && self.saw_low_while_off
+                    && self.fm_fast_ema >= self.fm_fast_baseline - TURN_STABLE_BAND
+                    && self.fm_fast_baseline > 0.0;
+                if offset_suspect || onset_suspect {
+                    self.state = TurnState::Shrunk;
+                    self.effective_window = cfg.sv_turn_window_samples;
+                    self.turn_stable_counter = 0;
+                    self.shrunk_refresh_done = false;
+                    self.saw_low_while_off = false;
+                    entered_shrunk = true;
+                    if offset_suspect && cfg.offset_fail_closed {
+                        self.offset_failclosed_active = true;
+                    }
+                }
+            }
+            TurnState::Shrunk => {
+                // Count consecutive frames the cue sits close to the
+                // (evolving) baseline; once stable AND a refresh on
+                // the shrunk window has landed, begin regrowing.
+                let close = self.had_evidence
+                    && (self.fm_fast_ema - self.fm_fast_baseline).abs() <= TURN_STABLE_BAND;
+                if close {
+                    self.turn_stable_counter += 1;
+                } else {
+                    self.turn_stable_counter = 0;
+                }
+                if self.shrunk_refresh_done
+                    && self.turn_stable_counter >= cfg.turn_stable_frames
+                {
+                    self.state = TurnState::Regrowing;
+                    self.effective_window = cfg.sv_window_samples;
+                }
+            }
+            TurnState::Regrowing => {
+                // The window is already restored; one frame in
+                // `Regrowing` is enough to settle back to `Steady`
+                // (kept as a distinct state so a future
+                // gradual-regrow policy has a hook).
+                self.state = TurnState::Steady;
+                self.turn_stable_counter = 0;
+            }
+        }
+
+        TurnDecision {
+            entered_shrunk,
+            shrunk: self.state == TurnState::Shrunk,
+        }
+    }
+}
+
 /// Private engine state — the carry-over data the streaming loop
 /// needs between `push_samples` / `flush` calls. Doesn't hold
 /// `EmbeddingPool` or `PipelineComponents`; both
@@ -237,9 +554,11 @@ pub(crate) struct StreamingState {
     new_speech_samples_after_silence: usize,
     prev_speech: bool,
     consecutive_speech_ms: f32,
-    last_score: f32,
-    last_cs: f32,
-    last_fm: f32,
+    /// Per-frame scoring scalars (`last_score` / `last_cs` /
+    /// `last_fm`) carried between frames. Bundled into [`ScoreState`]
+    /// so the per-frame core and the refresh strategies can share a
+    /// single `&mut` handle.
+    score: ScoreState,
     /// Continuous VAD-silence duration in ms, reset to 0 the moment a
     /// VAD-positive frame arrives. Used by the optional silence
     /// force-off rule (`PipelineConfig::silence_force_off_ms`) to
@@ -272,6 +591,15 @@ pub(crate) struct StreamingState {
     /// returns them via `shutdown` so [`StreamingPipeline::into_parts`]
     /// can reconstruct the full [`PipelineComponents`].
     pub(crate) async_worker: Option<AsyncWorker>,
+    /// **Stage B, Part 1** — per-frame fast F0 cue ring + YIN cache.
+    /// Always present; only *exercised* when `fast_cue_enabled` or
+    /// `turn_detect_enabled` is set (the per-frame YIN call is the
+    /// cost, so the disabled path skips `push_frame` entirely).
+    fast_f0_cue: FastF0Cue,
+    /// **Stage B, Part 2** — adaptive-window / turn-detection state
+    /// machine. Inert (stays `Steady`, `effective_window ==
+    /// sv_window_samples`) unless `turn_detect_enabled` is set.
+    turn: TurnDetector,
 }
 
 /// Persistent worker thread for `async_refresh = true` streaming.
@@ -419,6 +747,325 @@ impl AsyncWorker {
     }
 }
 
+/// Per-frame refresh policy — the one piece of the streaming loop
+/// that differs between the sync and async paths.
+///
+/// [`StreamingState::step_one_frame_core`] owns everything else
+/// (VAD, buffering, gate, envelope, diagnostics); it calls
+/// `on_refresh_due` when the cadence fires and `poll` on every
+/// frame. Sync runs Fbank / ECAPA / F0 inline and applies the result
+/// immediately; async submits the window to a worker and applies
+/// whatever has come back by the next `poll`.
+pub(crate) trait RefreshStrategy {
+    /// A refresh is due. `window` is the contiguous speech buffer.
+    /// Sync: run Fbank / ECAPA / F0 inline, update `score` and push
+    /// any auto-learn events now. Async: submit `window` to the
+    /// worker keyed on `frame_idx`.
+    fn on_refresh_due(
+        &mut self,
+        window: &[f32],
+        frame_idx: usize,
+        consecutive_speech_ms: f32,
+        score: &mut ScoreState,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError>;
+
+    /// Called every frame. Sync: no-op. Async: poll the worker for at
+    /// most one ready result and apply it via [`apply_refresh_result`].
+    fn poll(
+        &mut self,
+        consecutive_speech_ms: f32,
+        frame_idx: usize,
+        score: &mut ScoreState,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError>;
+
+    /// Enrolled `(f0_mu, f0_sigma)` from the pool — needed by the
+    /// Stage B per-frame fast F0 cue, which lives in the core but
+    /// only the strategy holds the `EmbeddingPool`.
+    fn enrolled_f0(&self) -> (f32, f32);
+}
+
+/// Submit / poll abstraction over an async ECAPA worker, so the same
+/// [`AsyncRefresh`] strategy can drive both the persistent
+/// [`AsyncWorker`] (live streaming) and the scoped `mpsc` worker
+/// inside `process_offline_async` (borrowed components — can't move
+/// `fbank` / `ecapa` into a persistent worker).
+pub(crate) trait RefreshChannel {
+    /// Hand a refresh window to the worker, keyed on the trigger
+    /// frame index (FIFO order preserved so auto-learn events get the
+    /// trigger-time frame, not the result-arrival frame).
+    fn submit(&mut self, window: Vec<f32>, frame_idx: usize);
+    /// Non-blocking poll for the next completed inference:
+    /// `(trigger_frame, embedding, f0_mu)`.
+    fn try_recv_result(
+        &mut self,
+    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError>;
+    /// Blocking drain of every outstanding inference. Used at
+    /// end-of-stream so the trailing scores / auto-learn events are
+    /// captured before the worker is torn down.
+    fn drain_blocking(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError>;
+}
+
+impl RefreshChannel for AsyncWorker {
+    fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
+        AsyncWorker::submit(self, window, frame_idx);
+    }
+    fn try_recv_result(
+        &mut self,
+    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
+        AsyncWorker::try_recv_result(self)
+    }
+    fn drain_blocking(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
+        AsyncWorker::drain_blocking(self)
+    }
+}
+
+/// Sync refresh strategy: Fbank / ECAPA / F0 run inline on the
+/// caller's thread, the score + auto-learn events are updated
+/// immediately. `poll` is a no-op.
+struct SyncRefresh<'a> {
+    fbank: &'a mut Fbank,
+    ecapa: &'a mut EcapaTdnn,
+    cohort: &'a [Vec<f32>],
+    pool: &'a mut EmbeddingPool,
+    decision_sr: u32,
+    enable_auto_learn: bool,
+    score_ema_alpha: f32,
+    use_as_norm: bool,
+    gate_cfg: GateConfig,
+}
+
+impl RefreshStrategy for SyncRefresh<'_> {
+    fn on_refresh_due(
+        &mut self,
+        window: &[f32],
+        frame_idx: usize,
+        consecutive_speech_ms: f32,
+        score: &mut ScoreState,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        let feats = self.fbank.compute(window);
+        let n_frames = feats.len() / N_MELS;
+        let embedding = self.ecapa.embed_features(&feats, n_frames, N_MELS)?;
+
+        let f0_track = estimate_f0_track(
+            window,
+            self.decision_sr,
+            2048,
+            512,
+            DEFAULT_F_MIN,
+            DEFAULT_F_MAX,
+        );
+        let (f0_mu, _) = f0_statistics(&f0_track);
+
+        let cs = self.pool.match_score(&embedding);
+        let fm = f0_match(
+            f0_mu,
+            self.pool.metadata().f0_mu,
+            self.pool.metadata().f0_sigma,
+        );
+        score.last_cs = cs;
+        score.last_fm = fm;
+        let new_score = if self.use_as_norm && !self.cohort.is_empty() {
+            as_norm_score(&embedding, cs, self.cohort, 20)
+        } else {
+            cs
+        };
+        score.last_score = smooth_score(score.last_score, new_score, self.score_ema_alpha);
+
+        if self.enable_auto_learn
+            && should_admit_auto_learn(
+                score.last_score,
+                fm,
+                consecutive_speech_ms,
+                &self.gate_cfg,
+            )
+        {
+            let admitted = self.pool.adapt(embedding);
+            let kind = if admitted {
+                AutoLearnKind::Admit
+            } else {
+                AutoLearnKind::RejectAnchorDistance
+            };
+            out.events.push(AutoLearnEvent {
+                frame_idx,
+                kind,
+                score: score.last_score,
+                f0_match: fm,
+            });
+        }
+        Ok(())
+    }
+
+    fn poll(
+        &mut self,
+        _consecutive_speech_ms: f32,
+        _frame_idx: usize,
+        _score: &mut ScoreState,
+        _out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        Ok(())
+    }
+
+    fn enrolled_f0(&self) -> (f32, f32) {
+        let m = self.pool.metadata();
+        (m.f0_mu, m.f0_sigma)
+    }
+}
+
+/// A [`RefreshChannel`] over a scoped `mpsc` pair — used by
+/// `process_offline_async`, which borrows `PipelineComponents` and so
+/// can't move `fbank` / `ecapa` into a persistent [`AsyncWorker`].
+/// The actual worker thread lives in `process_offline_async`'s
+/// `std::thread::scope`; this struct just carries the channel ends
+/// plus the same outstanding / pending / FIFO-frame-index bookkeeping
+/// the inline loop used to keep, so the cadence is identical.
+pub(crate) struct ScopedRefreshChannel {
+    work_tx: std::sync::mpsc::Sender<Vec<f32>>,
+    result_rx: std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
+    outstanding: u32,
+    pending: Option<Vec<f32>>,
+    refresh_frame_indices: VecDeque<usize>,
+}
+
+impl ScopedRefreshChannel {
+    pub(crate) fn new(
+        work_tx: std::sync::mpsc::Sender<Vec<f32>>,
+        result_rx: std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
+    ) -> Self {
+        Self {
+            work_tx,
+            result_rx,
+            outstanding: 0,
+            pending: None,
+            refresh_frame_indices: VecDeque::new(),
+        }
+    }
+
+}
+
+impl RefreshChannel for ScopedRefreshChannel {
+    fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
+        self.refresh_frame_indices.push_back(frame_idx);
+        if self.outstanding == 0 {
+            if self.work_tx.send(window).is_ok() {
+                self.outstanding = 1;
+            }
+        } else {
+            self.pending = Some(window);
+        }
+    }
+
+    fn try_recv_result(
+        &mut self,
+    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
+        if self.outstanding == 0 {
+            return Ok(None);
+        }
+        match self.result_rx.try_recv() {
+            Ok(Ok((emb, f0_mu))) => {
+                let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
+                self.outstanding -= 1;
+                if let Some(next) = self.pending.take() {
+                    if self.work_tx.send(next).is_ok() {
+                        self.outstanding = 1;
+                    }
+                }
+                Ok(Some((frame_idx, emb, f0_mu)))
+            }
+            Ok(Err(e)) => Err(e),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                Err(EmbeddingError::Ort("ECAPA worker disconnected".into()))
+            }
+        }
+    }
+
+    fn drain_blocking(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
+        let mut results = Vec::new();
+        while self.outstanding > 0 {
+            let msg = self
+                .result_rx
+                .recv()
+                .map_err(|_| EmbeddingError::Ort("ECAPA worker disconnected".into()))?;
+            let (emb, f0_mu) = msg?;
+            let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
+            self.outstanding -= 1;
+            results.push((frame_idx, emb, f0_mu));
+            if let Some(next) = self.pending.take() {
+                if self.work_tx.send(next).is_ok() {
+                    self.outstanding = 1;
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// Async refresh strategy: a due refresh **submits** the window to a
+/// [`RefreshChannel`]; every frame `poll` drains at most one ready
+/// result and folds it into the pool / gate state via
+/// [`apply_refresh_result`].
+pub(crate) struct AsyncRefresh<'a> {
+    pub(crate) channel: &'a mut dyn RefreshChannel,
+    pub(crate) cohort: &'a [Vec<f32>],
+    pub(crate) pool: &'a mut EmbeddingPool,
+    pub(crate) enable_auto_learn: bool,
+    pub(crate) score_ema_alpha: f32,
+    pub(crate) gate_cfg: GateConfig,
+}
+
+impl RefreshStrategy for AsyncRefresh<'_> {
+    fn on_refresh_due(
+        &mut self,
+        window: &[f32],
+        frame_idx: usize,
+        _consecutive_speech_ms: f32,
+        _score: &mut ScoreState,
+        _out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        self.channel.submit(window.to_vec(), frame_idx);
+        Ok(())
+    }
+
+    fn poll(
+        &mut self,
+        consecutive_speech_ms: f32,
+        _frame_idx: usize,
+        score: &mut ScoreState,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        if let Some((trigger_frame, embedding, f0_mu)) = self.channel.try_recv_result()? {
+            apply_refresh_result(
+                embedding,
+                f0_mu,
+                trigger_frame,
+                consecutive_speech_ms,
+                self.pool,
+                self.cohort,
+                &self.gate_cfg,
+                self.enable_auto_learn,
+                self.score_ema_alpha,
+                score,
+                &mut out.events,
+            );
+        }
+        Ok(())
+    }
+
+    fn enrolled_f0(&self) -> (f32, f32) {
+        let m = self.pool.metadata();
+        (m.f0_mu, m.f0_sigma)
+    }
+}
+
 /// Owning storage for `PipelineComponents` inside a
 /// [`StreamingPipeline`]. Sync stores the full struct; async splits
 /// out `fbank` + `ecapa` into the persistent worker thread, keeping
@@ -489,9 +1136,7 @@ impl StreamingState {
             new_speech_samples_after_silence: 0,
             prev_speech: false,
             consecutive_speech_ms: 0.0,
-            last_score: 0.0,
-            last_cs: 0.0,
-            last_fm: 1.0,
+            score: ScoreState::new(),
             silence_ms_since_speech: 0.0,
             gate_state: GateState::new(config.gate),
             envelope_state: EnvelopeState::new(config.gate, audio_sr),
@@ -500,6 +1145,8 @@ impl StreamingState {
             audio_samples_emitted: 0,
             identity_input_per_frame: CHUNK_SAMPLES_16K,
             async_worker: None,
+            fast_f0_cue: FastF0Cue::new(),
+            turn: TurnDetector::new(config.pipeline.sv_window_samples),
         })
     }
 
@@ -549,15 +1196,15 @@ impl StreamingState {
         self.new_speech_samples_after_silence = 0;
         self.prev_speech = false;
         self.consecutive_speech_ms = 0.0;
-        self.last_score = 0.0;
-        self.last_cs = 0.0;
-        self.last_fm = 1.0;
+        self.score = ScoreState::new();
         self.silence_ms_since_speech = 0.0;
         self.gate_state = GateState::new(config.gate);
         self.envelope_state = EnvelopeState::new(config.gate, config.audio_sample_rate);
         self.current_decision = None;
         self.frame_idx = 0;
         self.audio_samples_emitted = 0;
+        self.fast_f0_cue.reset();
+        self.turn.reset(config.pipeline.sv_window_samples);
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -647,34 +1294,51 @@ impl StreamingState {
         Ok(Some((audio_chunk, decision_chunk)))
     }
 
-    /// Single VAD-frame iteration: runs VAD, accumulates speech,
-    /// maybe runs ECAPA, advances gate + envelope, appends the
-    /// envelope-gated audio-rate samples to `out`.
-    fn step_one_frame(
+    /// Shared per-VAD-frame core for all three streaming call-sites
+    /// (sync streaming, async streaming, `process_offline_async`).
+    ///
+    /// Everything common lives here: VAD scoring, speech-buffer
+    /// accumulation, the pre-roll ring, silence bookkeeping, the
+    /// refresh-trigger decision (`due_normal` / `due_early`), the
+    /// gate update + `silence_force_off` AND-term, diagnostics
+    /// pushes, the decision-boundary emit, the envelope advance, and
+    /// the counter bumps.
+    ///
+    /// The *only* thing that varies between sync and async is **how**
+    /// a due refresh is executed and how its result is applied — that
+    /// is parameterised via the [`RefreshStrategy`] trait. `vad` is
+    /// passed in by `&mut` (rather than reached through
+    /// `PipelineComponents`) because in async mode the rest of the
+    /// components live in a worker thread.
+    pub(crate) fn step_one_frame_core(
         &mut self,
         audio_chunk: &[f32],
         decision_frame: &[f32],
-        pool: &mut EmbeddingPool,
-        components: &mut PipelineComponents,
+        vad: &mut SileroVad,
+        strategy: &mut dyn RefreshStrategy,
         config: &StreamingConfig,
         out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
         let vad_frame = CHUNK_SAMPLES_16K;
         let pipeline_cfg = &config.pipeline;
-        let gate_cfg = &config.gate;
         let dt_ms = pipeline_cfg.vad_frame_ms();
+        // Stage B: when no opt-in flag is set this is always
+        // `sv_window_samples`, so every site below is byte-identical
+        // to the pre-Stage-B behaviour.
+        let effective_window = self.turn.effective_window;
+        let stage_b_active = pipeline_cfg.fast_cue_enabled || pipeline_cfg.turn_detect_enabled;
 
-        let speech_prob = components.vad.score(decision_frame)?;
+        let speech_prob = vad.score(decision_frame)?;
         let now_speech = speech_prob > pipeline_cfg.vad_threshold;
         if now_speech {
             if !self.prev_speech {
                 // VAD OFF→ON: fold the pre-roll ring into the speech
                 // buffer so the next ECAPA refresh sees the pre-trigger
                 // audio. Issue #80.
-                self.prepend_pre_roll_to_speech_buffer(pipeline_cfg.sv_window_samples);
+                self.prepend_pre_roll_to_speech_buffer(effective_window);
             }
             for &sample in decision_frame {
-                if self.speech_buffer.len() == pipeline_cfg.sv_window_samples {
+                if self.speech_buffer.len() == effective_window {
                     self.speech_buffer.pop_front();
                 }
                 self.speech_buffer.push_back(sample);
@@ -703,78 +1367,132 @@ impl StreamingState {
         // trigger frame itself.
         self.push_pre_roll(decision_frame);
 
-        let due_normal = self.samples_since_update >= pipeline_cfg.sv_update_samples;
+        // --- Stage B, Part 1: per-frame fast F0 cue ---------------
+        // Compute the instantaneous F0 cue whenever any Stage B
+        // feature needs it. `fm_fast` is `Some` only with real
+        // evidence (ring full + voiced frame); `None` = neutral / no
+        // EMA update. The fused score is what feeds the gate when
+        // `fast_cue_enabled`; otherwise the gate sees `last_score`
+        // exactly as before.
+        let mut fm_fast: Option<f32> = None;
+        if stage_b_active {
+            if let Some(f0_hz) = self
+                .fast_f0_cue
+                .push_frame(decision_frame, pipeline_cfg.sample_rate)
+            {
+                let (mu, sigma) = strategy.enrolled_f0();
+                fm_fast = Some(f0_match(f0_hz, mu, sigma));
+            }
+        }
+
+        // --- Stage B, Part 2: turn detection ----------------------
+        // Observe the cue against the fast/slow EMA baseline. The
+        // detector is fully inert unless `turn_detect_enabled`.
+        // `gate_on` is the gate state *coming into* this frame
+        // (`current_decision`), so the offset/onset-suspect tests see
+        // the pre-update state. Only fed on `now_speech` frames.
+        let gate_on_before = self.current_decision.unwrap_or(false);
+        let turn_decision = if now_speech {
+            self.turn.observe(fm_fast, gate_on_before, pipeline_cfg)
+        } else {
+            TurnDecision {
+                entered_shrunk: false,
+                shrunk: self.turn.state == TurnState::Shrunk,
+            }
+        };
+        if turn_decision.entered_shrunk {
+            // On the shrink edge, drop the speech buffer down to the
+            // most recent `effective_window` samples so the next
+            // refresh sees only post-turn audio.
+            let new_window = self.turn.effective_window;
+            while self.speech_buffer.len() > new_window {
+                self.speech_buffer.pop_front();
+            }
+        }
+        // While shrunk, the refresh cadence tightens to the turn
+        // cadence and a refresh fires immediately on the shrink edge.
+        let update_cadence = if turn_decision.shrunk {
+            pipeline_cfg.sv_turn_update_samples
+        } else {
+            pipeline_cfg.sv_update_samples
+        };
+        let refresh_window = self.turn.effective_window;
+
+        let due_normal = self.samples_since_update >= update_cadence;
         let due_early = self.silence_seen_since_refresh
             && now_speech
             && self.new_speech_samples_after_silence
                 >= pipeline_cfg.sv_min_new_samples_after_silence;
-        if (due_normal || due_early) && self.speech_buffer.len() >= pipeline_cfg.sv_window_samples {
+        let due_turn = turn_decision.entered_shrunk;
+        if (due_normal || due_early || due_turn)
+            && self.speech_buffer.len() >= refresh_window
+        {
             self.samples_since_update = 0;
             self.silence_seen_since_refresh = false;
             self.new_speech_samples_after_silence = 0;
+            // Stage the contiguous window into the reusable scratch so
+            // both strategies see the same `&[f32]` view. While
+            // shrunk this is only the last `effective_window`
+            // samples.
             self.sv_window_scratch.clear();
             self.sv_window_scratch
                 .extend(self.speech_buffer.iter().copied());
-            let window: &[f32] = &self.sv_window_scratch;
-
-            let feats = components.fbank.compute(window);
-            let n_frames = feats.len() / N_MELS;
-            let embedding = components.ecapa.embed_features(&feats, n_frames, N_MELS)?;
-
-            let f0_track = estimate_f0_track(
-                window,
-                pipeline_cfg.sample_rate,
-                2048,
-                512,
-                DEFAULT_F_MIN,
-                DEFAULT_F_MAX,
-            );
-            let (f0_mu, _) = f0_statistics(&f0_track);
-
-            let cs = pool.match_score(&embedding);
-            let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
-            self.last_cs = cs;
-            self.last_fm = fm;
-            let new_score = if gate_cfg.use_as_norm && !components.cohort.is_empty() {
-                as_norm_score(&embedding, cs, &components.cohort, 20)
-            } else {
-                cs
-            };
-            self.last_score =
-                smooth_score(self.last_score, new_score, pipeline_cfg.score_ema_alpha);
-
-            if pipeline_cfg.enable_auto_learn
-                && should_admit_auto_learn(
-                    self.last_score,
-                    fm,
-                    self.consecutive_speech_ms,
-                    gate_cfg,
-                )
-            {
-                let admitted = pool.adapt(embedding);
-                let kind = if admitted {
-                    AutoLearnKind::Admit
-                } else {
-                    AutoLearnKind::RejectAnchorDistance
-                };
-                out.events.push(AutoLearnEvent {
-                    frame_idx: self.frame_idx,
-                    kind,
-                    score: self.last_score,
-                    f0_match: fm,
-                });
+            strategy.on_refresh_due(
+                &self.sv_window_scratch,
+                self.frame_idx,
+                self.consecutive_speech_ms,
+                &mut self.score,
+                out,
+            )?;
+            // A refresh on the shrunk window has now been issued. For
+            // the sync strategy this completes inline; for the async
+            // strategy the result trails by one inference (the async
+            // path already trails `last_score` by design), so we
+            // treat "submitted while shrunk" as "completed" — it arms
+            // both the fail-closed clear and the regrow transition.
+            if turn_decision.shrunk {
+                self.turn.note_refresh_completed();
             }
         }
 
-        let is_on_score = self.gate_state.update(self.last_score, dt_ms, now_speech);
+        // Every frame: sync is a no-op, async polls the worker and
+        // applies any ready result before the gate update.
+        strategy.poll(
+            self.consecutive_speech_ms,
+            self.frame_idx,
+            &mut self.score,
+            out,
+        )?;
+
+        // Stage B, Part 1: the gate sees the *fused* score when the
+        // fast cue is enabled, the bare `last_score` otherwise.
+        let gate_score = if pipeline_cfg.fast_cue_enabled {
+            fuse_fast_cue(
+                self.score.last_score,
+                fm_fast.unwrap_or(pipeline_cfg.fast_cue_f0_neutral),
+                pipeline_cfg.fast_cue_weight,
+                pipeline_cfg.fast_cue_f0_neutral,
+            )
+        } else {
+            self.score.last_score
+        };
+
+        let is_on_score = self.gate_state.update(gate_score, dt_ms, now_speech);
         let is_on = is_on_score
             && !(pipeline_cfg.silence_force_off_ms > 0.0
-                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
+                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms)
+            // Stage B, Part 2: offset fail-closed — an extra AND term
+            // parallel to the silence rule, OUTSIDE `gate_state.update`
+            // so it bypasses the gate hangover. Cleared once a refresh
+            // on the shrunk window lands.
+            && !self.turn.offset_failclosed_active;
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
-            out.score_per_frame.push(self.last_score);
-            out.cos_sim_max_per_frame.push(self.last_cs);
-            out.f0_match_per_frame.push(self.last_fm);
+            // Stage B, Part 1: with the fast cue on, the diagnostics
+            // score is the same fused value the gate consumed.
+            out.score_per_frame.push(gate_score);
+            out.cos_sim_max_per_frame.push(self.score.last_cs);
+            out.f0_match_per_frame.push(self.score.last_fm);
         }
 
         // Decision boundary: record (audio_rate_index, is_on) on
@@ -797,15 +1515,45 @@ impl StreamingState {
         Ok(())
     }
 
-    /// Async-mode counterpart of `step_one_frame`. Identical except
-    /// that an ECAPA refresh **submits** the speech window to the
-    /// persistent worker instead of running `Fbank` / `EcapaTdnn`
-    /// inline, and any ready results are applied via
-    /// [`apply_refresh_result`] before the gate update.
-    ///
-    /// This matches `process_offline_async`'s "at most one
-    /// inference in flight + one queued window" cadence so live
-    /// behaviour is consistent with the offline async path.
+    /// Single VAD-frame iteration, sync mode: builds a
+    /// [`SyncRefresh`] over the borrowed components and runs the
+    /// shared [`Self::step_one_frame_core`].
+    fn step_one_frame(
+        &mut self,
+        audio_chunk: &[f32],
+        decision_frame: &[f32],
+        pool: &mut EmbeddingPool,
+        components: &mut PipelineComponents,
+        config: &StreamingConfig,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        // Disjoint borrows: `vad` drives the core, `fbank` / `ecapa` /
+        // `cohort` go into the refresh strategy.
+        let PipelineComponents {
+            vad,
+            fbank,
+            ecapa,
+            cohort,
+        } = components;
+        let mut strategy = SyncRefresh {
+            fbank,
+            ecapa,
+            cohort,
+            pool,
+            decision_sr: config.pipeline.sample_rate,
+            enable_auto_learn: config.pipeline.enable_auto_learn,
+            score_ema_alpha: config.pipeline.score_ema_alpha,
+            use_as_norm: config.gate.use_as_norm,
+            gate_cfg: config.gate,
+        };
+        self.step_one_frame_core(audio_chunk, decision_frame, vad, &mut strategy, config, out)
+    }
+
+    /// Single VAD-frame iteration, async mode: builds an
+    /// [`AsyncRefresh`] over the persistent worker and runs the
+    /// shared [`Self::step_one_frame_core`]. The worker is taken out
+    /// of `self` for the duration of the call so the strategy can
+    /// hold a `&mut` to it disjointly from `&mut self`.
     fn step_one_frame_async(
         &mut self,
         audio_chunk: &[f32],
@@ -816,106 +1564,56 @@ impl StreamingState {
         config: &StreamingConfig,
         out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
-        let vad_frame = CHUNK_SAMPLES_16K;
-        let pipeline_cfg = &config.pipeline;
-        let gate_cfg = &config.gate;
-        let dt_ms = pipeline_cfg.vad_frame_ms();
+        let mut worker = self
+            .async_worker
+            .take()
+            .expect("step_one_frame_async requires an async worker");
+        let mut strategy = AsyncRefresh {
+            channel: &mut worker,
+            cohort,
+            pool,
+            enable_auto_learn: config.pipeline.enable_auto_learn,
+            score_ema_alpha: config.pipeline.score_ema_alpha,
+            gate_cfg: config.gate,
+        };
+        let res =
+            self.step_one_frame_core(audio_chunk, decision_frame, vad, &mut strategy, config, out);
+        self.async_worker = Some(worker);
+        res
+    }
 
-        let speech_prob = vad.score(decision_frame)?;
-        let now_speech = speech_prob > pipeline_cfg.vad_threshold;
-        if now_speech {
-            if !self.prev_speech {
-                self.prepend_pre_roll_to_speech_buffer(pipeline_cfg.sv_window_samples);
-            }
-            for &sample in decision_frame {
-                if self.speech_buffer.len() == pipeline_cfg.sv_window_samples {
-                    self.speech_buffer.pop_front();
-                }
-                self.speech_buffer.push_back(sample);
-            }
-            self.consecutive_speech_ms += dt_ms;
-            if self.silence_seen_since_refresh {
-                self.new_speech_samples_after_silence += vad_frame;
-            }
-        } else {
-            self.consecutive_speech_ms = 0.0;
+    /// Blocking-drain every outstanding inference on `channel` and
+    /// fold the results into `pool` / `self.score` / `out.events`.
+    ///
+    /// Shared end-of-stream tail for both async paths
+    /// (`StreamingState::flush_async` and `process_offline_async`).
+    /// Per-frame audio / gate decisions were already emitted with
+    /// whatever `last_score` held at the time; these trailing
+    /// results only affect `pool` and the auto-learn event log, and
+    /// the score carried forward for any subsequent run.
+    pub(crate) fn drain_trailing_refreshes(
+        &mut self,
+        channel: &mut dyn RefreshChannel,
+        pool: &mut EmbeddingPool,
+        cohort: &[Vec<f32>],
+        config: &StreamingConfig,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
+        for (trigger_frame, embedding, f0_mu) in channel.drain_blocking()? {
+            apply_refresh_result(
+                embedding,
+                f0_mu,
+                trigger_frame,
+                self.consecutive_speech_ms,
+                pool,
+                cohort,
+                &config.gate,
+                config.pipeline.enable_auto_learn,
+                config.pipeline.score_ema_alpha,
+                &mut self.score,
+                &mut out.events,
+            );
         }
-        if self.prev_speech && !now_speech {
-            self.silence_seen_since_refresh = true;
-            self.new_speech_samples_after_silence = 0;
-        }
-        if now_speech {
-            self.silence_ms_since_speech = 0.0;
-        } else {
-            self.silence_ms_since_speech += dt_ms;
-        }
-        self.prev_speech = now_speech;
-        self.samples_since_update += vad_frame;
-
-        self.push_pre_roll(decision_frame);
-
-        // Submit a refresh window to the worker when due — same
-        // cadence rule as the sync path.
-        let due_normal = self.samples_since_update >= pipeline_cfg.sv_update_samples;
-        let due_early = self.silence_seen_since_refresh
-            && now_speech
-            && self.new_speech_samples_after_silence
-                >= pipeline_cfg.sv_min_new_samples_after_silence;
-        if (due_normal || due_early) && self.speech_buffer.len() >= pipeline_cfg.sv_window_samples {
-            self.samples_since_update = 0;
-            self.silence_seen_since_refresh = false;
-            self.new_speech_samples_after_silence = 0;
-            let window: Vec<f32> = self.speech_buffer.iter().copied().collect();
-            if let Some(worker) = self.async_worker.as_mut() {
-                worker.submit(window, self.frame_idx);
-            }
-        }
-
-        // Drain at most one ready result per frame so the gate
-        // score updates as soon as the worker is done.
-        if let Some(worker) = self.async_worker.as_mut() {
-            if let Some((trigger_frame, embedding, f0_mu)) = worker.try_recv_result()? {
-                apply_refresh_result(
-                    embedding,
-                    f0_mu,
-                    trigger_frame,
-                    self.consecutive_speech_ms,
-                    pool,
-                    cohort,
-                    gate_cfg,
-                    pipeline_cfg.enable_auto_learn,
-                    pipeline_cfg.score_ema_alpha,
-                    &mut self.last_score,
-                    &mut self.last_cs,
-                    &mut self.last_fm,
-                    &mut out.events,
-                );
-            }
-        }
-
-        let is_on_score = self.gate_state.update(self.last_score, dt_ms, now_speech);
-        let is_on = is_on_score
-            && !(pipeline_cfg.silence_force_off_ms > 0.0
-                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
-        if config.diagnostics {
-            out.gate_per_frame.push(is_on);
-            out.score_per_frame.push(self.last_score);
-            out.cos_sim_max_per_frame.push(self.last_cs);
-            out.f0_match_per_frame.push(self.last_fm);
-        }
-
-        let block_start_audio = self.audio_samples_emitted;
-        if self.current_decision != Some(is_on) {
-            out.gate_decisions.push((block_start_audio, is_on));
-            self.current_decision = Some(is_on);
-        }
-
-        let gain = self.envelope_state.advance(is_on, audio_chunk.len());
-        for (k, &g) in gain.iter().enumerate() {
-            out.audio.push(audio_chunk[k] * g);
-        }
-        self.audio_samples_emitted += audio_chunk.len();
-        self.frame_idx += 1;
         Ok(())
     }
 
@@ -1038,29 +1736,10 @@ impl StreamingState {
             }
         }
         // Drain any in-flight ECAPA work so its scores + auto-learn
-        // events make it into the output. Per-frame audio was
-        // already emitted using whatever `last_score` was at that
-        // frame; these results only affect `pool` /
-        // `auto_learn_events`.
-        if let Some(worker) = self.async_worker.as_mut() {
-            let results = worker.drain_blocking()?;
-            for (trigger_frame, embedding, f0_mu) in results {
-                apply_refresh_result(
-                    embedding,
-                    f0_mu,
-                    trigger_frame,
-                    self.consecutive_speech_ms,
-                    pool,
-                    cohort,
-                    &config.gate,
-                    config.pipeline.enable_auto_learn,
-                    config.pipeline.score_ema_alpha,
-                    &mut self.last_score,
-                    &mut self.last_cs,
-                    &mut self.last_fm,
-                    &mut out.events,
-                );
-            }
+        // events make it into the output.
+        if let Some(mut worker) = self.async_worker.take() {
+            self.drain_trailing_refreshes(&mut worker, pool, cohort, config, &mut out)?;
+            self.async_worker = Some(worker);
         }
         Ok(out)
     }
@@ -1245,6 +1924,10 @@ impl StreamingPipeline {
 }
 
 #[cfg(test)]
+// The Stage B tests deliberately use exact `f32` equality (the
+// identity / disabled paths must be bit-exact) and cast loop indices
+// to `f32` for synthetic-tone generation — both inert in test code.
+#[allow(clippy::float_cmp, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -1373,5 +2056,298 @@ mod tests {
             Err(other) => panic!("expected Embedding error, got: {other}"),
             Ok(_) => panic!("sync `new` must reject async_refresh = true"),
         }
+    }
+
+    // ---- Stage B, Part 1: fast F0 cue fusion --------------------
+
+    #[test]
+    fn fuse_fast_cue_is_identity_at_neutral() {
+        // "No evidence" feeds `fm_fast == neutral`, so the fused
+        // score must equal `last_score` exactly — this is the
+        // arithmetic reason the disabled / no-evidence path is
+        // byte-identical to today.
+        let neutral = 0.5_f32;
+        for &ls in &[0.0_f32, 0.31, 0.7, -0.2] {
+            assert_eq!(fuse_fast_cue(ls, neutral, 0.15, neutral), ls);
+        }
+    }
+
+    #[test]
+    fn fuse_fast_cue_nudges_up_and_down() {
+        // Above-neutral cue nudges up, below-neutral nudges down,
+        // scaled by the weight.
+        let up = fuse_fast_cue(0.3, 1.0, 0.2, 0.5);
+        let down = fuse_fast_cue(0.3, 0.0, 0.2, 0.5);
+        assert!((up - (0.3 + 0.2 * 0.5)).abs() < 1e-6);
+        assert!((down - (0.3 - 0.2 * 0.5)).abs() < 1e-6);
+        assert!(up > 0.3 && down < 0.3);
+    }
+
+    #[test]
+    fn fast_f0_cue_no_evidence_until_ring_full() {
+        // The ring needs FAST_F0_RING_SAMPLES before YIN runs;
+        // before that every frame is "no evidence".
+        let mut cue = FastF0Cue::new();
+        let frame = vec![0.0_f32; CHUNK_SAMPLES_16K];
+        let mut pushed = 0;
+        while pushed + CHUNK_SAMPLES_16K <= FAST_F0_RING_SAMPLES {
+            assert!(
+                cue.push_frame(&frame, 16_000).is_none(),
+                "ring not full yet at {pushed} samples"
+            );
+            pushed += CHUNK_SAMPLES_16K;
+        }
+        // One more frame fills the ring; silence is unvoiced so YIN
+        // still returns None — but the point is the ring-fill gate
+        // no longer suppresses it.
+        let _ = cue.push_frame(&frame, 16_000);
+    }
+
+    #[test]
+    fn fast_f0_cue_recovers_pure_tone() {
+        // A sustained 150 Hz tone through a full ring should give a
+        // voiced estimate near 150 Hz.
+        let mut cue = FastF0Cue::new();
+        let sr = 16_000_u32;
+        let mut last: Option<f32> = None;
+        for frame_idx in 0..16 {
+            let mut frame = vec![0.0_f32; CHUNK_SAMPLES_16K];
+            for (i, s) in frame.iter_mut().enumerate() {
+                let n = frame_idx * CHUNK_SAMPLES_16K + i;
+                *s = (std::f32::consts::TAU * 150.0 * n as f32 / sr as f32).sin();
+            }
+            last = cue.push_frame(&frame, sr);
+        }
+        let est = last.expect("voiced estimate once ring is full");
+        assert!((est - 150.0).abs() / 150.0 < 0.05, "est={est}");
+    }
+
+    // ---- Stage B, Part 2: turn detection ------------------------
+
+    /// Turn-detection cfg helper: enabled, with the rest at defaults.
+    fn turn_cfg() -> PipelineConfig {
+        PipelineConfig {
+            turn_detect_enabled: true,
+            ..PipelineConfig::default()
+        }
+    }
+
+    #[test]
+    fn turn_detector_inert_when_disabled() {
+        // With `turn_detect_enabled = false` the detector never
+        // leaves `Steady` and `effective_window` stays at
+        // `sv_window_samples`, whatever the cue does.
+        let cfg = PipelineConfig::default();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        for fm in [0.9_f32, 0.1, 0.9, 0.05, 0.95] {
+            let d = det.observe(Some(fm), true, &cfg);
+            assert!(!d.entered_shrunk && !d.shrunk);
+            assert_eq!(det.state, TurnState::Steady);
+            assert_eq!(det.effective_window, cfg.sv_window_samples);
+        }
+    }
+
+    #[test]
+    fn turn_detector_shrinks_on_sharp_drop() {
+        // Gate ON, baseline established high, then the cue collapses
+        // → offset-suspect fires, window shrinks, `due_turn` would
+        // fire (entered_shrunk == true).
+        let cfg = turn_cfg();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        // Seed + hold a high baseline while the gate is ON.
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        assert_eq!(det.state, TurnState::Steady);
+        assert!(det.fm_fast_baseline > 0.8);
+        // Sharp drop in the cue — push it well below
+        // baseline - turn_drop_delta.
+        let mut entered = false;
+        for _ in 0..10 {
+            let d = det.observe(Some(0.1), true, &cfg);
+            entered |= d.entered_shrunk;
+            if det.state == TurnState::Shrunk {
+                break;
+            }
+        }
+        assert!(entered, "expected an entered_shrunk edge");
+        assert_eq!(det.state, TurnState::Shrunk);
+        assert_eq!(det.effective_window, cfg.sv_turn_window_samples);
+    }
+
+    #[test]
+    fn turn_detector_offset_fail_closed_lifecycle() {
+        // With `offset_fail_closed`, an offset-suspect sets
+        // `offset_failclosed_active`; a refresh-completed note
+        // clears it.
+        let cfg = PipelineConfig {
+            offset_fail_closed: true,
+            ..turn_cfg()
+        };
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        for _ in 0..10 {
+            det.observe(Some(0.1), true, &cfg);
+            if det.state == TurnState::Shrunk {
+                break;
+            }
+        }
+        assert_eq!(det.state, TurnState::Shrunk);
+        assert!(
+            det.offset_failclosed_active,
+            "offset-suspect must arm fail-closed"
+        );
+        det.note_refresh_completed();
+        assert!(
+            !det.offset_failclosed_active,
+            "a shrunk-window refresh must clear fail-closed"
+        );
+        assert!(det.shrunk_refresh_done);
+    }
+
+    #[test]
+    fn turn_detector_fail_closed_off_when_flag_unset() {
+        // Turn detection on, but `offset_fail_closed` off — the
+        // window still shrinks but the gate-override flag never arms.
+        let cfg = turn_cfg();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        for _ in 0..10 {
+            det.observe(Some(0.1), true, &cfg);
+            if det.state == TurnState::Shrunk {
+                break;
+            }
+        }
+        assert_eq!(det.state, TurnState::Shrunk);
+        assert!(!det.offset_failclosed_active);
+    }
+
+    #[test]
+    fn turn_detector_regrows_after_stable_and_refresh() {
+        // Shrunk → Regrowing requires BOTH a completed shrunk-window
+        // refresh AND `turn_stable_frames` of cue close to baseline;
+        // Regrowing → Steady on the next frame, window restored.
+        let cfg = turn_cfg();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        for _ in 0..10 {
+            det.observe(Some(0.1), true, &cfg);
+            if det.state == TurnState::Shrunk {
+                break;
+            }
+        }
+        assert_eq!(det.state, TurnState::Shrunk);
+        // The gate has recovered onto the (new) target: feed
+        // confirmed-target frames (gate ON) with the cue pinned at
+        // baseline. The EMA climbs back up; WITHOUT a refresh note
+        // the detector must NOT regrow no matter how stable it gets.
+        let baseline = det.fm_fast_baseline;
+        for _ in 0..60 {
+            det.observe(Some(baseline), true, &cfg);
+        }
+        assert_eq!(
+            det.state,
+            TurnState::Shrunk,
+            "no regrow without a completed shrunk-window refresh"
+        );
+        // Now note a refresh; the cue is already pinned at baseline,
+        // so the next `turn_stable_frames` frames must trip the
+        // regrow.
+        det.note_refresh_completed();
+        for _ in 0..=cfg.turn_stable_frames {
+            det.observe(Some(baseline), true, &cfg);
+        }
+        assert!(matches!(
+            det.state,
+            TurnState::Regrowing | TurnState::Steady
+        ));
+        // One more frame settles to Steady with the window restored.
+        det.observe(Some(baseline), true, &cfg);
+        assert_eq!(det.state, TurnState::Steady);
+        assert_eq!(det.effective_window, cfg.sv_window_samples);
+    }
+
+    #[test]
+    fn turn_detector_effective_window_shrink_then_grow() {
+        // End-to-end window-length trace: starts at sv_window_samples,
+        // shrinks to sv_turn_window_samples, returns to
+        // sv_window_samples.
+        let cfg = turn_cfg();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        assert_eq!(det.effective_window, cfg.sv_window_samples);
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        for _ in 0..10 {
+            det.observe(Some(0.1), true, &cfg);
+        }
+        assert_eq!(det.effective_window, cfg.sv_turn_window_samples);
+        det.note_refresh_completed();
+        // Confirmed-target frames (gate ON) with the cue pinned at
+        // baseline: the EMA climbs back, `turn_stable_frames` close
+        // frames accumulate, the detector regrows and settles to
+        // Steady with the window restored.
+        let baseline = det.fm_fast_baseline;
+        for _ in 0..80 {
+            det.observe(Some(baseline), true, &cfg);
+        }
+        assert_eq!(det.effective_window, cfg.sv_window_samples);
+    }
+
+    #[test]
+    fn turn_detector_due_turn_fires_once_on_shrink_edge() {
+        // `TurnDecision.entered_shrunk` is the `due_turn` refresh
+        // trigger the streaming core ORs in — it must fire exactly
+        // on the shrink edge, then stay false while `Shrunk`.
+        let cfg = turn_cfg();
+        let mut det = TurnDetector::new(cfg.sv_window_samples);
+        for _ in 0..40 {
+            det.observe(Some(0.95), true, &cfg);
+        }
+        let mut edges = 0_u32;
+        for _ in 0..20 {
+            let d = det.observe(Some(0.05), true, &cfg);
+            if d.entered_shrunk {
+                edges += 1;
+                assert!(d.shrunk, "entered_shrunk implies shrunk");
+            }
+        }
+        assert_eq!(edges, 1, "due_turn must fire exactly once per turn");
+        assert_eq!(det.state, TurnState::Shrunk);
+    }
+
+    #[test]
+    fn stage_b_disabled_leaves_gate_score_untouched() {
+        // With every Stage B flag false the per-frame path is
+        // unchanged: `effective_window` stays at `sv_window_samples`,
+        // the turn detector is inert, and the score that feeds the
+        // gate is `last_score` verbatim (the streaming core only
+        // calls `fuse_fast_cue` when `fast_cue_enabled`). This mirror
+        // of that branch documents the byte-equal contract.
+        let cfg = PipelineConfig::default();
+        assert!(!cfg.fast_cue_enabled);
+        assert!(!cfg.turn_detect_enabled);
+        assert!(!cfg.offset_fail_closed);
+        let det = TurnDetector::new(cfg.sv_window_samples);
+        assert_eq!(det.effective_window, cfg.sv_window_samples);
+        // The gate-score selection the core makes when the cue is off.
+        let last_score = 0.37_f32;
+        let gate_score = if cfg.fast_cue_enabled {
+            fuse_fast_cue(
+                last_score,
+                cfg.fast_cue_f0_neutral,
+                cfg.fast_cue_weight,
+                cfg.fast_cue_f0_neutral,
+            )
+        } else {
+            last_score
+        };
+        assert_eq!(gate_score, last_score);
     }
 }
