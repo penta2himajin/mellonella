@@ -13,31 +13,48 @@ Inputs
 * noise                     = synthetic Gaussian white noise (seed-fixed)
 * SNR sweep                 = 5, 10, 15 dB                  (case A / case C)
 * simultaneous mix sweep    = target+other at +9, 0 dB      (case B)
+* varying-SNR segmented     = contiguous target segments at the
+                              VARY_SNR_SCHEDULE_DB schedule    (case D)
 
 Per measurement key we record the metrics that apply:
 
     snr_<S>_db (target speaker + noise at <S> dB)
-        tpr             — gate-on rate during target speech
-        fpr             — gate-on rate when the input is the other speaker
-        si_sdr_db       — SI-SDR vs the clean target reference
-        other_rms_db    — overall RMS (dBFS) of the gated output when
-                          the input is the other speaker; lower = better
-                          attenuation. Catches "gate stays open"
-                          regressions even when FPR happens to land at 0.
+        tpr               — gate-on rate during target speech
+        fpr               — gate-on rate when the input is the other speaker
+        si_sdr_db         — SI-SDR vs the clean target reference
+        other_rms_db      — overall RMS (dBFS) of the gated output when
+                            the input is the other speaker; lower = better
+                            attenuation. Catches "gate stays open"
+                            regressions even when FPR happens to land at 0.
+        gate_transitions  — ON<->OFF flips in the per-frame gate (chatter)
 
     sim4_<R>db (target + other speech at target-to-other ratio <R>)
-        tpr             — gate-on rate during target voiced frames; the
-                          FP-tolerant policy in docs/gating.md D-001 says
-                          this should stay high even at 0 dB mix
-        si_sdr_db       — SI-SDR of the gated output vs the clean target
+        tpr               — gate-on rate during target voiced frames; the
+                            FP-tolerant policy in docs/gating.md D-001 says
+                            this should stay high even at 0 dB mix
+        si_sdr_db         — SI-SDR of the gated output vs the clean target
+        gate_transitions  — ON<->OFF flips in the per-frame gate (chatter)
+
+    vary_snr (case D — non-stationary; exercises #117 / #118)
+        tpr               — gate-on rate across the SNR schedule
+        si_sdr_db         — SI-SDR of the gated output vs the clean target
+        gate_transitions  — ON<->OFF flips; the metric the score-smoothing
+                            (#117) and λ-residual auto-learn (#118) work is
+                            expected to move — the stationary cases above
+                            are too steady to show those gains.
 
 Tolerances (worse-side only; improvements are ignored):
 
-    TPR           :  current >= baseline * 0.95           (relative -5%)
-    FPR           :  current <= baseline * 1.05           (relative +5%)
-                      — when baseline is 0, allow current up to 0.05 absolute
-    SI-SDR        :  current >= baseline - 1.0 dB         (absolute, dB)
-    other_rms_db  :  current <= baseline + 3.0 dB         (absolute, dB up = worse)
+    TPR              :  current >= baseline * 0.95        (relative -5%)
+    FPR              :  current <= baseline * 1.05        (relative +5%)
+                         — when baseline is 0, allow current up to 0.05 absolute
+    SI-SDR           :  current >= baseline - 1.0 dB      (absolute, dB)
+    other_rms_db     :  current <= baseline + 3.0 dB      (absolute, dB up = worse)
+    gate_transitions :  current <= baseline + 4           (absolute, more = worse)
+
+A measurement key absent from the baseline (a newly added scenario or
+metric) is reported as a note, not a failure — refresh the baseline
+with ``--update-baseline`` to start gating on it.
 
 Usage
 -----
@@ -80,12 +97,22 @@ from mellonella_bench.metrics.ns_quality import si_sdr
 SAMPLE_RATE = 16_000
 SNRS_DB: tuple[float, ...] = (5.0, 10.0, 15.0)
 SIM4_RATIOS_DB: tuple[float, ...] = (9.0, 0.0)
+# Per-segment SNR schedule for the `vary_snr` case: contiguous target
+# segments mixed at alternating high / low SNR. The steps create score
+# jitter at segment boundaries (exercises the EMA smoothing, #117) and
+# alternating high / low-confidence regions (exercises auto-learn
+# adaptation, #118) that the stationary `snr_*` cases never reach.
+VARY_SNR_SCHEDULE_DB: tuple[float, ...] = (15.0, 4.0, 12.0, 3.0, 14.0, 5.0)
 SEED = 0
 TPR_REL_TOL = 0.05
 FPR_REL_TOL = 0.05
 FPR_ABS_FLOOR = 0.05  # used when baseline FPR is exactly 0
 SI_SDR_ABS_TOL_DB = 1.0
 OTHER_RMS_ABS_TOL_DB = 3.0  # output_rms_db growing by > 3 dB = mute weakening
+# gate_transitions counts ON<->OFF flips in the per-frame gate — a
+# "chatter" measure (lower = steadier). Allowed to grow by this many
+# flips before it counts as a regression.
+GATE_TRANSITIONS_ABS_TOL = 4
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -159,10 +186,47 @@ def _mix_target_other(target: np.ndarray, other: np.ndarray, ratio_db: float) ->
     return (target.astype(np.float32) + scale * other_aligned.astype(np.float32)).astype(np.float32)
 
 
+def _mix_vary_snr(
+    target: np.ndarray, noise: np.ndarray, schedule: tuple[float, ...]
+) -> np.ndarray:
+    """Concatenate ``len(schedule)`` contiguous segments of ``target``,
+    each mixed with the matching slice of ``noise`` at its own SNR.
+
+    The SNR steps create score jitter at the segment boundaries and
+    alternating high / low-confidence regions — the conditions the EMA
+    smoothing (#117) and the λ-residual auto-learn (#118) are meant to
+    handle, which the stationary `snr_*` cases never produce. A silent
+    target segment (libri pauses) degrades to pure noise rather than
+    raising on zero speech energy.
+    """
+    n_seg = len(schedule)
+    seg_len = target.size // n_seg
+    out: list[np.ndarray] = []
+    for i, snr_db in enumerate(schedule):
+        start = i * seg_len
+        end = target.size if i == n_seg - 1 else start + seg_len
+        seg = target[start:end]
+        noise_seg = noise[start:end]
+        if float(np.mean(seg.astype(np.float64) ** 2)) <= 0.0:
+            out.append(noise_seg.astype(np.float32))
+        else:
+            out.append(_mix_at_snr(seg, noise_seg, snr_db))
+    return np.concatenate(out).astype(np.float32)
+
+
 def _gate_on_rate(gate_per_frame: np.ndarray) -> float:
     if gate_per_frame.size == 0:
         return 0.0
     return float(gate_per_frame.mean())
+
+
+def _gate_transitions(gate_per_frame: np.ndarray) -> int:
+    """Number of ON<->OFF flips in the per-frame gate — a chatter
+    measure. Lower is steadier; this is the metric the score-smoothing
+    work (#117) is expected to move on the `vary_snr` case."""
+    if gate_per_frame.size < 2:
+        return 0
+    return int(np.sum(gate_per_frame[1:] != gate_per_frame[:-1]))
 
 
 def _rms_db(audio: np.ndarray) -> float:
@@ -352,6 +416,7 @@ def measure(
             "fpr": round(fpr, 4),
             "si_sdr_db": round(sisdr, 2),
             "other_rms_db": round(other_rms_db_value, 2),
+            "gate_transitions": _gate_transitions(target_gate),
         }
 
     # --- Case B: simultaneous target + other at each ratio -------------------
@@ -366,7 +431,27 @@ def measure(
         metrics[f"sim4_{int(ratio_db)}db"] = {
             "tpr": round(sim_tpr, 4),
             "si_sdr_db": round(sim_sisdr, 2),
+            "gate_transitions": _gate_transitions(sim_gate),
         }
+
+    # --- Case D: varying-SNR segmented target (jitter + adaptation) ----------
+    # A non-stationary scenario: contiguous target segments at the
+    # VARY_SNR_SCHEDULE_DB schedule. Unlike the stationary cases above,
+    # this exercises the score-smoothing (#117) and auto-learn
+    # adaptation (#118) work — `gate_transitions` is the metric that
+    # rewards steadier gating across the SNR steps.
+    vary_noise = rng.standard_normal(target_test.size).astype(np.float32)
+    vary_mix = _mix_vary_snr(target_test, vary_noise, VARY_SNR_SCHEDULE_DB)
+    vary_gate, vary_audio_out, vary_out_sr = run(vary_mix)
+    vary_tpr = _gate_on_rate(vary_gate)
+    vary_out_at_16k = _to_target_sr(vary_audio_out, vary_out_sr, SAMPLE_RATE)
+    n_vary = min(target_test.size, vary_out_at_16k.size)
+    vary_sisdr = si_sdr(target_test[:n_vary], vary_out_at_16k[:n_vary])
+    metrics["vary_snr"] = {
+        "tpr": round(vary_tpr, 4),
+        "si_sdr_db": round(vary_sisdr, 2),
+        "gate_transitions": _gate_transitions(vary_gate),
+    }
 
     return metrics
 
@@ -417,15 +502,34 @@ def _check_metric_pair(
             f"{base['other_rms_db']:.2f} dB + {OTHER_RMS_ABS_TOL_DB} dB"
         )
 
+    if (
+        "gate_transitions" in cur
+        and "gate_transitions" in base
+        and cur["gate_transitions"] > base["gate_transitions"] + GATE_TRANSITIONS_ABS_TOL
+    ):
+        failures.append(
+            f"{key} gate_transitions regressed: {cur['gate_transitions']} > "
+            f"{base['gate_transitions']} + {GATE_TRANSITIONS_ABS_TOL} (more gate chatter)"
+        )
+
 
 def _check_against_baseline(
     current: dict[str, dict[str, float]],
     baseline: dict[str, dict[str, float]],
 ) -> list[str]:
+    """Compare each measurement key against the baseline. A key present
+    in ``current`` but absent from ``baseline`` is a *new* measurement
+    (e.g. a freshly added scenario / metric) — reported as a note, not
+    a failure, so adding measurements does not break a CI run before
+    the baseline has been refreshed with ``--update-baseline``."""
     failures: list[str] = []
     for key, cur in current.items():
         if key not in baseline:
-            failures.append(f"{key}: missing from baseline")
+            print(
+                f"[ci-accuracy] note: '{key}' not in baseline yet — "
+                "new measurement key, not gated until the baseline is refreshed",
+                file=sys.stderr,
+            )
             continue
         _check_metric_pair(failures, key, cur, baseline[key])
     return failures
@@ -441,6 +545,7 @@ def _config_payload(engine: str, use_as_norm: bool) -> dict[str, object]:
         "sample_rate": SAMPLE_RATE,
         "snrs_db": list(SNRS_DB),
         "sim4_ratios_db": list(SIM4_RATIOS_DB),
+        "vary_snr_schedule_db": list(VARY_SNR_SCHEDULE_DB),
         "seed": SEED,
     }
     if engine == "python":
@@ -503,7 +608,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[ci-accuracy] engine={args.engine}; running mini scenario_1 at "
-        f"{SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; sim4 ratios={SIM4_RATIOS_DB} dB"
+        f"{SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; sim4 ratios={SIM4_RATIOS_DB} dB; "
+        f"vary_snr schedule={VARY_SNR_SCHEDULE_DB} dB"
         + (f"; AS-Norm cohort={args.as_norm_cohort}" if use_as_norm else "")
     )
     metrics = measure(as_norm_cohort=args.as_norm_cohort, engine=args.engine)
@@ -522,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fpr_absolute_floor_when_zero": FPR_ABS_FLOOR,
                 "si_sdr_absolute_db": SI_SDR_ABS_TOL_DB,
                 "other_rms_absolute_db": OTHER_RMS_ABS_TOL_DB,
+                "gate_transitions_absolute": GATE_TRANSITIONS_ABS_TOL,
             },
             "metrics": metrics,
         }

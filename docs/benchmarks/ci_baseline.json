@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "config": {
+    "engine": "python",
     "sample_rate": 16000,
     "snrs_db": [
       5.0,
@@ -10,6 +11,14 @@
     "sim4_ratios_db": [
       9.0,
       0.0
+    ],
+    "vary_snr_schedule_db": [
+      15.0,
+      4.0,
+      12.0,
+      3.0,
+      14.0,
+      5.0
     ],
     "seed": 0,
     "theta_pass": 0.3,
@@ -22,34 +31,45 @@
     "fpr_relative": 0.05,
     "fpr_absolute_floor_when_zero": 0.05,
     "si_sdr_absolute_db": 1.0,
-    "other_rms_absolute_db": 3.0
+    "other_rms_absolute_db": 3.0,
+    "gate_transitions_absolute": 4
   },
   "metrics": {
     "snr_5_db": {
       "tpr": 0.3247,
       "fpr": 0.0,
       "si_sdr_db": -2.24,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 6
     },
     "snr_10_db": {
       "tpr": 0.4329,
       "fpr": 0.0,
       "si_sdr_db": 0.82,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 8
     },
     "snr_15_db": {
       "tpr": 0.7273,
       "fpr": 0.0,
       "si_sdr_db": 3.66,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 1
     },
     "sim4_9db": {
       "tpr": 0.355,
-      "si_sdr_db": -6.01
+      "si_sdr_db": -6.01,
+      "gate_transitions": 4
     },
     "sim4_0db": {
       "tpr": 0.0,
-      "si_sdr_db": 0.0
+      "si_sdr_db": 0.0,
+      "gate_transitions": 0
+    },
+    "vary_snr": {
+      "tpr": 0.2857,
+      "si_sdr_db": -3.47,
+      "gate_transitions": 4
     }
   }
 }
