@@ -60,6 +60,85 @@ jobs:
       - name: Run ci-accuracy (compares against docs/benchmarks/ci_baseline.json)
         run: python scripts/ci_accuracy.py
 
+  ci-accuracy-rust:
+    name: ci-accuracy Rust core (mini scenario_1 vs rust baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Measures the live Rust core (the mellonella CLI) instead of the
+    # mellonella_poc reference — this is the implementation that ships,
+    # so its numbers are what the gating-stability work (#117–#120) is
+    # judged against. See #121 (closing the Python-vs-Rust measurement
+    # gap). Compares against docs/benchmarks/ci_baseline_rust.json.
+    steps:
+      - uses: actions/checkout@v4
+
+      # libasound2-dev: the CLI links mellonella-audio-io (cpal) even
+      # though `process` never opens a device.
+      - name: Install system deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libsndfile1 ffmpeg libasound2-dev
+          version: 1.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            poc/pyproject.toml
+            bench/pyproject.toml
+
+      # poc[models] is needed for the one-shot ECAPA ONNX export (torch +
+      # speechbrain) and bench supplies si_sdr + the librosa example
+      # audio. The rust runner itself shells out to the CLI and does not
+      # import mellonella_poc.
+      - name: Install poc[models] + bench (CPU torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -e "poc[models]"
+          pip install -e bench
+
+      - name: Cache HF / SpeechBrain / DFN3 / librosa downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/mellonella
+            ~/.cache/librosa
+            ~/.cache/DeepFilterNet
+          key: accuracy-models-v1-${{ runner.os }}-${{ hashFiles('poc/pyproject.toml') }}
+          restore-keys: |
+            accuracy-models-v1-${{ runner.os }}-
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build mellonella CLI (release)
+        run: cargo build --release -p mellonella-cli --manifest-path rust/Cargo.toml
+
+      # ECAPA: exported from the SpeechBrain checkpoint (embedding-only —
+      # the mode the Rust EcapaTdnn expects). VAD: silero ships its ONNX
+      # inside the pip package. ORT dylib: the onnxruntime wheel bundles
+      # libonnxruntime, which `ort`'s load-dynamic feature needs.
+      - name: Export ECAPA ONNX + resolve VAD ONNX + ORT dylib
+        run: |
+          set -euo pipefail
+          python scripts/export_ecapa_onnx.py \
+            --mode embedding-only \
+            --output build/ecapa_tdnn.onnx
+          vad_onnx=$(python -c "import silero_vad, glob, os; print(glob.glob(os.path.join(os.path.dirname(silero_vad.__file__), '**', '*.onnx'), recursive=True)[0])")
+          ort_dylib=$(python -c "import onnxruntime, glob, os; print(glob.glob(os.path.join(os.path.dirname(onnxruntime.__file__), '**', 'libonnxruntime*'), recursive=True)[0])")
+          echo "MELLONELLA_ECAPA_ONNX=$PWD/build/ecapa_tdnn.onnx" >> "$GITHUB_ENV"
+          echo "MELLONELLA_VAD_ONNX=$vad_onnx" >> "$GITHUB_ENV"
+          echo "ORT_DYLIB_PATH=$ort_dylib" >> "$GITHUB_ENV"
+          echo "resolved VAD_ONNX=$vad_onnx ORT_DYLIB=$ort_dylib"
+
+      - name: Run ci-accuracy --engine rust (vs docs/benchmarks/ci_baseline_rust.json)
+        run: python scripts/ci_accuracy.py --engine rust
+
   ci-accuracy-as-norm:
     name: ci-accuracy AS-Norm (mini scenario_1 vs as-norm baseline)
     runs-on: ubuntu-latest

@@ -41,32 +41,41 @@ Tolerances (worse-side only; improvements are ignored):
 
 Usage
 -----
-    python scripts/ci_accuracy.py                    # compare to committed baseline
-    python scripts/ci_accuracy.py --update-baseline  # write the baseline file
+    python scripts/ci_accuracy.py                      # python engine vs baseline
+    python scripts/ci_accuracy.py --engine rust        # rust core (live) vs baseline
+    python scripts/ci_accuracy.py --update-baseline    # refresh the baseline file
 
-The first form is what CI runs. The second is for the maintainer to
-refresh the baseline after an intentional, validated change.
+``--engine`` selects the implementation under test: ``python`` is the
+``mellonella_poc`` reference, ``rust`` shells out to the ``mellonella``
+CLI — the live Rust core that actually ships (#121). Each engine + mode
+tracks its own baseline file (see ``_baseline_path``). The rust engine
+needs a release-built CLI and the ONNX env vars
+(``MELLONELLA_ECAPA_ONNX`` / ``MELLONELLA_VAD_ONNX`` / ``ORT_DYLIB_PATH``).
+
+CI runs the compare form; ``--update-baseline`` is for the maintainer to
+refresh a baseline after an intentional, validated change.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from math import gcd
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from mellonella_poc.config import Config, GatingConfig
-from mellonella_poc.pipeline import (
-    PipelineComponents,
-    enroll_from_recording,
-    process_offline,
-)
 from scipy.signal import resample_poly
 
 from mellonella_bench.metrics.ns_quality import si_sdr
+
+# ``mellonella_poc`` (torch / speechbrain) is imported lazily inside the
+# Python runner so ``--engine rust`` can run without the heavy ML deps.
 
 SAMPLE_RATE = 16_000
 SNRS_DB: tuple[float, ...] = (5.0, 10.0, 15.0)
@@ -79,21 +88,31 @@ SI_SDR_ABS_TOL_DB = 1.0
 OTHER_RMS_ABS_TOL_DB = 3.0  # output_rms_db growing by > 3 dB = mute weakening
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BASELINE_PATH_LEGACY = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline.json"
-BASELINE_PATH_AS_NORM = REPO_ROOT / "docs" / "benchmarks" / "ci_baseline_as_norm.json"
 
 
-def _baseline_path(use_as_norm: bool) -> Path:
-    """Pick which baseline file to read/write based on the active gating mode.
+def _baseline_path(use_as_norm: bool, engine: str) -> Path:
+    """Pick which baseline file to read/write for the active engine + mode.
 
-    Legacy ``α·cs + β·f0`` and AS-Norm produce metric values on
-    different scales (one is a mixed cosine+pitch score, the other a
-    cohort-normalised z-score), so a single baseline file would mix
-    incompatible distributions. Each mode keeps its own file at
-    ``docs/benchmarks/ci_baseline{,_as_norm}.json`` so the regression
-    check stays meaningful in either path.
+    Four distributions, four files under ``docs/benchmarks/``:
+
+    * ``ci_baseline.json``               — Python, legacy ``α·cs + β·f0``
+    * ``ci_baseline_as_norm.json``       — Python, AS-Norm z-score
+    * ``ci_baseline_rust.json``          — Rust core, raw-cs + EMA path
+    * ``ci_baseline_rust_as_norm.json``  — Rust core, AS-Norm z-score
+
+    The Python ``α·cs + β·f0`` path and the AS-Norm z-score path produce
+    metric values on different scales, so they cannot share a file. The
+    Rust core is a separate implementation again (raw cosine vs the
+    anchor centroid, plus EMA smoothing — see #117) and is what the
+    live product actually runs, so it tracks its own baseline rather
+    than being force-fit to the Python reference's numbers (#121).
     """
-    return BASELINE_PATH_AS_NORM if use_as_norm else BASELINE_PATH_LEGACY
+    name = "ci_baseline"
+    if engine == "rust":
+        name += "_rust"
+    if use_as_norm:
+        name += "_as_norm"
+    return REPO_ROOT / "docs" / "benchmarks" / f"{name}.json"
 
 
 def _to_target_sr(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -155,14 +174,142 @@ def _rms_db(audio: np.ndarray) -> float:
     return 20.0 * float(np.log10(rms + 1e-12))
 
 
-def measure(as_norm_cohort: Path | None = None) -> dict[str, dict[str, float]]:
+# A runner takes a 16 kHz mixture and returns
+# ``(gate_per_frame, output_audio, output_sr)`` — the per-VAD-frame gate
+# decision, the gated output waveform, and that waveform's sample rate.
+# Both engines expose the same shape so :func:`measure` is engine-agnostic.
+PipelineRun = "tuple[np.ndarray, np.ndarray, int]"
+
+
+def _python_runner(enrollment_audio: np.ndarray, as_norm_cohort: Path | None):
+    """Build a runner backed by ``mellonella_poc.pipeline.process_offline``."""
+    from mellonella_poc.config import Config, GatingConfig
+    from mellonella_poc.pipeline import (
+        PipelineComponents,
+        enroll_from_recording,
+        process_offline,
+    )
+
+    if as_norm_cohort is not None:
+        config = Config(
+            gating=GatingConfig(
+                use_as_norm=True,
+                as_norm_cohort_path=str(as_norm_cohort),
+            ),
+        )
+    else:
+        config = Config()
+    components = PipelineComponents.build_default(config)
+    pool = enroll_from_recording(enrollment_audio, SAMPLE_RATE, config, components)
+    output_sr = int(config.audio.output_sr)
+
+    def run(mixture: np.ndarray):
+        result = process_offline(mixture, SAMPLE_RATE, pool, config, components)
+        return (
+            np.asarray(result.gate_per_frame, dtype=bool),
+            np.asarray(result.audio, dtype=np.float32),
+            output_sr,
+        )
+
+    return run
+
+
+def _rust_runner(enrollment_audio: np.ndarray, as_norm_cohort: Path | None):
+    """Build a runner backed by the ``mellonella`` CLI (the live Rust core).
+
+    Enrolls once into a temp JSON, then per mixture writes a 16-bit WAV,
+    runs ``mellonella process … --gate-decisions`` and reads back the
+    gated output WAV + the per-frame gate diagnostics. The CLI needs
+    ``MELLONELLA_ECAPA_ONNX`` / ``MELLONELLA_VAD_ONNX`` / ``ORT_DYLIB_PATH``
+    in the environment. The binary path defaults to the release build and
+    can be overridden with ``MELLONELLA_RUST_BIN``.
+    """
+    if as_norm_cohort is not None:
+        raise SystemExit(
+            "[ci-accuracy] --engine rust does not support --as-norm-cohort yet "
+            "(the CLI has no --cohort flag — tracked as a #121 follow-up)"
+        )
+
+    rust_bin = Path(
+        os.environ.get(
+            "MELLONELLA_RUST_BIN",
+            REPO_ROOT / "rust" / "target" / "release" / "mellonella",
+        )
+    )
+    if not rust_bin.exists():
+        raise SystemExit(
+            f"[ci-accuracy] Rust CLI missing at {rust_bin}; run "
+            "`cargo build --release -p mellonella-cli` or set MELLONELLA_RUST_BIN"
+        )
+
+    workdir = Path(tempfile.mkdtemp(prefix="ci-accuracy-rust-"))
+    enroll_wav = workdir / "enroll.wav"
+    enroll_json = workdir / "enroll.json"
+    sf.write(str(enroll_wav), enrollment_audio, SAMPLE_RATE, subtype="PCM_16")
+    subprocess.run(
+        [str(rust_bin), "enroll", str(enroll_wav), str(enroll_json)],
+        check=True,
+        env=os.environ.copy(),
+    )
+
+    counter = itertools.count()
+
+    def run(mixture: np.ndarray):
+        idx = next(counter)
+        in_wav = workdir / f"mix_{idx}.wav"
+        out_wav = workdir / f"out_{idx}.wav"
+        diag_json = workdir / f"diag_{idx}.json"
+        sf.write(str(in_wav), mixture, SAMPLE_RATE, subtype="PCM_16")
+        subprocess.run(
+            [
+                str(rust_bin),
+                "process",
+                str(in_wav),
+                str(enroll_json),
+                str(out_wav),
+                "--gate-decisions",
+                str(diag_json),
+            ],
+            check=True,
+            env=os.environ.copy(),
+        )
+        audio, sr = sf.read(str(out_wav), dtype="float32", always_2d=False)
+        diag = json.loads(diag_json.read_text())
+        return (
+            np.asarray(diag["gate_per_frame"], dtype=bool),
+            np.asarray(audio, dtype=np.float32),
+            int(sr),
+        )
+
+    return run
+
+
+def _make_runner(engine: str, enrollment_audio: np.ndarray, as_norm_cohort: Path | None):
+    if engine == "python":
+        return _python_runner(enrollment_audio, as_norm_cohort)
+    if engine == "rust":
+        return _rust_runner(enrollment_audio, as_norm_cohort)
+    raise SystemExit(f"[ci-accuracy] unknown engine: {engine!r} (expected python|rust)")
+
+
+def measure(
+    as_norm_cohort: Path | None = None,
+    engine: str = "python",
+) -> dict[str, dict[str, float]]:
     """Run the pipeline at every SNR + simultaneous mix and aggregate metrics.
+
+    ``engine`` selects which implementation drives the measurement:
+
+    * ``python`` — ``mellonella_poc.pipeline.process_offline`` (the
+      reference; ``α·cs + β·f0`` or AS-Norm scoring).
+    * ``rust``   — the ``mellonella`` CLI, i.e. the live Rust core. This
+      is what ships, so its numbers are the ones that matter for the
+      gating-stability work (#117–#120). See #121.
 
     When ``as_norm_cohort`` points at an impostor cohort ``.npz`` (built
     by :mod:`scripts/build_impostor_cohort`), the pipeline switches to
-    the AS-Norm gating path with the data-driven defaults
-    ``theta_pass_as_norm = 2.25`` / ``theta_learn_as_norm = 3.25``
-    (Phase 6 Part 2). Otherwise the legacy ``α·cs + β·f0`` path is used.
+    the AS-Norm gating path. Only supported for ``engine="python"`` so
+    far.
     """
     import librosa  # lazy: only needed when the script actually runs
 
@@ -178,18 +325,7 @@ def measure(as_norm_cohort: Path | None = None) -> dict[str, dict[str, float]]:
     enrollment_audio = target_audio[:half]
     target_test = target_audio[half:]
 
-    # Project defaults (post-calibration); see scripts/calibrate.py.
-    if as_norm_cohort is not None:
-        config = Config(
-            gating=GatingConfig(
-                use_as_norm=True,
-                as_norm_cohort_path=str(as_norm_cohort),
-            ),
-        )
-    else:
-        config = Config()
-    components = PipelineComponents.build_default(config)
-    pool = enroll_from_recording(enrollment_audio, SAMPLE_RATE, config, components)
+    run = _make_runner(engine, enrollment_audio, as_norm_cohort)
 
     rng = np.random.default_rng(SEED)
     metrics: dict[str, dict[str, float]] = {}
@@ -200,16 +336,16 @@ def measure(as_norm_cohort: Path | None = None) -> dict[str, dict[str, float]]:
         other_noise = rng.standard_normal(other_audio.size).astype(np.float32)
 
         target_mix = _mix_at_snr(target_test, target_noise, snr)
-        target_result = process_offline(target_mix, SAMPLE_RATE, pool, config, components)
-        tpr = _gate_on_rate(target_result.gate_per_frame)
-        out_at_16k = _to_target_sr(target_result.audio, config.audio.output_sr, SAMPLE_RATE)
+        target_gate, target_audio_out, target_out_sr = run(target_mix)
+        tpr = _gate_on_rate(target_gate)
+        out_at_16k = _to_target_sr(target_audio_out, target_out_sr, SAMPLE_RATE)
         n = min(target_test.size, out_at_16k.size)
         sisdr = si_sdr(target_test[:n], out_at_16k[:n])
 
         other_mix = _mix_at_snr(other_audio, other_noise, snr)
-        other_result = process_offline(other_mix, SAMPLE_RATE, pool, config, components)
-        fpr = _gate_on_rate(other_result.gate_per_frame)
-        other_rms_db_value = _rms_db(other_result.audio)
+        other_gate, other_audio_out, _ = run(other_mix)
+        fpr = _gate_on_rate(other_gate)
+        other_rms_db_value = _rms_db(other_audio_out)
 
         metrics[f"snr_{int(snr)}_db"] = {
             "tpr": round(tpr, 4),
@@ -221,9 +357,9 @@ def measure(as_norm_cohort: Path | None = None) -> dict[str, dict[str, float]]:
     # --- Case B: simultaneous target + other at each ratio -------------------
     for ratio_db in SIM4_RATIOS_DB:
         sim_mix = _mix_target_other(target_test, other_audio, ratio_db)
-        sim_result = process_offline(sim_mix, SAMPLE_RATE, pool, config, components)
-        sim_tpr = _gate_on_rate(sim_result.gate_per_frame)
-        sim_out_at_16k = _to_target_sr(sim_result.audio, config.audio.output_sr, SAMPLE_RATE)
+        sim_gate, sim_audio_out, sim_out_sr = run(sim_mix)
+        sim_tpr = _gate_on_rate(sim_gate)
+        sim_out_at_16k = _to_target_sr(sim_audio_out, sim_out_sr, SAMPLE_RATE)
         n_sim = min(target_test.size, sim_out_at_16k.size)
         sim_sisdr = si_sdr(target_test[:n_sim], sim_out_at_16k[:n_sim])
 
@@ -295,15 +431,55 @@ def _check_against_baseline(
     return failures
 
 
+def _config_payload(engine: str, use_as_norm: bool) -> dict[str, object]:
+    """Metadata block stored in the baseline file. Engine-aware: the
+    Python theta/alpha/beta defaults only exist for ``engine="python"``;
+    the Rust core's gate defaults live in its own source (`GateConfig` /
+    `PipelineConfig`) and are not duplicated here."""
+    payload: dict[str, object] = {
+        "engine": engine,
+        "sample_rate": SAMPLE_RATE,
+        "snrs_db": list(SNRS_DB),
+        "sim4_ratios_db": list(SIM4_RATIOS_DB),
+        "seed": SEED,
+    }
+    if engine == "python":
+        from mellonella_poc.config import Config
+
+        defaults = Config()
+        payload["theta_pass"] = defaults.gating.theta_pass
+        payload["theta_learn"] = defaults.gating.theta_learn
+        payload["alpha"] = defaults.gating.alpha
+        payload["beta"] = defaults.gating.beta
+        if use_as_norm:
+            payload["use_as_norm"] = True
+            payload["theta_pass_as_norm"] = defaults.gating.theta_pass_as_norm
+            payload["theta_learn_as_norm"] = defaults.gating.theta_learn_as_norm
+    elif use_as_norm:
+        payload["use_as_norm"] = True
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="CI accuracy regression check")
     parser.add_argument(
         "--update-baseline",
         action="store_true",
         help=(
-            "overwrite docs/benchmarks/ci_baseline.json with the current "
-            "measurement (or ci_baseline_as_norm.json when --as-norm-cohort "
-            "is set)"
+            "overwrite the baseline file for the active engine + mode with "
+            "the current measurement (see --engine / --as-norm-cohort)"
+        ),
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("python", "rust"),
+        default="python",
+        help=(
+            "which implementation to measure. 'python' = the "
+            "mellonella_poc reference (default); 'rust' = the mellonella "
+            "CLI, i.e. the live Rust core that actually ships (#121). The "
+            "two track separate baseline files because they are distinct "
+            "implementations."
         ),
     )
     parser.add_argument(
@@ -314,42 +490,29 @@ def main(argv: list[str] | None = None) -> int:
             "path to an impostor cohort .npz "
             "(see scripts/build_impostor_cohort.py); enables AS-Norm in the "
             "real pipeline (D-010 Phase 6 Part 2 step 3). When set, the "
-            "script reads / writes the AS-Norm baseline at "
-            "docs/benchmarks/ci_baseline_as_norm.json instead of the "
-            "legacy ci_baseline.json — the two metric distributions are "
-            "incompatible (mixed cosine+pitch vs cohort z-score)."
+            "script reads / writes the AS-Norm baseline variant instead of "
+            "the legacy one — the two metric distributions are "
+            "incompatible (mixed cosine+pitch vs cohort z-score). "
+            "Only supported with --engine python so far."
         ),
     )
     args = parser.parse_args(argv)
 
-    baseline_path = _baseline_path(args.as_norm_cohort is not None)
+    use_as_norm = args.as_norm_cohort is not None
+    baseline_path = _baseline_path(use_as_norm, args.engine)
 
     print(
-        f"[ci-accuracy] running mini scenario_1 at {SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; "
-        f"sim4 ratios={SIM4_RATIOS_DB} dB"
-        + (f"; AS-Norm cohort={args.as_norm_cohort}" if args.as_norm_cohort else "")
+        f"[ci-accuracy] engine={args.engine}; running mini scenario_1 at "
+        f"{SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; sim4 ratios={SIM4_RATIOS_DB} dB"
+        + (f"; AS-Norm cohort={args.as_norm_cohort}" if use_as_norm else "")
     )
-    metrics = measure(as_norm_cohort=args.as_norm_cohort)
+    metrics = measure(as_norm_cohort=args.as_norm_cohort, engine=args.engine)
     print("[ci-accuracy] measurements:")
     print(json.dumps(metrics, indent=2))
 
     if args.update_baseline:
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        defaults = Config()
-        config_payload: dict[str, object] = {
-            "sample_rate": SAMPLE_RATE,
-            "snrs_db": list(SNRS_DB),
-            "sim4_ratios_db": list(SIM4_RATIOS_DB),
-            "seed": SEED,
-            "theta_pass": defaults.gating.theta_pass,
-            "theta_learn": defaults.gating.theta_learn,
-            "alpha": defaults.gating.alpha,
-            "beta": defaults.gating.beta,
-        }
-        if args.as_norm_cohort is not None:
-            config_payload["use_as_norm"] = True
-            config_payload["theta_pass_as_norm"] = defaults.gating.theta_pass_as_norm
-            config_payload["theta_learn_as_norm"] = defaults.gating.theta_learn_as_norm
+        config_payload = _config_payload(args.engine, use_as_norm)
         payload = {
             "schema_version": 2,
             "config": config_payload,

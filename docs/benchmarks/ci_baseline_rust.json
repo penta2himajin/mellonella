@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "config": {
+    "engine": "rust",
+    "sample_rate": 16000,
+    "snrs_db": [
+      5.0,
+      10.0,
+      15.0
+    ],
+    "sim4_ratios_db": [
+      9.0,
+      0.0
+    ],
+    "seed": 0
+  },
+  "tolerances": {
+    "tpr_relative": 0.05,
+    "fpr_relative": 0.05,
+    "fpr_absolute_floor_when_zero": 0.05,
+    "si_sdr_absolute_db": 1.0,
+    "other_rms_absolute_db": 3.0
+  },
+  "metrics": {
+    "snr_5_db": {
+      "tpr": 0.6509,
+      "fpr": 0.0,
+      "si_sdr_db": 0.05,
+      "other_rms_db": -120.0
+    },
+    "snr_10_db": {
+      "tpr": 0.6466,
+      "fpr": 0.0,
+      "si_sdr_db": 2.73,
+      "other_rms_db": -120.0
+    },
+    "snr_15_db": {
+      "tpr": 0.6681,
+      "fpr": 0.0,
+      "si_sdr_db": 2.14,
+      "other_rms_db": -120.0
+    },
+    "sim4_9db": {
+      "tpr": 0.7026,
+      "si_sdr_db": 1.25
+    },
+    "sim4_0db": {
+      "tpr": 0.3534,
+      "si_sdr_db": -5.71
+    }
+  }
+}
