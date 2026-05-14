@@ -140,22 +140,23 @@ pub struct PipelineConfig {
     pub silence_force_off_ms: f32,
     /// EMA smoothing factor applied to `last_score` on every refresh:
     /// `last_score = alpha * new_score + (1 - alpha) * last_score`.
-    /// `1.0` (default) disables smoothing — the new score replaces the
-    /// old one. Lower values smooth out brief dips (e.g. an embedding
-    /// shift at speech-onset transients, or one noisy refresh window)
-    /// that would otherwise drag the gate below `theta_pass` for one
-    /// refresh cycle. The first refresh always overwrites (no smoothing
-    /// against the initial zero).
+    /// `1.0` disables smoothing — the new score replaces the old one.
+    /// Lower values smooth out brief dips (e.g. an embedding shift at
+    /// speech-onset transients, or one noisy refresh window) that would
+    /// otherwise drag the gate below `theta_pass` for one refresh
+    /// cycle. The first refresh always overwrites (no smoothing against
+    /// the initial zero).
     ///
-    /// Kept at `1.0` (#117 → #121): #117 shipped `0.6`, but measuring
-    /// the Rust core in CI (#121) showed that on the deterministic
-    /// `ci_accuracy` mini-scenario — which has no inter-speaker jitter —
-    /// any `alpha < 1.0` only *adds lag* with nothing to suppress, so it
-    /// regressed TPR / SI-SDR. EMA stays available but off by default
-    /// until there is a jitter-exercising scenario to calibrate `alpha`
-    /// against. The anchor-centroid scoring (the other half of #117) is
-    /// kept — it is a principled stability change with only a small,
-    /// in-tolerance TPR cost.
+    /// Default `0.8`, calibrated against the `ci_accuracy` mini-scenario
+    /// (history: #117 shipped `0.6`; #121 reverted to `1.0` after the
+    /// TPR-only view showed a regression; once #125 added the
+    /// `vary_snr` case and the `gate_transitions` chatter metric, an
+    /// alpha sweep showed `0.8` strictly dominates `1.0` — it recovers
+    /// the chatter reduction and the snr_15 / sim4_9db TPR gains while
+    /// leaving snr_10 untouched, which is exactly the cell that
+    /// regressed at `0.6` / `0.7`). `1.0` restores the no-smoothing
+    /// behaviour and is pinned by the `pipeline_parity` fixture so the
+    /// Rust↔Python byte-equal contract is unaffected.
     pub score_ema_alpha: f32,
 }
 
@@ -171,7 +172,7 @@ impl Default for PipelineConfig {
             pre_roll_ms: 100,
             async_refresh: false,
             silence_force_off_ms: 0.0,
-            score_ema_alpha: 1.0,
+            score_ema_alpha: 0.8,
         }
     }
 }
