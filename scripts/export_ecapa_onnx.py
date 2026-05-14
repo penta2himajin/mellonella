@@ -21,6 +21,16 @@ Modes
     PyTorch and confirms the ONNX subgraph is byte-equivalent on its
     inputs, plus the round-trip cosine vs. the full PyTorch reference.
 
+``--mode encoder`` / ``--mode pooler`` (#119)
+    Split the embedding-only graph at the attentive-pooling boundary:
+    ``encoder`` is features → per-frame feature map ``(B, C_mfa, T)``
+    (mean_var_norm + ECAPA blocks + MFA), ``pooler`` is that map →
+    ``(B, 192)`` embedding (attentive stat pooling + bn + fc).
+    ``pooler(encoder(x))`` reproduces the monolithic embedding-only
+    graph exactly — see the ``verify-split`` subcommand. Splitting lets
+    a streaming caller run the heavy time-invariant front-end at one
+    cadence and the cheap time-pooling head at a finer one.
+
 Usage
 -----
     python scripts/export_ecapa_onnx.py export \\
@@ -31,6 +41,14 @@ Usage
     # Both in one go (export then verify the freshly produced file):
     python scripts/export_ecapa_onnx.py export-and-verify \\
         --output build/ecapa_tdnn.onnx
+
+    # #119 split: export the two halves, then verify they recombine.
+    python scripts/export_ecapa_onnx.py export \\
+        --mode encoder --output build/ecapa_encoder.onnx
+    python scripts/export_ecapa_onnx.py export \\
+        --mode pooler --output build/ecapa_pooler.onnx
+    python scripts/export_ecapa_onnx.py verify-split \\
+        --encoder build/ecapa_encoder.onnx --pooler build/ecapa_pooler.onnx
 
 Notes
 -----
@@ -173,6 +191,94 @@ def _build_embedding_only_wrapper(classifier) -> "torch.nn.Module":  # noqa: ANN
     return eo
 
 
+def _build_encoder_wrapper(classifier) -> "torch.nn.Module":  # noqa: ANN001
+    """Module: (B, T_frames, n_mels) → (B, C_mfa, T_frames) — #119.
+
+    The first half of the embedding-only graph: mean_var_norm + the
+    ECAPA blocks + multi-layer feature aggregation, stopping *before*
+    the attentive statistics pooling. Output is the per-frame feature
+    map; pairing this with :func:`_build_pooler_wrapper` reproduces the
+    monolithic ``embedding-only`` graph exactly. Splitting here lets a
+    streaming caller run the (heavy, time-invariant) conv front-end at
+    one cadence and the (cheap, time-pooling) head at a finer one.
+    """
+    import torch
+    from speechbrain.lobes.models.ECAPA_TDNN import TDNNBlock
+
+    mean_var_norm = classifier.mods.mean_var_norm
+    embedding_model = classifier.mods.embedding_model
+
+    class Encoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mean_var_norm = mean_var_norm
+            self.embedding_model = embedding_model
+
+        def forward(self, feats: "torch.Tensor") -> "torch.Tensor":
+            wav_lens = torch.ones(feats.shape[0], device=feats.device)
+            normed = self.mean_var_norm(feats, wav_lens)
+            model = self.embedding_model
+            # Mirror ECAPA_TDNN.forward up to and including `mfa`.
+            x = normed.transpose(1, 2)
+            xl = []
+            for layer in model.blocks:
+                if isinstance(layer, TDNNBlock):
+                    x = layer(x)
+                else:
+                    x = layer(x, lengths=wav_lens)
+                xl.append(x)
+            x = torch.cat(xl[1:], dim=1)
+            return model.mfa(x)
+
+    enc = Encoder()
+    enc.eval()
+    return enc
+
+
+def _build_pooler_wrapper(classifier) -> "torch.nn.Module":  # noqa: ANN001
+    """Module: (B, C_mfa, T_frames) → (B, 192) — #119.
+
+    The second half of the embedding-only graph: attentive statistics
+    pooling + batchnorm + the final linear layer. Consumes the
+    per-frame feature map produced by :func:`_build_encoder_wrapper`.
+    """
+    import torch
+
+    embedding_model = classifier.mods.embedding_model
+
+    class Pooler(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding_model = embedding_model
+
+        def forward(self, frame_features: "torch.Tensor") -> "torch.Tensor":
+            model = self.embedding_model
+            wav_lens = torch.ones(frame_features.shape[0], device=frame_features.device)
+            # Mirror ECAPA_TDNN.forward from `asp` onward.
+            x = model.asp(frame_features, lengths=wav_lens)
+            x = model.asp_bn(x)
+            x = model.fc(x)
+            return x.transpose(1, 2).squeeze(1)
+
+    pool = Pooler()
+    pool.eval()
+    return pool
+
+
+def _probe_mfa_channels(classifier, sample_rate: int) -> int:  # noqa: ANN001
+    """Run the encoder wrapper once to learn the MFA output channel
+    count (C_mfa) — it depends on the checkpoint, so it is not
+    hard-coded."""
+    import torch
+
+    fe = _build_features(classifier)
+    enc = _build_encoder_wrapper(classifier)
+    with torch.no_grad():
+        feats = fe(torch.zeros(1, sample_rate, dtype=torch.float32))
+        frame_features = enc(feats)
+    return int(frame_features.shape[1])
+
+
 def _dummy_features(sr: int, duration_sec: float = 3.0) -> "torch.Tensor":
     import torch
 
@@ -188,6 +294,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     print(f"[export] mode={args.mode} loading {args.source}", file=sys.stderr)
     classifier = _load_classifier(args.source, args.savedir)
 
+    output_names = ["embedding"]
+    expect_embedding_dim = True
     if args.mode == "full":
         wrapper = _build_full_wrapper(classifier)
         dummy = torch.zeros(1, args.sample_rate * 3, dtype=torch.float32)
@@ -210,12 +318,41 @@ def cmd_export(args: argparse.Namespace) -> int:
             "embedding": {0: "batch"},
         }
         print(f"[export] embedding-only n_mels={n_mels}", file=sys.stderr)
+    elif args.mode == "encoder":
+        # First half of the embedding-only graph (#119): features →
+        # per-frame feature map, stopping before the time pooling.
+        fe = _build_features(classifier)
+        with torch.no_grad():
+            probe = fe(torch.zeros(1, args.sample_rate, dtype=torch.float32))
+        n_mels = probe.shape[-1]
+        wrapper = _build_encoder_wrapper(classifier)
+        dummy = torch.zeros(1, 100, n_mels, dtype=torch.float32)
+        input_names = ["features"]
+        output_names = ["frame_features"]
+        expect_embedding_dim = False
+        dynamic_axes = {
+            "features": {0: "batch", 1: "frames"},
+            "frame_features": {0: "batch", 2: "frames"},
+        }
+        print(f"[export] encoder n_mels={n_mels}", file=sys.stderr)
+    elif args.mode == "pooler":
+        # Second half of the embedding-only graph (#119): per-frame
+        # feature map → embedding.
+        c_mfa = _probe_mfa_channels(classifier, args.sample_rate)
+        wrapper = _build_pooler_wrapper(classifier)
+        dummy = torch.zeros(1, c_mfa, 100, dtype=torch.float32)
+        input_names = ["frame_features"]
+        dynamic_axes = {
+            "frame_features": {0: "batch", 2: "frames"},
+            "embedding": {0: "batch"},
+        }
+        print(f"[export] pooler c_mfa={c_mfa}", file=sys.stderr)
     else:
         raise ValueError(f"unknown mode: {args.mode}")
 
     with torch.no_grad():
         out = wrapper(dummy)
-    if out.shape[-1] != EMBEDDING_DIM:
+    if expect_embedding_dim and out.shape[-1] != EMBEDDING_DIM:
         raise RuntimeError(
             f"unexpected embedding dim {out.shape[-1]}, expected {EMBEDDING_DIM}; "
             f"the SpeechBrain checkpoint may have changed"
@@ -227,7 +364,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         (dummy,),
         str(output),
         input_names=input_names,
-        output_names=["embedding"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
         opset_version=args.opset,
         do_constant_folding=True,
@@ -329,6 +466,81 @@ def cmd_export_and_verify(args: argparse.Namespace) -> int:
     return cmd_verify(args)
 
 
+def cmd_verify_split(args: argparse.Namespace) -> int:
+    """Verify the #119 encoder + pooler split reproduces the monolithic
+    embedding-only graph: for each test clip, run
+    ``pooler(encoder(features))`` through ONNX Runtime and compare the
+    embedding (raw + pairwise-cosine) against the full PyTorch
+    reference."""
+    import onnxruntime as ort  # type: ignore[import-not-found]
+    import torch
+
+    enc_path = Path(args.encoder)
+    pool_path = Path(args.pooler)
+    for p in (enc_path, pool_path):
+        if not p.exists():
+            print(f"[verify-split] missing {p}; run `export` first", file=sys.stderr)
+            return 2
+
+    print(f"[verify-split] loading torch reference {args.source}", file=sys.stderr)
+    classifier = _load_classifier(args.source, args.savedir)
+    full_ref = _build_full_wrapper(classifier)
+    fe = _build_features(classifier)
+
+    print(f"[verify-split] loading onnx {enc_path} + {pool_path}", file=sys.stderr)
+    enc_sess = ort.InferenceSession(str(enc_path), providers=["CPUExecutionProvider"])
+    pool_sess = ort.InferenceSession(str(pool_path), providers=["CPUExecutionProvider"])
+
+    waves: list[np.ndarray] = []
+    labels: list[str] = []
+    for i, f0 in enumerate((140.0, 180.0, 220.0)):
+        waves.append(_synth_waveform(seed=42 + i, sr=args.sample_rate, duration_sec=3.0, f0=f0))
+        labels.append(f"synth_{i}_f{int(f0)}")
+    for path_str in args.audio or []:
+        wav = _load_audio(Path(path_str), args.sample_rate)
+        if wav.size < args.sample_rate:
+            print(f"[verify-split] skip {path_str}: shorter than 1 s", file=sys.stderr)
+            continue
+        waves.append(wav)
+        labels.append(Path(path_str).stem)
+
+    torch_embs: list[np.ndarray] = []
+    onnx_embs: list[np.ndarray] = []
+    raw_max_delta = 0.0
+    for wav, label in zip(waves, labels, strict=True):
+        wav_t = torch.from_numpy(wav).unsqueeze(0)
+        with torch.no_grad():
+            emb_t = full_ref(wav_t).cpu().numpy().astype(np.float64)
+            feats = fe(wav_t).cpu().numpy().astype(np.float32)
+        frame_features = enc_sess.run(["frame_features"], {"features": feats})[0]
+        emb_o = pool_sess.run(
+            ["embedding"], {"frame_features": frame_features}
+        )[0].astype(np.float64)
+        delta = float(np.max(np.abs(emb_t - emb_o)))
+        raw_max_delta = max(raw_max_delta, delta)
+        print(f"[verify-split] {label:24s} raw max|Δ|={delta:.3e}", file=sys.stderr)
+        torch_embs.append(emb_t[0])
+        onnx_embs.append(emb_o[0])
+
+    torch_arr = np.stack(torch_embs, axis=0)
+    onnx_arr = np.stack(onnx_embs, axis=0)
+    cos_max_delta = float(
+        np.max(np.abs(_cosine_matrix(torch_arr, torch_arr) - _cosine_matrix(onnx_arr, onnx_arr)))
+    )
+
+    print("", file=sys.stderr)
+    print(f"[verify-split] N={len(waves)} clips", file=sys.stderr)
+    print(f"[verify-split] raw embedding max|Δ|     = {raw_max_delta:.3e}", file=sys.stderr)
+    print(f"[verify-split] cosine-similarity max|Δ| = {cos_max_delta:.3e}", file=sys.stderr)
+    print(f"[verify-split] tolerance                = {args.tol:.3e}", file=sys.stderr)
+
+    if cos_max_delta < args.tol:
+        print("[verify-split] PASS — split graph matches the monolithic graph", file=sys.stderr)
+        return 0
+    print("[verify-split] FAIL — split parity exceeds tolerance", file=sys.stderr)
+    return 1
+
+
 def cmd_quantize(args: argparse.Namespace) -> int:
     """Dynamic INT8 quantization of an existing FP32 ECAPA ONNX.
 
@@ -400,10 +612,12 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     common.add_argument(
         "--mode",
-        choices=("full", "embedding-only"),
+        choices=("full", "embedding-only", "encoder", "pooler"),
         default=DEFAULT_MODE,
         help="full = waveform→embedding (broken under torch 2.4 STFT export); "
-        "embedding-only = features→embedding (default)",
+        "embedding-only = features→embedding (default); "
+        "encoder = features→frame_features (#119, first half); "
+        "pooler = frame_features→embedding (#119, second half)",
     )
 
     p_export = sub.add_parser("export", parents=[common])
@@ -416,6 +630,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--audio", nargs="*", help="optional WAV/FLAC files for additional parity checks")
     p_verify.add_argument("--tol", type=float, default=DEFAULT_TOL)
     p_verify.set_defaults(func=cmd_verify)
+
+    p_verify_split = sub.add_parser("verify-split", parents=[common])
+    p_verify_split.add_argument("--encoder", required=True, help="encoder ONNX (#119)")
+    p_verify_split.add_argument("--pooler", required=True, help="pooler ONNX (#119)")
+    p_verify_split.add_argument(
+        "--audio", nargs="*", help="optional WAV/FLAC files for additional parity checks"
+    )
+    p_verify_split.add_argument("--tol", type=float, default=DEFAULT_TOL)
+    p_verify_split.set_defaults(func=cmd_verify_split)
 
     p_both = sub.add_parser("export-and-verify", parents=[common])
     p_both.add_argument("--output", required=True)
