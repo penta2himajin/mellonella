@@ -127,9 +127,25 @@ def main() -> int:
     score_per_frame: list[float] = []
     gate_per_frame: list[int] = []
 
-    n_frames = audio.size // VAD_FRAME
-    for frame_idx in range(n_frames):
-        frame = audio[frame_idx * VAD_FRAME : (frame_idx + 1) * VAD_FRAME]
+    # Frame the audio the way the Rust streaming engine does.
+    # `process_offline` is a thin wrapper over the streaming engine
+    # (rust/mellonella-core/src/streaming.rs): `push_block` drains every
+    # full VAD frame, then `flush()` zero-pads a trailing sub-frame
+    # remainder to a full frame and gives it one last decision pass so
+    # the tail of the buffer isn't lost. Mirror that here — process the
+    # `audio.size // VAD_FRAME` full frames plus, if there is a
+    # remainder, one zero-padded flush frame.
+    n_full = audio.size // VAD_FRAME
+    frames: list[np.ndarray] = [
+        audio[i * VAD_FRAME : (i + 1) * VAD_FRAME] for i in range(n_full)
+    ]
+    remainder = audio.size - n_full * VAD_FRAME
+    if remainder > 0:
+        tail = np.zeros(VAD_FRAME, dtype=np.float32)
+        tail[:remainder] = audio[n_full * VAD_FRAME :]
+        frames.append(tail)
+    n_frames = len(frames)
+    for frame in frames:
         prob = float(vad(torch.from_numpy(frame), SR).item())
         if prob > VAD_THRESHOLD:
             speech_buffer.extend(frame.tolist())
