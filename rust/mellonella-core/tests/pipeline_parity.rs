@@ -98,6 +98,15 @@ fn process_offline_matches_python_reference() {
         // anchor verbatim, so `match_score` reduces to the old
         // `cos_sim_max` exactly.)
         score_ema_alpha: 1.0,
+        // Stage B knobs default OFF, but pin them explicitly here as
+        // defense-in-depth: the Python reference has no fast F0 cue,
+        // no adaptive window / turn detection, and no offset
+        // fail-closed, so these must stay off for the Rust↔Python
+        // per-frame parity to hold. Mirrors how `async_refresh` /
+        // `adaptive_theta` are pinned.
+        fast_cue_enabled: false,
+        turn_detect_enabled: false,
+        offset_fail_closed: false,
         ..PipelineConfig::default()
     };
     // adaptive_theta defaults to true (#120) but the Python reference

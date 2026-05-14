@@ -866,3 +866,150 @@ cadence was *compute*, but the binding cost is *accuracy*.
 - #119 (decision-cadence split), PR #129 (Stage 1, merged)
 - D-011 (Rust port — the `EcapaTdnn` / `PipelineConfig` surfaces this
   builds on)
+
+## D-013: Stage B — model-free speaker-turn latency reduction (opt-in)
+
+### Context
+
+D-012 closed #119 (the ECAPA encoder/pooler split) with the finding
+that an incremental encoder cannot be made faithful, and re-scoped
+speaker-turn latency to "a separate, *adaptive* investigation: detect
+a turn, then shrink the window / force a refresh, so the steady-state
+cases keep the long window." This is that investigation, landed as
+**Stage B**.
+
+The problem restated: the pipeline gates audio for a single enrolled
+target. Speaker-turn latency is high — measured onset ≈ 1.3 s, offset
+≈ 0.5 s — because the ECAPA embedding is computed over a ~1 s sliding
+window refreshed every ~500 ms. Right after a turn the window is still
+full of the previous speaker, so the embedding (and the gate) lag a
+full window. Target: onset / offset < 500 ms, **without** model
+training and **without** disturbing the byte-equal `pipeline_parity`
+contract with the Python PoC.
+
+### Chosen
+
+Three confirmed scoping decisions framed the work:
+
+1. **Rust-only.** Stage B is a live-path Rust feature; the Python PoC
+   (`poc/`) is untouched. The PoC's role is the parity reference, and
+   a latency feature that only lives on the live path does not need a
+   PoC mirror.
+2. **Opt-in / default OFF.** Every new `PipelineConfig` knob defaults
+   to OFF / no-op. With defaults, the per-frame path is byte-identical
+   to pre-Stage-B: `effective_window` stays pinned at
+   `sv_window_samples`, the turn detector early-returns, and the gate
+   is fed the bare `last_score`. `ci_baseline_rust.json` and the
+   `pipeline_parity` fixture are therefore unaffected; the fixture
+   also pins the three switches off explicitly as defense-in-depth.
+3. **Streaming consolidation first.** The per-VAD-frame loop was
+   triplicated (`StreamingState::step_one_frame`,
+   `step_one_frame_async`, and a hand-rolled inline copy in
+   `process_offline_async`). Stage B was built on a single shared
+   core rather than three times.
+
+The design, in three parts:
+
+- **Part 0 — consolidation refactor (behaviour-preserving).** A
+  shared `StreamingState::step_one_frame_core` now owns everything
+  common to all three call-sites: VAD scoring, speech-buffer
+  accumulation, pre-roll ring, silence bookkeeping, the refresh-due
+  decision, the gate update + `silence_force_off` AND-term,
+  diagnostics, the decision-boundary emit, the envelope advance. The
+  *only* thing that varies — how a due refresh is executed and its
+  result applied — is a `RefreshStrategy` trait with two impls:
+  `SyncRefresh` (Fbank/ECAPA/F0 inline) and `AsyncRefresh` (submit to
+  a worker, poll for results). `AsyncRefresh` is generic over a
+  `RefreshChannel` so it drives both the persistent `AsyncWorker`
+  (live streaming) and a `ScopedRefreshChannel` over the
+  `std::thread::scope` worker `process_offline_async` must keep (it
+  borrows `PipelineComponents` and so cannot move `fbank`/`ecapa`
+  into a persistent worker). The three score scalars
+  (`last_score`/`last_cs`/`last_fm`) were bundled into a `ScoreState`
+  struct so the core and strategies share one `&mut` handle.
+- **Part 1 — fast per-frame F0 cue + anchor fusion.** A 2048-sample
+  decision-rate ring runs one `yin_frame_with_cache` per VAD frame;
+  the instantaneous F0 is mapped through the existing `f0_match`
+  against the enrolled `f0_mu`/`f0_sigma` to a `fm_fast ∈ [0,1]`.
+  When `fast_cue_enabled`, the gate is fed
+  `fused = last_score + fast_cue_weight·(fm_fast − fast_cue_f0_neutral)`
+  instead of `last_score` — the slow ECAPA score is the anchor, the
+  cheap per-frame cue is a nudge so a turn moves the gate before the
+  next embedding refresh lands. "No evidence" (ring not full / YIN
+  unvoiced) feeds the neutral value, which makes the fused term the
+  identity — the arithmetic reason the disabled path is bit-exact.
+- **Part 2 — adaptive window + turn detection.** A fast/slow EMA pair
+  of `fm_fast` (the slow baseline only advancing on confirmed-target,
+  gate-ON frames) feeds a small pure `TurnDetector` state machine
+  (`Steady` → `Shrunk` → `Regrowing` → `Steady`). An offset-suspect
+  (gate ON, cue dropped well below baseline) or onset-suspect (gate
+  OFF, cue dipped then rose back toward baseline) shrinks
+  `effective_window` to `sv_turn_window_samples`, tightens the
+  cadence to `sv_turn_update_samples`, fires an immediate `due_turn`
+  refresh, and flushes the speech buffer down to post-turn audio.
+  Every site that read `sv_window_samples` as the buffer cap / refresh
+  threshold now reads `effective_window`. Optionally
+  (`offset_fail_closed`) an offset-suspect also forces the gate off
+  immediately — an extra AND term in `is_on`, parallel to the
+  `silence_force_off_ms` rule and likewise outside `gate_state.update`
+  so it bypasses the hangover — until a refresh on the shrunk window
+  confirms the new speaker. There is no symmetric onset fail-open:
+  onset still has to earn the gate through normal scoring.
+
+### Reasons
+
+- **It is the adaptive approach D-012 explicitly pointed at.** The
+  steady-state low-SNR / FPR cases keep the long window; only a
+  *suspected* turn shrinks it, so the accuracy/latency coupling
+  D-012 measured is not paid in steady state.
+- **No model training, no parity risk.** The fast cue reuses the
+  existing YIN + `f0_match` primitives; turn detection is pure
+  arithmetic over them. All of it is gated behind default-OFF flags,
+  so the Rust↔Python byte-equal contract is structurally preserved
+  rather than re-verified by luck.
+- **One core, not three.** The consolidation refactor means Stage B
+  (and every future per-frame change) is written once. The async
+  offline path keeps its scoped worker but its loop body is now just
+  "build an `AsyncRefresh`, call the shared core".
+
+### Trade-offs
+
+- **The fast F0 cue is low-confidence.** F0 overlap between speakers
+  is real; the cue is deliberately a small-weight nudge and a turn
+  *trigger*, never a decision on its own. The ECAPA anchor still
+  dominates the score.
+- **Async "refresh completed" is approximated as "refresh
+  submitted".** For the sync strategy a shrunk-window refresh
+  completes inline; for the async strategy the result trails by one
+  inference, and Stage B treats "submitted while shrunk" as
+  "completed" for the fail-closed-clear / regrow gate. This is
+  consistent with the async path already trailing `last_score` by one
+  inference by design.
+- **Tuning is unvalidated here.** The defaults (`fast_cue_weight`
+  0.15, `turn_drop_delta` 0.25, `sv_turn_window_samples` 8000, …) are
+  reasoned starting points, not swept against `ci_accuracy`. The CLI
+  `--low-latency` profile flag exists so the bench harness can
+  exercise and tune them; the opt-in default-OFF stance means an
+  un-tuned knob ships inert.
+
+### Future revisit triggers
+
+- **A `ci_accuracy` sweep validates (or moves) the Stage B defaults.**
+  Once the bench harness has run `--low-latency` across the
+  `speaker_turn` / `vary_snr` scenarios, the per-knob defaults should
+  be re-pinned with the measured numbers (the way `score_ema_alpha`
+  was calibrated in #117 → #125).
+- **The Stage 2 split backend finds a use.** D-012 kept the
+  encoder/pooler split unused; a future Stage B refinement could run
+  a cheap pooler-only re-score on the shrunk window once a turn is
+  suspected.
+
+### References
+
+- D-012 (re-scoped #119 speaker-turn latency to this adaptive
+  investigation), D-011 (Rust port — the `PipelineConfig` /
+  `StreamingState` surfaces this builds on)
+- D-005 (F0 as an auxiliary cue — the `f0_match` primitive Part 1
+  reuses)
+- handoff issue #130 (speaker-verification-score-stabilisation
+  workstream)

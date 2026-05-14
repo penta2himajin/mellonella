@@ -24,8 +24,6 @@
     clippy::too_many_lines
 )]
 
-use std::collections::VecDeque;
-
 use std::borrow::Cow;
 
 use crate::embedding::{EcapaTdnn, EmbeddingError};
@@ -34,14 +32,21 @@ use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
     apply_envelope, as_norm_score, f0_match, should_admit_auto_learn, ApplyEnvelopeError,
-    GateConfig, GateState,
+    GateConfig,
 };
 use crate::resample::{resample_to, ResampleError};
-use crate::streaming::{StreamingConfig, StreamingState};
+use crate::streaming::{
+    AsyncRefresh, ScopedRefreshChannel, StreamingConfig, StreamingOutput, StreamingState,
+};
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 /// SV-side cadence for the offline pipeline.
 #[derive(Debug, Clone, Copy)]
+// A plain configuration struct — each bool is an independent,
+// documented opt-in knob (async refresh, auto-learn, the three
+// Stage B switches). Bundling them into sub-structs or an enum would
+// only obscure the flat, greppable config surface callers rely on.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PipelineConfig {
     /// Sample rate of the input buffer. Currently fixed at 16 kHz so the
     /// component models match. Kept on the config struct so future
@@ -158,6 +163,80 @@ pub struct PipelineConfig {
     /// behaviour and is pinned by the `pipeline_parity` fixture so the
     /// Rust↔Python byte-equal contract is unaffected.
     pub score_ema_alpha: f32,
+    /// **Stage B, Part 1** — opt-in per-frame fast F0 cue. When `true`,
+    /// the streaming core runs a single `yin_frame_with_cache` per VAD
+    /// frame over a 2048-sample decision-rate ring, maps the
+    /// instantaneous F0 through `f0_match` against the enrolled
+    /// `f0_mu` / `f0_sigma`, and **fuses** the result into the score
+    /// that drives the gate:
+    /// `fused = last_score + fast_cue_weight * (fm_fast - fast_cue_f0_neutral)`.
+    /// The slow ECAPA-refreshed `last_score` is the anchor; the F0 cue
+    /// is a cheap per-frame nudge so a speaker turn moves the gate
+    /// before the next embedding refresh lands.
+    ///
+    /// Default `false` — with the default the fused term is never
+    /// computed and `last_score` feeds the gate exactly as before, so
+    /// the `pipeline_parity` byte-equal contract is untouched.
+    pub fast_cue_enabled: bool,
+    /// Weight of the fused F0 nudge (see [`Self::fast_cue_enabled`]).
+    /// Small by design — the cue is a low-confidence per-frame hint,
+    /// not a decision on its own. Inert when `fast_cue_enabled` is
+    /// `false`.
+    pub fast_cue_weight: f32,
+    /// Neutral point the per-frame `fm_fast` is measured against
+    /// before scaling by [`Self::fast_cue_weight`]. `fm_fast` above
+    /// this nudges the score up, below nudges down. `0.5` is the
+    /// midpoint of `f0_match`'s `[0, 1]` range. Also used as the
+    /// "no evidence" value when the F0 ring isn't full yet or YIN
+    /// returns unvoiced. Inert when `fast_cue_enabled` is `false`.
+    pub fast_cue_f0_neutral: f32,
+    /// **Stage B, Part 2** — opt-in adaptive-window turn detection.
+    /// When `true`, the streaming core tracks a fast/slow EMA of the
+    /// per-frame `fm_fast` cue and, on a suspected speaker turn,
+    /// temporarily shrinks the ECAPA window to
+    /// [`Self::sv_turn_window_samples`] and tightens the refresh
+    /// cadence to [`Self::sv_turn_update_samples`] so the embedding
+    /// re-converges on the new speaker faster. Once the cue
+    /// re-stabilises the window grows back to
+    /// [`Self::sv_window_samples`].
+    ///
+    /// Default `false` — with the default `effective_window` stays
+    /// pinned at `sv_window_samples` and every turn-detection branch
+    /// is inert, so behaviour (and `pipeline_parity`) is unchanged.
+    /// Requires the per-frame F0 cue to be meaningful; enabling this
+    /// without [`Self::fast_cue_enabled`] still detects turns (the
+    /// cue is computed whenever turn detection needs it) but does not
+    /// fuse the cue into the gate score.
+    pub turn_detect_enabled: bool,
+    /// Drop in the fast `fm_fast` EMA, relative to the slow baseline,
+    /// that marks an offset-suspect (target→other) turn. Inert when
+    /// `turn_detect_enabled` is `false`.
+    pub turn_drop_delta: f32,
+    /// Consecutive frames the `fm_fast` EMA must sit close to its
+    /// (new) baseline before the window is allowed to grow back from
+    /// `Shrunk` → `Steady`. Inert when `turn_detect_enabled` is
+    /// `false`.
+    pub turn_stable_frames: u32,
+    /// Shrunk ECAPA window length (samples) used while a turn is
+    /// suspected. Default 8 000 (0.5 s @ 16 kHz) — half the steady
+    /// `sv_window_samples`. Inert when `turn_detect_enabled` is
+    /// `false`.
+    pub sv_turn_window_samples: usize,
+    /// Shrunk refresh cadence (samples) used while a turn is
+    /// suspected. Default 2 000 (125 ms @ 16 kHz). Inert when
+    /// `turn_detect_enabled` is `false`.
+    pub sv_turn_update_samples: usize,
+    /// **Stage B, Part 2** — opt-in offset fail-closed. When `true`
+    /// *and* an offset-suspect turn fires, the gate is forced **off**
+    /// immediately (an extra AND term in `is_on`, parallel to the
+    /// `silence_force_off_ms` rule and likewise bypassing the gate
+    /// hangover) until a refresh on the shrunk window confirms the
+    /// new speaker. There is no symmetric onset fail-open — onset
+    /// still has to earn the gate through normal scoring.
+    ///
+    /// Default `false`. Requires `turn_detect_enabled` to have any
+    /// effect (the offset-suspect signal comes from turn detection).
+    pub offset_fail_closed: bool,
 }
 
 impl Default for PipelineConfig {
@@ -173,6 +252,17 @@ impl Default for PipelineConfig {
             async_refresh: false,
             silence_force_off_ms: 0.0,
             score_ema_alpha: 0.8,
+            // Stage B — all opt-in, default OFF so behaviour (and the
+            // `pipeline_parity` byte-equal contract) is unchanged.
+            fast_cue_enabled: false,
+            fast_cue_weight: 0.15,
+            fast_cue_f0_neutral: 0.5,
+            turn_detect_enabled: false,
+            turn_drop_delta: 0.25,
+            turn_stable_frames: 10,
+            sv_turn_window_samples: 8_000,
+            sv_turn_update_samples: 2_000,
+            offset_fail_closed: false,
         }
     }
 }
@@ -225,6 +315,41 @@ pub enum AutoLearnKind {
     /// Candidate cleared rule-based gates but the pool refused it via
     /// `can_auto_learn`.
     RejectAnchorDistance,
+}
+
+/// Bundle of the three per-frame scoring scalars carried between
+/// VAD frames: the gate-feeding integrated score plus the two
+/// diagnostic components (`cos_sim_max` and F0 match). Extracted as
+/// a struct so the streaming per-frame core and both async refresh
+/// paths can pass them around as one `&mut` reference rather than
+/// three loose `&mut f32`s — the borrow checker is happier and the
+/// refresh-strategy trait signature stays compact.
+#[derive(Debug, Clone, Copy)]
+// The `last_*` prefix is load-bearing — these mirror the long-lived
+// `last_score` / `last_cs` / `last_fm` names used throughout the
+// pipeline + streaming docs, so the shared vocabulary is worth the
+// `struct_field_names` lint.
+#[allow(clippy::struct_field_names)]
+pub(crate) struct ScoreState {
+    /// Integrated, EMA-smoothed score fed into the gate.
+    pub last_score: f32,
+    /// Last refresh's raw `cos_sim_max` (diagnostics only).
+    pub last_cs: f32,
+    /// Last refresh's F0 match (diagnostics only).
+    pub last_fm: f32,
+}
+
+impl ScoreState {
+    /// Initial state: zero score / cos-sim, neutral (1.0) F0 match —
+    /// matches the historical inline initialisation in both the
+    /// streaming engine and `process_offline_async`.
+    pub(crate) fn new() -> Self {
+        Self {
+            last_score: 0.0,
+            last_cs: 0.0,
+            last_fm: 1.0,
+        }
+    }
 }
 
 /// EMA smoothing for `last_score`: `alpha * new + (1 - alpha) * old`,
@@ -528,32 +653,45 @@ fn process_offline_async(
 ) -> Result<ProcessResult, PipelineError> {
     let vad_frame = CHUNK_SAMPLES_16K;
     let sv_sr = pipeline_cfg.sample_rate;
-    let dt_ms = pipeline_cfg.vad_frame_ms();
 
     let decision_audio = audio_for_decisions(audio, audio_sample_rate, sv_sr)?;
     let audio_dec: &[f32] = decision_audio.as_ref();
 
-    let mut speech_buffer: VecDeque<f32> = VecDeque::with_capacity(pipeline_cfg.sv_window_samples);
-    let pre_roll_capacity = pipeline_cfg.pre_roll_samples_decision();
-    let mut pre_roll_ring: VecDeque<f32> = VecDeque::with_capacity(pre_roll_capacity);
-    let mut samples_since_update = 0_usize;
-    let mut silence_seen_since_refresh = false;
-    let mut new_speech_samples_after_silence = 0_usize;
-    let mut prev_speech = false;
-    let mut consecutive_speech_ms = 0.0_f32;
-    let mut silence_ms_since_speech = 0.0_f32;
-    let mut last_score = 0.0_f32;
-    let mut last_cs = 0.0_f32;
-    let mut last_fm = 1.0_f32;
+    // The async offline path now shares the streaming per-frame core.
+    // `process_offline_async` still owns its own `std::thread::scope`
+    // worker (it borrows `PipelineComponents`, so it can't move
+    // `fbank` / `ecapa` into a persistent `AsyncWorker`); the loop
+    // body becomes "build an `AsyncRefresh` over the scoped channel,
+    // call `step_one_frame_core`". The audio is pre-resampled to the
+    // decision rate, so the `StreamingState` runs at identity rate
+    // (no internal resampler) and the per-frame `audio_chunk` is the
+    // decision-rate frame itself — its envelope-gated output is
+    // discarded here because the offline path re-applies the envelope
+    // at the audio rate at the end from the run-length `decisions`.
+    //
+    // `diagnostics: true` mirrors the sync `process_offline` so the
+    // core fills `score_per_frame` / `cos_sim_max_per_frame` /
+    // `f0_match_per_frame` unconditionally — the historical
+    // `process_offline_async` always emitted those regardless of the
+    // (then non-existent) diagnostics flag.
+    let cfg = StreamingConfig {
+        pipeline: PipelineConfig {
+            // `StreamingState::new` is the sync constructor and rejects
+            // `async_refresh = true`; the async behaviour here comes
+            // from the `AsyncRefresh` strategy + scoped worker below,
+            // not from the `StreamingState` worker, so this flag must
+            // be cleared on the state's own config copy.
+            async_refresh: false,
+            ..*pipeline_cfg
+        },
+        gate: *gate_cfg,
+        // Identity rate: `audio_dec` is already at the decision rate.
+        audio_sample_rate: sv_sr,
+        diagnostics: true,
+    };
+    let mut state = StreamingState::new(&cfg)?;
 
-    let mut gate_state = GateState::new(*gate_cfg);
-    let mut decisions: Vec<(usize, bool)> = Vec::new();
-    let mut current_decision: Option<bool> = None;
-    let mut per_frame: Vec<bool> = Vec::new();
-    let mut score_per_frame: Vec<f32> = Vec::new();
-    let mut cs_per_frame: Vec<f32> = Vec::new();
-    let mut fm_per_frame: Vec<f32> = Vec::new();
-    let mut auto_learn_events: Vec<AutoLearnEvent> = Vec::new();
+    let mut out = StreamingOutput::default();
 
     // Disjoint borrows of PipelineComponents so the worker thread can
     // own ecapa + fbank while the main loop keeps vad. The `cohort` is
@@ -593,184 +731,43 @@ fn process_offline_async(
             }
         });
 
-        // outstanding = number of work_tx sends not yet matched by a
-        // res_rx recv. Bench cadence + 2 s audio → worst case
-        // outstanding stays at 1; pending holds one queued window so a
-        // burst of two refreshes within one ECAPA wall time doesn't
-        // drop work.
-        let mut outstanding: u32 = 0;
-        let mut pending: Option<Vec<f32>> = None;
-        // Frame index of each refresh, in FIFO order, so AutoLearnEvent
-        // gets the trigger-time index rather than the result-arrival
-        // time.
-        let mut refresh_frame_indices: VecDeque<usize> = VecDeque::new();
+        // The `ScopedRefreshChannel` carries the outstanding / pending
+        // / FIFO-frame-index bookkeeping the old inline loop kept, so
+        // the "at most one inference in flight + one queued window"
+        // cadence is byte-identical.
+        let mut channel = ScopedRefreshChannel::new(work_tx, res_rx);
 
         let mut frame_start = 0_usize;
-        let mut frame_idx = 0_usize;
-
         while frame_start + vad_frame <= audio_dec.len() {
             let frame = &audio_dec[frame_start..frame_start + vad_frame];
-
-            let speech_prob = vad.score(frame)?;
-            let now_speech = speech_prob > pipeline_cfg.vad_threshold;
-            if now_speech {
-                if !prev_speech && !pre_roll_ring.is_empty() {
-                    // VAD OFF→ON: fold the pre-roll ring into the
-                    // speech buffer (issue #80). Same semantics as the
-                    // sync streaming engine.
-                    for &sample in &pre_roll_ring {
-                        if speech_buffer.len() == pipeline_cfg.sv_window_samples {
-                            speech_buffer.pop_front();
-                        }
-                        speech_buffer.push_back(sample);
-                    }
-                }
-                for &sample in frame {
-                    if speech_buffer.len() == pipeline_cfg.sv_window_samples {
-                        speech_buffer.pop_front();
-                    }
-                    speech_buffer.push_back(sample);
-                }
-                consecutive_speech_ms += dt_ms;
-                if silence_seen_since_refresh {
-                    new_speech_samples_after_silence += vad_frame;
-                }
-            } else {
-                consecutive_speech_ms = 0.0;
-            }
-            if prev_speech && !now_speech {
-                silence_seen_since_refresh = true;
-                new_speech_samples_after_silence = 0;
-            }
-            if now_speech {
-                silence_ms_since_speech = 0.0;
-            } else {
-                silence_ms_since_speech += dt_ms;
-            }
-            prev_speech = now_speech;
-            samples_since_update += vad_frame;
-
-            if pre_roll_capacity > 0 {
-                for &sample in frame {
-                    if pre_roll_ring.len() == pre_roll_capacity {
-                        pre_roll_ring.pop_front();
-                    }
-                    pre_roll_ring.push_back(sample);
-                }
-            }
-
-            let due_normal = samples_since_update >= pipeline_cfg.sv_update_samples;
-            let due_early = silence_seen_since_refresh
-                && now_speech
-                && new_speech_samples_after_silence
-                    >= pipeline_cfg.sv_min_new_samples_after_silence;
-            if (due_normal || due_early) && speech_buffer.len() >= pipeline_cfg.sv_window_samples {
-                samples_since_update = 0;
-                silence_seen_since_refresh = false;
-                new_speech_samples_after_silence = 0;
-                let window: Vec<f32> = speech_buffer.iter().copied().collect();
-                if outstanding == 0 {
-                    work_tx.send(window).expect("worker alive");
-                    outstanding = 1;
-                    refresh_frame_indices.push_back(frame_idx);
-                } else {
-                    pending = Some(window);
-                    refresh_frame_indices.push_back(frame_idx);
-                }
-            }
-
-            // Drain at most one ready result per frame so the gate
-            // score updates as soon as the worker is done.
-            if outstanding > 0 {
-                match res_rx.try_recv() {
-                    Ok(res) => {
-                        let (embedding, f0_mu) = res?;
-                        let trigger_frame = refresh_frame_indices.pop_front().unwrap_or(frame_idx);
-                        apply_refresh_result(
-                            embedding,
-                            f0_mu,
-                            trigger_frame,
-                            consecutive_speech_ms,
-                            pool,
-                            cohort,
-                            gate_cfg,
-                            pipeline_cfg.enable_auto_learn,
-                            pipeline_cfg.score_ema_alpha,
-                            &mut last_score,
-                            &mut last_cs,
-                            &mut last_fm,
-                            &mut auto_learn_events,
-                        );
-                        outstanding -= 1;
-                        if let Some(next) = pending.take() {
-                            work_tx.send(next).expect("worker alive");
-                            outstanding = 1;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(PipelineError::Embedding(EmbeddingError::Ort(
-                            "ECAPA worker disconnected".into(),
-                        )));
-                    }
-                }
-            }
-
-            let is_on_score = gate_state.update(last_score, dt_ms, now_speech);
-            let is_on = is_on_score
-                && !(pipeline_cfg.silence_force_off_ms > 0.0
-                    && silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
-            per_frame.push(is_on);
-            score_per_frame.push(last_score);
-            cs_per_frame.push(last_cs);
-            fm_per_frame.push(last_fm);
-
-            if current_decision != Some(is_on) {
-                decisions.push((frame_start, is_on));
-                current_decision = Some(is_on);
-            }
-
+            let mut strategy = AsyncRefresh {
+                channel: &mut channel,
+                cohort,
+                pool,
+                enable_auto_learn: pipeline_cfg.enable_auto_learn,
+                score_ema_alpha: pipeline_cfg.score_ema_alpha,
+                gate_cfg: *gate_cfg,
+            };
+            state.step_one_frame_core(frame, frame, vad, &mut strategy, &cfg, &mut out)?;
             frame_start += vad_frame;
-            frame_idx += 1;
         }
 
         // Drain whatever ECAPA work is still in flight so the result
         // log is complete before we tear down the worker. Per-frame
         // outputs were already emitted for the main loop above, so
-        // these only affect pool / auto_learn_events.
-        while outstanding > 0 {
-            let res = res_rx.recv().map_err(|_| {
-                PipelineError::Embedding(EmbeddingError::Ort("ECAPA worker disconnected".into()))
-            })?;
-            let (embedding, f0_mu) = res?;
-            let trigger_frame = refresh_frame_indices.pop_front().unwrap_or(frame_idx);
-            apply_refresh_result(
-                embedding,
-                f0_mu,
-                trigger_frame,
-                consecutive_speech_ms,
-                pool,
-                cohort,
-                gate_cfg,
-                pipeline_cfg.enable_auto_learn,
-                pipeline_cfg.score_ema_alpha,
-                &mut last_score,
-                &mut last_cs,
-                &mut last_fm,
-                &mut auto_learn_events,
-            );
-            outstanding -= 1;
-            if let Some(next) = pending.take() {
-                work_tx.send(next).expect("worker alive");
-                outstanding = 1;
-            }
-        }
+        // these only affect pool / auto_learn_events. Shares the
+        // streaming engine's `drain_trailing_refreshes` tail.
+        state.drain_trailing_refreshes(&mut channel, pool, cohort, &cfg, &mut out)?;
 
-        // Closing the work channel lets the worker exit so the scope
-        // can join it.
-        drop(work_tx);
         Ok(())
     })?;
+
+    let mut decisions = out.gate_decisions;
+    let per_frame = out.gate_per_frame;
+    let score_per_frame = out.score_per_frame;
+    let cs_per_frame = out.cos_sim_max_per_frame;
+    let fm_per_frame = out.f0_match_per_frame;
+    let auto_learn_events = out.events;
 
     if decisions.is_empty() {
         decisions.push((0, false));
@@ -822,24 +819,22 @@ pub(crate) fn apply_refresh_result(
     gate_cfg: &GateConfig,
     enable_auto_learn: bool,
     score_ema_alpha: f32,
-    last_score: &mut f32,
-    last_cs: &mut f32,
-    last_fm: &mut f32,
+    score: &mut ScoreState,
     auto_learn_events: &mut Vec<AutoLearnEvent>,
 ) {
     let cs = pool.match_score(&embedding);
     let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
-    *last_cs = cs;
-    *last_fm = fm;
+    score.last_cs = cs;
+    score.last_fm = fm;
     let new_score = if gate_cfg.use_as_norm && !cohort.is_empty() {
         as_norm_score(&embedding, cs, cohort, 20)
     } else {
         cs
     };
-    *last_score = smooth_score(*last_score, new_score, score_ema_alpha);
+    score.last_score = smooth_score(score.last_score, new_score, score_ema_alpha);
 
     if enable_auto_learn
-        && should_admit_auto_learn(*last_score, fm, consecutive_speech_ms, gate_cfg)
+        && should_admit_auto_learn(score.last_score, fm, consecutive_speech_ms, gate_cfg)
     {
         let admitted = pool.adapt(embedding);
         let kind = if admitted {
@@ -850,7 +845,7 @@ pub(crate) fn apply_refresh_result(
         auto_learn_events.push(AutoLearnEvent {
             frame_idx: trigger_frame,
             kind,
-            score: *last_score,
+            score: score.last_score,
             f0_match: fm,
         });
     }

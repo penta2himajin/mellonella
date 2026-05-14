@@ -194,6 +194,68 @@ fn streaming_identity_rate_per_frame_matches_offline() {
 }
 
 #[test]
+fn streaming_turn_detect_identity_rate_matches_offline() {
+    // Stage B: with `turn_detect_enabled` (+ the fast F0 cue + offset
+    // fail-closed) the streaming engine and `process_offline` share
+    // the same per-frame core, so at identity rate they must still
+    // produce identical per-VAD-frame gate state. Early-skips without
+    // ONNX — this test exists to keep the Stage B opt-in path
+    // compiled and the offline↔streaming consistency contract pinned.
+    let Some((ecapa_path, vad_path)) = skip_if_no_onnx() else {
+        return;
+    };
+    let audio = synth_waveform(16_000, 2.0, 180.0);
+
+    let pipeline_cfg = PipelineConfig {
+        fast_cue_enabled: true,
+        turn_detect_enabled: true,
+        offset_fail_closed: true,
+        ..PipelineConfig::default()
+    };
+    let gate_cfg = GateConfig::default();
+
+    let (mut components_a, mut pool_a) = build_components(&ecapa_path, &vad_path);
+    let offline = process_offline(
+        &audio,
+        16_000,
+        &mut pool_a,
+        &pipeline_cfg,
+        &gate_cfg,
+        &mut components_a,
+    )
+    .expect("offline runs");
+
+    let (components_b, pool_b) = build_components(&ecapa_path, &vad_path);
+    let config = StreamingConfig {
+        pipeline: pipeline_cfg,
+        gate: gate_cfg,
+        audio_sample_rate: 16_000,
+        diagnostics: true,
+    };
+    let mut pipeline = StreamingPipeline::new(pool_b, config, components_b).expect("streaming new");
+    let part1 = pipeline.push_samples(&audio).expect("push");
+    let part2 = pipeline.flush().expect("flush");
+    let streaming = concat_outputs(vec![part1, part2]);
+
+    assert_eq!(
+        streaming.gate_per_frame.len(),
+        offline.gate_per_frame.len(),
+        "frame counts diverge with turn detection enabled"
+    );
+    for (i, (&s, &o)) in streaming
+        .gate_per_frame
+        .iter()
+        .zip(offline.gate_per_frame.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            s, o,
+            "turn-detect gate_per_frame[{i}] differs: streaming={s} offline={o}"
+        );
+    }
+}
+
+#[test]
 fn streaming_identity_rate_chunk_invariance() {
     let Some((ecapa_path, vad_path)) = skip_if_no_onnx() else {
         return;
