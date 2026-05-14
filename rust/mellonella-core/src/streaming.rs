@@ -747,7 +747,8 @@ impl StreamingState {
             } else {
                 cs
             };
-            self.last_score = smooth_score(self.last_score, new_score, pipeline_cfg.score_ema_alpha);
+            self.last_score =
+                smooth_score(self.last_score, new_score, pipeline_cfg.score_ema_alpha);
 
             if pipeline_cfg.enable_auto_learn
                 && should_admit_auto_learn(
