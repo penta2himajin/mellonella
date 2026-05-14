@@ -751,7 +751,7 @@ impl StreamingState {
                     gate_cfg,
                 )
             {
-                let admitted = pool.add_auto_learn(embedding);
+                let admitted = pool.adapt(embedding);
                 let kind = if admitted {
                     AutoLearnKind::Admit
                 } else {
@@ -763,14 +763,6 @@ impl StreamingState {
                     score: self.last_score,
                     f0_match: fm,
                 });
-                if admitted && pool.maybe_reset() {
-                    out.events.push(AutoLearnEvent {
-                        frame_idx: self.frame_idx,
-                        kind: AutoLearnKind::Reset,
-                        score: self.last_score,
-                        f0_match: fm,
-                    });
-                }
             }
         }
 
