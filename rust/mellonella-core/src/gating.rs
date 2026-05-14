@@ -775,7 +775,10 @@ mod tests {
         assert!((lo..=hi).contains(&eff), "eff={eff} not in [{lo}, {hi}]");
         // A steady 0.9 speech score with ~zero variance pushes the
         // adaptive threshold to the upper clamp.
-        assert!((eff - hi).abs() < 1e-4, "eff={eff} expected upper clamp {hi}");
+        assert!(
+            (eff - hi).abs() < 1e-4,
+            "eff={eff} expected upper clamp {hi}"
+        );
     }
 
     #[test]
