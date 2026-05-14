@@ -46,16 +46,16 @@
       "gate_transitions": 5
     },
     "snr_15_db": {
-      "tpr": 0.6379,
+      "tpr": 0.6681,
       "fpr": 0.0,
-      "si_sdr_db": 2.12,
+      "si_sdr_db": 2.14,
       "other_rms_db": -120.0,
-      "gate_transitions": 3
+      "gate_transitions": 1
     },
     "sim4_9db": {
-      "tpr": 0.6983,
-      "si_sdr_db": 2.89,
-      "gate_transitions": 4
+      "tpr": 0.7414,
+      "si_sdr_db": 2.91,
+      "gate_transitions": 3
     },
     "sim4_0db": {
       "tpr": 0.3534,
@@ -63,9 +63,9 @@
       "gate_transitions": 4
     },
     "vary_snr": {
-      "tpr": 0.6293,
+      "tpr": 0.6336,
       "si_sdr_db": 0.34,
-      "gate_transitions": 4
+      "gate_transitions": 3
     }
   }
 }

@@ -89,12 +89,12 @@ fn process_offline_matches_python_reference() {
         // than the Python reference and the per-frame scores diverge.
         sv_update_samples: 4_000,
         enable_auto_learn: false,
-        // The dump script has no EMA smoothing. The live default is also
-        // 1.0 (#117 shipped 0.6, #121 reverted it — see PipelineConfig),
-        // so this pin is currently a no-op, but it is kept explicit so a
-        // future default change cannot silently break the Rust↔Python
-        // byte-equal contract. (The #117 centroid scoring needs no pin —
-        // the fixture pool has a single anchor, whose centroid is that
+        // The dump script has no EMA smoothing, but the live default is
+        // now 0.8 (#117 → #121 → #125 calibration — see PipelineConfig),
+        // so this pin is load-bearing: it forces the no-smoothing path
+        // that keeps the Rust↔Python per-frame scores byte-equal.
+        // (The #117 centroid scoring needs no pin — the fixture pool
+        // has a single anchor, whose centroid is that
         // anchor verbatim, so `match_score` reduces to the old
         // `cos_sim_max` exactly.)
         score_ema_alpha: 1.0,
