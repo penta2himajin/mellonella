@@ -93,7 +93,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Install shellcheck (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: shellcheck
+          version: 1.0
       - name: shellcheck scripts/*.sh
         run: shellcheck scripts/*.sh
