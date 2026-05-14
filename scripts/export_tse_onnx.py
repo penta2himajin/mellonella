@@ -43,10 +43,10 @@ from pathlib import Path
 
 import numpy as np
 
-# Make the in-repo `training` package importable when run as a script.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Make the in-repo `tse` package importable when run as a script.
+_TRAINING_ROOT = Path(__file__).resolve().parent.parent / "training"
+if str(_TRAINING_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TRAINING_ROOT))
 
 DEFAULT_TOL = 1e-4
 DEFAULT_CHUNK = 160  # samples; multiple of the PoC encoder stride (16)
@@ -54,7 +54,7 @@ DEFAULT_N_CHUNKS = 12  # test-clip length, in chunks, for `verify`
 
 
 def _load_config(name: str):  # noqa: ANN202
-    from training.tse.config import TSEConfig
+    from tse.config import TSEConfig
 
     if name == "poc_16k":
         return TSEConfig.poc_16k()
@@ -66,7 +66,7 @@ def _load_config(name: str):  # noqa: ANN202
 def _build_model(config, checkpoint: Path | None):  # noqa: ANN001, ANN202
     import torch
 
-    from training.tse.model import CausalConvTasNetTSE
+    from tse.model import CausalConvTasNetTSE
 
     model = CausalConvTasNetTSE(config)
     if checkpoint is not None:
@@ -75,7 +75,10 @@ def _build_model(config, checkpoint: Path | None):  # noqa: ANN001, ANN202
         model.load_state_dict(state)
         print(f"[export] loaded weights from {checkpoint}", file=sys.stderr)
     else:
-        print("[export] no --checkpoint given — exporting randomly-initialised weights", file=sys.stderr)
+        print(
+            "[export] no --checkpoint given — exporting randomly-initialised weights",
+            file=sys.stderr,
+        )
     model.eval()
     return model
 
@@ -253,7 +256,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
         onnx_chunks.append(results[0])
         onnx_state = list(results[1:])
         chunk_delta = float(
-            np.max(np.abs(results[0].astype(np.float64) - torch_chunks[i].astype(np.float64)))
+            np.max(
+                np.abs(
+                    results[0].astype(np.float64) - torch_chunks[i].astype(np.float64)
+                )
+            )
         )
         per_chunk_delta = max(per_chunk_delta, chunk_delta)
         print(f"[verify] chunk {i:3d}  max|Δ| = {chunk_delta:.3e}", file=sys.stderr)
@@ -266,7 +273,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"[verify] overall  max|Δ|   = {overall:.3e}", file=sys.stderr)
     print(f"[verify] tolerance         = {args.tol:.3e}", file=sys.stderr)
     if overall < args.tol:
-        print("[verify] PASS — PyTorch↔ONNX per-chunk parity within tolerance", file=sys.stderr)
+        print(
+            "[verify] PASS — PyTorch↔ONNX per-chunk parity within tolerance",
+            file=sys.stderr,
+        )
         return 0
     print("[verify] FAIL — parity exceeds tolerance", file=sys.stderr)
     return 1
@@ -293,7 +303,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", choices=("poc_16k", "prod_48k"), default="poc_16k")
-    common.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="chunk length in samples")
+    common.add_argument(
+        "--chunk", type=int, default=DEFAULT_CHUNK, help="chunk length in samples"
+    )
     common.add_argument(
         "--checkpoint", type=Path, default=None, help="optional trained-weights .pt"
     )

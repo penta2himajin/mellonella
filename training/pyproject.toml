@@ -19,6 +19,7 @@ dependencies = [
 onnx = [
     "onnx>=1.15",
     "onnxruntime>=1.17",
+    "onnxscript>=0.1",
 ]
 dev = [
     "pytest>=8.0",
@@ -27,7 +28,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = [".."]
+where = ["."]
 include = ["tse*"]
 
 [tool.ruff]
@@ -47,7 +48,7 @@ ignore_missing_imports = true
 files = ["tse"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tse/tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "datasets: tests that need real training datasets to be present locally",

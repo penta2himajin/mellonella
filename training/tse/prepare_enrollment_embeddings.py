@@ -29,7 +29,7 @@ Usage
 ::
 
     export MELLONELLA_ECAPA_ONNX=build/ecapa_tdnn.onnx
-    python -m training.tse.prepare_enrollment_embeddings \\
+    python -m tse.prepare_enrollment_embeddings \\
         --audio-dir data/librispeech/train-clean-100 \\
         --out build/tse/enroll_embeddings.npz
 
@@ -119,18 +119,14 @@ def compute_embedding(
     if audio.ndim != 1:
         raise ValueError("compute_embedding expects a 1-D mono buffer")
     if audio.size < SAMPLE_RATE:
-        raise ValueError(
-            f"need >= 1 s of audio for ECAPA, got {audio.size / SAMPLE_RATE:.2f}s"
-        )
+        raise ValueError(f"need >= 1 s of audio for ECAPA, got {audio.size / SAMPLE_RATE:.2f}s")
     with torch.no_grad():
         feats = compute_features(torch.from_numpy(audio).unsqueeze(0))
     feats_np = feats.cpu().numpy().astype(np.float32)
     emb = session.run(["embedding"], {"features": feats_np})[0]
     emb = np.asarray(emb, dtype=np.float32).reshape(-1)
     if emb.shape[0] != EMBEDDING_DIM:
-        raise RuntimeError(
-            f"ECAPA ONNX returned dim {emb.shape[0]}, expected {EMBEDDING_DIM}"
-        )
+        raise RuntimeError(f"ECAPA ONNX returned dim {emb.shape[0]}, expected {EMBEDDING_DIM}")
     return emb
 
 
@@ -174,7 +170,8 @@ def prepare(
             print(f"[enroll] {i + 1}/{len(files)} embeddings", file=sys.stderr)
 
     out_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out_npz, **embeddings)
+    # numpy's savez stub mistypes **kwds; the call is correct at runtime.
+    np.savez(out_npz, **embeddings)  # type: ignore[arg-type]
     print(f"[enroll] wrote {len(embeddings)} embeddings -> {out_npz}", file=sys.stderr)
     return embeddings
 

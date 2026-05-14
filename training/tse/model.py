@@ -32,6 +32,8 @@ Total: ``1 + 3 + 7 * n_repeats * n_blocks + 1`` tensors.
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
@@ -170,9 +172,7 @@ class CausalTCNBlock(nn.Module):
         self.conv1x1_in = nn.Conv1d(b, h, kernel_size=1)
         self.prelu1 = nn.PReLU(h)
         self.norm1 = CumulativeLayerNorm(h, eps=config.ln_eps)
-        self.dw_conv = nn.Conv1d(
-            h, h, kernel_size=p, dilation=dilation, groups=h, padding=0
-        )
+        self.dw_conv = nn.Conv1d(h, h, kernel_size=p, dilation=dilation, groups=h, padding=0)
         self.prelu2 = nn.PReLU(h)
         self.norm2 = CumulativeLayerNorm(h, eps=config.ln_eps)
         self.conv1x1_res = nn.Conv1d(h, b, kernel_size=1)
@@ -222,7 +222,7 @@ class CausalTCNBlock(nn.Module):
         # Prepend ring-buffer context instead of zero-padding.
         if self.pad > 0:
             y_ctx = torch.cat([dw_ring, y], dim=2)
-            new_ring = y_ctx[:, :, -self.pad:]
+            new_ring = y_ctx[:, :, -self.pad :]
         else:  # pragma: no cover - tcn_kernel is always > 1 in practice
             y_ctx = y
             new_ring = dw_ring
@@ -298,7 +298,7 @@ class CausalConvTasNetTSE(nn.Module):
     def receptive_field_samples(self) -> int:
         """Total causal receptive field of the separator, in input samples."""
         cfg = self.config
-        latent = 1 + sum(block.pad for block in self.blocks)
+        latent = 1 + sum(cast(CausalTCNBlock, block).pad for block in self.blocks)
         # Each latent frame covers enc_stride input samples; plus the
         # encoder analysis window overlap.
         return latent * cfg.enc_stride + cfg.enc_overlap
@@ -380,6 +380,7 @@ class CausalConvTasNetTSE(nn.Module):
             z11(),  # input_norm sum/sqsum/count
         ]
         for block in self.blocks:
+            block = cast(CausalTCNBlock, block)
             state.append(torch.zeros(batch_size, cfg.hidden, block.pad, device=dev))
             state.extend([z11(), z11(), z11()])  # cln1
             state.extend([z11(), z11(), z11()])  # cln2
@@ -421,9 +422,7 @@ class CausalConvTasNetTSE(nn.Module):
             )
         expected = self.n_state_tensors
         if len(conv_states) != expected:
-            raise ValueError(
-                f"conv_states has {len(conv_states)} tensors, expected {expected}"
-            )
+            raise ValueError(f"conv_states has {len(conv_states)} tensors, expected {expected}")
 
         states = list(conv_states)
         idx = 0
@@ -432,9 +431,7 @@ class CausalConvTasNetTSE(nn.Module):
         enc_overlap_state = states[idx]
         idx += 1
         x = torch.cat([enc_overlap_state, chunk], dim=2)
-        new_enc_overlap = (
-            x[:, :, -cfg.enc_overlap:] if cfg.enc_overlap > 0 else enc_overlap_state
-        )
+        new_enc_overlap = x[:, :, -cfg.enc_overlap :] if cfg.enc_overlap > 0 else enc_overlap_state
         enc = F.relu(self.encoder(x))  # (B, N, L), L = chunk_len / stride
 
         # --- input cumulative LN (streaming) ---
@@ -453,13 +450,12 @@ class CausalConvTasNetTSE(nn.Module):
         h = feat
         new_states: list[torch.Tensor] = [new_enc_overlap, n_in_sum, n_in_sqsum, n_in_count]
         for block in self.blocks:
+            block = cast(CausalTCNBlock, block)
             dw_ring = states[idx]
             cln1 = (states[idx + 1], states[idx + 2], states[idx + 3])
             cln2 = (states[idx + 4], states[idx + 5], states[idx + 6])
             idx += 7
-            h, skip, new_ring, n1, n2 = block.forward_streaming(
-                h, gamma, beta, dw_ring, cln1, cln2
-            )
+            h, skip, new_ring, n1, n2 = block.forward_streaming(h, gamma, beta, dw_ring, cln1, cln2)
             skip_sum = skip_sum + skip
             new_states.extend([new_ring, n1[0], n1[1], n1[2], n2[0], n2[1], n2[2]])
 

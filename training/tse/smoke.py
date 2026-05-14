@@ -1,7 +1,8 @@
 """Local-CPU validation gate for the Stage C TSE scaffold.
 
-Run as ``python -m training.tse.smoke`` (from the repo root) or
-``python training/tse/smoke.py``. Exits non-zero on any failure.
+Run as ``python training/tse/smoke.py`` (from the repo root) or
+``python -m tse.smoke`` (with ``training`` installed / on the path).
+Exits non-zero on any failure.
 
 Four checks:
 
@@ -28,18 +29,18 @@ from pathlib import Path
 
 import torch
 
-# Make the in-repo `training` package + `scripts/` importable regardless of
-# how this file is invoked.
+# Make the `tse` package + `scripts/` importable regardless of how this
+# file is invoked.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-for p in (_REPO_ROOT, _REPO_ROOT / "scripts"):
+for p in (_REPO_ROOT / "training", _REPO_ROOT / "scripts"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from training.tse.config import TSEConfig  # noqa: E402
-from training.tse.data import synthetic_fixture_dataset  # noqa: E402
-from training.tse.loss import neg_si_sdr_loss  # noqa: E402
-from training.tse.model import CausalConvTasNetTSE, count_parameters  # noqa: E402
-from training.tse.train import overfit_one_batch  # noqa: E402
+from tse.config import TSEConfig  # noqa: E402
+from tse.data import synthetic_fixture_dataset  # noqa: E402
+from tse.loss import neg_si_sdr_loss  # noqa: E402
+from tse.model import CausalConvTasNetTSE, count_parameters  # noqa: E402
+from tse.train import overfit_one_batch  # noqa: E402
 
 STREAM_TOL = 1e-4
 ONNX_TOL = 1e-4
@@ -63,8 +64,7 @@ def check_forward_backward(config: TSEConfig) -> CausalConvTasNetTSE:
     print(f"[smoke] param count: {n_params:,}", file=sys.stderr)
     if not (PARAM_LOW <= n_params <= PARAM_HIGH):
         raise AssertionError(
-            f"param count {n_params:,} outside expected band "
-            f"[{PARAM_LOW:,}, {PARAM_HIGH:,}]"
+            f"param count {n_params:,} outside expected band [{PARAM_LOW:,}, {PARAM_HIGH:,}]"
         )
 
     ds = synthetic_fixture_dataset(n=3, sample_rate=config.sample_rate, duration_sec=1.0)
@@ -80,9 +80,7 @@ def check_forward_backward(config: TSEConfig) -> CausalConvTasNetTSE:
     if not torch.isfinite(loss):
         raise AssertionError(f"loss is not finite: {loss.item()}")
     loss.backward()
-    grad_norm = sum(
-        float(p.grad.norm()) for p in model.parameters() if p.grad is not None
-    )
+    grad_norm = sum(float(p.grad.norm()) for p in model.parameters() if p.grad is not None)
     if grad_norm == 0.0 or not torch.isfinite(torch.tensor(grad_norm)):
         raise AssertionError(f"bad gradient norm: {grad_norm}")
     print(
@@ -114,9 +112,13 @@ def check_full_vs_streaming(config: TSEConfig) -> None:
         streamed = torch.cat(outs, dim=1)
 
     if full.shape != streamed.shape:
-        raise AssertionError(f"shape mismatch: full {tuple(full.shape)} vs stream {tuple(streamed.shape)}")
+        raise AssertionError(
+            f"shape mismatch: full {tuple(full.shape)} vs stream {tuple(streamed.shape)}"
+        )
     delta = float((full - streamed).abs().max())
-    print(f"[smoke] full-vs-streaming max|Δ| = {delta:.3e}  (tol {STREAM_TOL:.0e})", file=sys.stderr)
+    print(
+        f"[smoke] full-vs-streaming max|Δ| = {delta:.3e}  (tol {STREAM_TOL:.0e})", file=sys.stderr
+    )
     if delta > STREAM_TOL:
         raise AssertionError(f"full vs streaming diverged: {delta:.3e} > {STREAM_TOL:.0e}")
     print("[smoke] full == streaming OK", file=sys.stderr)
@@ -153,8 +155,7 @@ def check_onnx_roundtrip(config: TSEConfig) -> None:
         import onnxruntime  # noqa: F401
     except ImportError:
         raise AssertionError(
-            "onnxruntime not installed — install the `onnx` extra: "
-            "pip install onnx onnxruntime"
+            "onnxruntime not installed — install the `onnx` extra: pip install onnx onnxruntime"
         ) from None
 
     import export_tse_onnx as exporter
@@ -222,7 +223,10 @@ def main() -> int:
 
     print("", file=sys.stderr)
     if failures:
-        print(f"[smoke] FAILED — {len(failures)}/{len(checks)} checks: {', '.join(failures)}", file=sys.stderr)
+        print(
+            f"[smoke] FAILED — {len(failures)}/{len(checks)} checks: {', '.join(failures)}",
+            file=sys.stderr,
+        )
         return 1
     print(f"[smoke] PASS — all {len(checks)} checks green", file=sys.stderr)
     return 0

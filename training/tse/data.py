@@ -156,9 +156,7 @@ class TSEMixtureDataset(Dataset):
         rng = self._rng(index)
 
         target = self._crop(np.asarray(src.target, dtype=np.float32), rng)
-        interferer = _fit_length(
-            np.asarray(src.interferer, dtype=np.float32), self.segment_samples
-        )
+        interferer = _fit_length(np.asarray(src.interferer, dtype=np.float32), self.segment_samples)
 
         ti_db = float(rng.uniform(*self.ti_ratio_db))
         mixture = target + _scale_to_ratio(target, interferer, ti_db)
@@ -181,9 +179,7 @@ class TSEMixtureDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def _synth_voice(
-    rng: np.random.Generator, n: int, sr: int, f0: float
-) -> np.ndarray:
+def _synth_voice(rng: np.random.Generator, n: int, sr: int, f0: float) -> np.ndarray:
     """Deterministic harmonic-stack 'voice' with light AM modulation."""
     t = np.arange(n) / sr
     wave = np.zeros(n, dtype=np.float64)
@@ -221,9 +217,7 @@ def synthetic_fixture_dataset(
         f0_i = 190.0 + 25.0 * i
         target = _synth_voice(rng, n_samples, sample_rate, f0_t)
         interferer = _synth_voice(rng, n_samples, sample_rate, f0_i)
-        noise = (
-            (rng.standard_normal(n_samples) * 0.1).astype(np.float32) if with_noise else None
-        )
+        noise = (rng.standard_normal(n_samples) * 0.1).astype(np.float32) if with_noise else None
         cond = rng.standard_normal(cond_dim).astype(np.float32)
         sources.append(
             TSESourceItem(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+
 from tse.config import TSEConfig
 from tse.data import TSEMixtureDataset, synthetic_fixture_dataset
 from tse.loss import neg_si_sdr_loss, si_sdr
@@ -215,9 +216,7 @@ def test_loss_matches_bench_si_sdr_reference() -> None:
     den = float(np.dot(e_noise, e_noise)) + eps
     bench_value = 10.0 * float(np.log10(num / den))
 
-    torch_value = float(
-        si_sdr(torch.from_numpy(ref_np), torch.from_numpy(est_np))
-    )
+    torch_value = float(si_sdr(torch.from_numpy(ref_np), torch.from_numpy(est_np)))
     assert abs(torch_value - bench_value) < 1e-2, (
         f"torch SI-SDR {torch_value:.4f} disagrees with bench {bench_value:.4f}"
     )
