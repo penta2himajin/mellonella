@@ -17,6 +17,7 @@ use mellonella_audio_io::{
     list_input_devices, list_output_devices, AudioDevice, LiveSession, LiveSessionStats, Recorder,
     SessionConfig, SessionEvent,
 };
+use mellonella_core::dfn3::Dfn3Pipeline;
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
@@ -107,12 +108,40 @@ impl Default for AppState {
             enable_dfn3: false,
             record_duration_secs: DEFAULT_RECORD_SECS,
             gate_cfg: GateConfig::default(),
-            pipeline_cfg: PipelineConfig::default(),
+            pipeline_cfg: default_live_pipeline_cfg(),
             session: None,
             recorder: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
         }
+    }
+}
+
+/// Live-tuned `PipelineConfig` for GUI sessions: takes the library
+/// defaults and overrides the fields whose library defaults are
+/// backward-compat no-ops (so existing tests against
+/// `PipelineConfig::default()` keep passing) but that matter for
+/// real-time mic use:
+///
+/// * `silence_force_off_ms = 400` — close the gate immediately after
+///   400 ms of continuous VAD-silence. Longer than a typical
+///   inter-word pause (~250 ms) so normal speech doesn't trip it,
+///   but short enough that the gate closes within ~500 ms of the
+///   user actually stopping (400 ms + 100 ms envelope `release_ms`).
+/// * `score_ema_alpha = 0.7` — smooth `last_score` updates across
+///   refreshes to ride out one-refresh dips at speech onset.
+/// * `sv_min_new_samples_after_silence = 1600` — fire the
+///   post-silence early refresh after only 100 ms of new speech
+///   (instead of the library-default 250 ms) so `last_score` catches
+///   up to the current speaker faster on resume. Cheap for a
+///   single-target system since there's no cross-speaker risk.
+#[must_use]
+pub fn default_live_pipeline_cfg() -> PipelineConfig {
+    PipelineConfig {
+        silence_force_off_ms: 400.0,
+        score_ema_alpha: 0.7,
+        sv_min_new_samples_after_silence: 1_600,
+        ..PipelineConfig::default()
     }
 }
 
@@ -216,10 +245,11 @@ impl AppState {
     }
 
     /// Read a clean voice recording from `path` (16-bit signed mono
-    /// WAV at any sample rate; resampled to 16 kHz internally), run
-    /// `enroll_from_recording`, and store the resulting pool.
+    /// WAV at any sample rate; resampled to 48 kHz internally so the
+    /// optional DFN3 pre-pass can run at its native rate), then route
+    /// through `run_enrollment`.
     pub fn enroll_from_wav(&mut self, path: &Path) {
-        match read_wav_to_16k_mono(path) {
+        match read_wav_to_48k_mono(path) {
             Ok(audio) => self.run_enrollment(&audio, EnrollmentOrigin::Wav(path.to_path_buf())),
             Err(e) => {
                 self.clear_pool();
@@ -228,13 +258,16 @@ impl AppState {
         }
     }
 
-    /// Kick off a mic recording of `secs` seconds at 16 kHz mono.
-    /// Call `poll_recorder` once per frame to detect completion.
+    /// Kick off a mic recording of `secs` seconds at 48 kHz mono —
+    /// matches the live audio path's rate so an optional DFN3
+    /// pre-pass during enrollment runs on the same distribution as
+    /// the live ECAPA refresh path. Call `poll_recorder` once per
+    /// frame to detect completion.
     pub fn start_recording(&mut self, secs: f32) {
         if self.recorder.is_some() {
             return;
         }
-        match Recorder::start(self.selected_input.clone(), DECISION_SAMPLE_RATE, secs) {
+        match Recorder::start(self.selected_input.clone(), OUTPUT_SAMPLE_RATE, secs) {
             Ok(r) => {
                 self.recorder = Some(r);
                 self.last_error = None;
@@ -268,7 +301,7 @@ impl AppState {
         self.recorder = None;
         match result {
             Ok(audio) => {
-                if audio.len() < DECISION_SAMPLE_RATE as usize {
+                if audio.len() < OUTPUT_SAMPLE_RATE as usize {
                     self.last_error =
                         Some("recording too short for ECAPA enrolment (need ≥ 1 s)".to_string());
                     return;
@@ -279,7 +312,40 @@ impl AppState {
         }
     }
 
-    fn run_enrollment(&mut self, audio_16k: &[f32], origin: EnrollmentOrigin) {
+    /// Enroll from 48 kHz mono audio. When `enable_dfn3` is on and a
+    /// DFN3 model is available, the audio is denoised at its native
+    /// 48 kHz before being downsampled to 16 kHz for ECAPA — this
+    /// keeps the anchor embeddings on the same audio distribution as
+    /// the live path's ECAPA refreshes. Without this match, cos_sim
+    /// drops noticeably under DFN3 ON and the gate ends up
+    /// fragmented (see B-symptom analysis from 2026-05-14 smoke).
+    fn run_enrollment(&mut self, audio_48k: &[f32], origin: EnrollmentOrigin) {
+        let denoised: Vec<f32> = if self.enable_dfn3 {
+            let Some(path) = dfn3_path_from_env() else {
+                self.last_error = Some(
+                    "noise suppression toggle is on but MELLONELLA_DFN3_ONNX isn't set — \
+                     disable the checkbox before enrolling, or point the env var at the ONNX"
+                        .into(),
+                );
+                return;
+            };
+            match apply_dfn3_offline(audio_48k, &path) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    self.last_error = Some(e);
+                    return;
+                }
+            }
+        } else {
+            audio_48k.to_vec()
+        };
+        let audio_16k = match resample_to(&denoised, OUTPUT_SAMPLE_RATE, DECISION_SAMPLE_RATE) {
+            Ok(a) => a,
+            Err(e) => {
+                self.last_error = Some(format!("resample 48 kHz → 16 kHz for ECAPA: {e}"));
+                return;
+            }
+        };
         let mut components = match Self::build_components() {
             Ok(c) => c,
             Err(e) => {
@@ -287,7 +353,7 @@ impl AppState {
                 return;
             }
         };
-        match enroll_from_recording(audio_16k, &mut components, EmbeddingPoolConfig::default()) {
+        match enroll_from_recording(&audio_16k, &mut components, EmbeddingPoolConfig::default()) {
             Ok(pool) => self.store_pool(pool, origin),
             Err(e) => self.last_error = Some(format!("enrol: {e}")),
         }
@@ -450,10 +516,10 @@ impl AppState {
 }
 
 /// Decode a 16-bit signed mono WAV at any common rate into f32
-/// samples at 16 kHz mono — the rate `enroll_from_recording`
-/// expects. Mirrors the CLI's `read_wav_mono` + resample helper but
-/// inline so the GUI doesn't pull the CLI binary in as a dep.
-fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
+/// samples at 48 kHz mono — the rate the enrollment pipeline
+/// operates at (DFN3 is native here, and we resample down to 16 kHz
+/// before ECAPA inside `run_enrollment`).
+fn read_wav_to_48k_mono(path: &Path) -> Result<Vec<f32>, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
     if spec.channels != 1 {
@@ -471,10 +537,30 @@ fn read_wav_to_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
         .map(|s| s.map(|v| f32::from(v) * scale))
         .collect::<Result<Vec<f32>, _>>()
         .map_err(|e| e.to_string())?;
-    if spec.sample_rate == DECISION_SAMPLE_RATE {
+    if spec.sample_rate == OUTPUT_SAMPLE_RATE {
         return Ok(samples);
     }
-    resample_to(&samples, spec.sample_rate, DECISION_SAMPLE_RATE).map_err(|e| e.to_string())
+    resample_to(&samples, spec.sample_rate, OUTPUT_SAMPLE_RATE).map_err(|e| e.to_string())
+}
+
+/// Push the whole enrollment recording through a fresh `Dfn3Pipeline`
+/// as one continuous stream — `push_samples` + `flush`, no per-chunk
+/// reset. This preserves the GRU + EMA evolution across the full
+/// recording (CLI's chunked `process()` resets between every ~1 s,
+/// which is fine for offline parity but here we want one coherent
+/// denoised stream that matches the live worker's continuous DFN3
+/// state).
+fn apply_dfn3_offline(audio_48k: &[f32], onnx_path: &Path) -> Result<Vec<f32>, String> {
+    let mut pipeline =
+        Dfn3Pipeline::from_onnx_path(onnx_path).map_err(|e| format!("DFN3 load: {e}"))?;
+    let mut enhanced = Vec::with_capacity(audio_48k.len());
+    enhanced.extend(
+        pipeline
+            .push_samples(audio_48k)
+            .map_err(|e| format!("DFN3 push: {e}"))?,
+    );
+    enhanced.extend(pipeline.flush().map_err(|e| format!("DFN3 flush: {e}"))?);
+    Ok(enhanced)
 }
 
 #[cfg(test)]

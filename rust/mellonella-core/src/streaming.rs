@@ -106,8 +106,8 @@ use crate::gating::{
     GateState,
 };
 use crate::pipeline::{
-    apply_refresh_result, fbank_ecapa_one, AutoLearnEvent, AutoLearnKind, PipelineComponents,
-    PipelineConfig, PipelineError,
+    apply_refresh_result, fbank_ecapa_one, smooth_score, AutoLearnEvent, AutoLearnKind,
+    PipelineComponents, PipelineConfig, PipelineError,
 };
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
@@ -241,6 +241,15 @@ pub(crate) struct StreamingState {
     last_score: f32,
     last_cs: f32,
     last_fm: f32,
+    /// Continuous VAD-silence duration in ms, reset to 0 the moment a
+    /// VAD-positive frame arrives. Used by the optional silence
+    /// force-off rule (`PipelineConfig::silence_force_off_ms`) to
+    /// override `last_score` when nothing's been heard for a while.
+    /// Necessary because `speech_buffer` only accumulates speech
+    /// frames, so `last_score` never decays on its own during clean
+    /// (DFN3-denoised) silence and the gate would otherwise stay open
+    /// indefinitely on whatever the last refresh scored.
+    silence_ms_since_speech: f32,
     gate_state: GateState,
     envelope_state: EnvelopeState,
     /// Last emitted `(start_sample, is_on)` decision (at audio
@@ -484,6 +493,7 @@ impl StreamingState {
             last_score: 0.0,
             last_cs: 0.0,
             last_fm: 1.0,
+            silence_ms_since_speech: 0.0,
             gate_state: GateState::new(config.gate),
             envelope_state: EnvelopeState::new(config.gate, audio_sr),
             current_decision: None,
@@ -543,6 +553,7 @@ impl StreamingState {
         self.last_score = 0.0;
         self.last_cs = 0.0;
         self.last_fm = 1.0;
+        self.silence_ms_since_speech = 0.0;
         self.gate_state = GateState::new(config.gate);
         self.envelope_state = EnvelopeState::new(config.gate, config.audio_sample_rate);
         self.current_decision = None;
@@ -680,6 +691,11 @@ impl StreamingState {
             self.silence_seen_since_refresh = true;
             self.new_speech_samples_after_silence = 0;
         }
+        if now_speech {
+            self.silence_ms_since_speech = 0.0;
+        } else {
+            self.silence_ms_since_speech += dt_ms;
+        }
         self.prev_speech = now_speech;
         self.samples_since_update += vad_frame;
 
@@ -726,11 +742,13 @@ impl StreamingState {
             let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
             self.last_cs = cs;
             self.last_fm = fm;
-            self.last_score = if gate_cfg.use_as_norm && !components.cohort.is_empty() {
+            let new_score = if gate_cfg.use_as_norm && !components.cohort.is_empty() {
                 as_norm_score(&embedding, cs, &components.cohort, 20)
             } else {
                 cs
             };
+            self.last_score =
+                smooth_score(self.last_score, new_score, pipeline_cfg.score_ema_alpha);
 
             if pipeline_cfg.enable_auto_learn
                 && should_admit_auto_learn(
@@ -763,7 +781,10 @@ impl StreamingState {
             }
         }
 
-        let is_on = self.gate_state.update(self.last_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on = is_on_score
+            && !(pipeline_cfg.silence_force_off_ms > 0.0
+                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
             out.score_per_frame.push(self.last_score);
@@ -838,6 +859,11 @@ impl StreamingState {
             self.silence_seen_since_refresh = true;
             self.new_speech_samples_after_silence = 0;
         }
+        if now_speech {
+            self.silence_ms_since_speech = 0.0;
+        } else {
+            self.silence_ms_since_speech += dt_ms;
+        }
         self.prev_speech = now_speech;
         self.samples_since_update += vad_frame;
 
@@ -873,6 +899,7 @@ impl StreamingState {
                     cohort,
                     gate_cfg,
                     pipeline_cfg.enable_auto_learn,
+                    pipeline_cfg.score_ema_alpha,
                     &mut self.last_score,
                     &mut self.last_cs,
                     &mut self.last_fm,
@@ -881,7 +908,10 @@ impl StreamingState {
             }
         }
 
-        let is_on = self.gate_state.update(self.last_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on = is_on_score
+            && !(pipeline_cfg.silence_force_off_ms > 0.0
+                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
             out.score_per_frame.push(self.last_score);
@@ -1039,6 +1069,7 @@ impl StreamingState {
                     cohort,
                     &config.gate,
                     config.pipeline.enable_auto_learn,
+                    config.pipeline.score_ema_alpha,
                     &mut self.last_score,
                     &mut self.last_cs,
                     &mut self.last_fm,

@@ -397,10 +397,22 @@ impl MellonellaApp {
                         )
                         .text("sv_update_samples (ECAPA refresh cadence @ 16 kHz)"),
                     );
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.state.pipeline_cfg.silence_force_off_ms,
+                            0.0..=3000.0,
+                        )
+                        .text("silence_force_off_ms (0 disables)")
+                        .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.state.pipeline_cfg.score_ema_alpha, 0.0..=1.0)
+                            .text("score_ema_alpha (1.0 disables smoothing)")
+                            .fixed_decimals(2),
+                    );
                     if ui.button("Reset to defaults").clicked() {
                         self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
-                        self.state.pipeline_cfg =
-                            mellonella_core::pipeline::PipelineConfig::default();
+                        self.state.pipeline_cfg = crate::state::default_live_pipeline_cfg();
                     }
                 });
             });

@@ -485,11 +485,25 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
         None
     };
 
+    // Live mode opts into the silence force-off + score EMA smoothing
+    // that the library defaults leave dormant. Mirrors the GUI's
+    // `default_live_pipeline_cfg`: 400 ms VAD-silence hangover (AND-
+    // combined with the score-side gate so close time is 400 ms +
+    // release_ms, not stacked on hangover_ms), 0.7 EMA blend to ride
+    // out one-refresh dips at speech onset, and a 100 ms post-silence
+    // early-refresh trigger so `last_score` catches up quickly on
+    // resume. See project-mellonella-first-smoke for the diagnosis.
+    let live_pipeline_cfg = PipelineConfig {
+        silence_force_off_ms: 400.0,
+        score_ema_alpha: 0.7,
+        sv_min_new_samples_after_silence: 1_600,
+        ..PipelineConfig::default()
+    };
     let session_cfg = SessionConfig {
         input_device: args.input_device,
         output_device: args.output_device,
         streaming: StreamingConfig {
-            pipeline: PipelineConfig::default(),
+            pipeline: live_pipeline_cfg,
             gate: GateConfig::default(),
             audio_sample_rate: OUTPUT_SAMPLE_RATE,
             diagnostics: false,
