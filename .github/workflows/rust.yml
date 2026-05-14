@@ -16,35 +16,51 @@ defaults:
     working-directory: rust
 
 jobs:
-  check:
-    name: cargo check / fmt / clippy / test
+  # `cargo fmt` needs no Linux dev headers, so we split it into its own
+  # job that skips the 12-min apt install. PRs that fail fmt now fail
+  # in ~30 s instead of waiting for the full build environment.
+  fmt:
+    name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: install Linux build deps (cpal + eframe + tray-icon)
-        # mellonella-audio-io depends on cpal (ALSA on Linux);
-        # mellonella-gui pulls in eframe (winit / wayland / X11) and
-        # tray-icon (AppIndicator / GTK). All three need dev headers
-        # + pkg-config metadata on top of the runtime libs the
-        # runner ships with.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  check:
+    name: cargo check / clippy / test
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # mellonella-audio-io depends on cpal (ALSA on Linux);
+      # mellonella-gui pulls in eframe (winit / wayland / X11) and
+      # tray-icon (AppIndicator / GTK). All three need dev headers
+      # + pkg-config metadata on top of the runtime libs the
+      # runner ships with. Same caching pattern as accuracy.yml /
+      # smoke.yml — cache-apt-pkgs-action tar-restores the installed
+      # files so cache hits run in ~30 s instead of ~12 min.
+      - name: install Linux build deps (cached; cpal + eframe + tray-icon)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            libasound2-dev
+            libxkbcommon-dev libxkbcommon-x11-dev
+            libwayland-dev
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libgtk-3-dev
+            libayatana-appindicator3-dev
+            libxdo-dev
+          version: 1.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo check
