@@ -1,0 +1,123 @@
+# mellonella-tse — Stage C: causal target speaker extraction
+
+`mellonella` currently *gates* (whole-frame pass/mute) but cannot
+*separate* overlapping speakers. **Stage C** adds a small **causal
+time-domain target speaker extraction (TSE)** network: conditioned on a
+frozen enrolled-speaker embedding, it extracts only the target speaker's
+voice from a mixture.
+
+This package is the model + training harness. It is greenfield Python ML
+code; the trained model exports to ONNX for the Rust core.
+
+## Architecture
+
+Causal Conv-TasNet TSE with SpeakerBeam-style FiLM conditioning:
+
+- **Encoder** — 1-D conv, ReLU, `N=256` basis channels. Causal (left-pad).
+- **Conditioning** — the frozen 192-dim ECAPA enrollment embedding feeds a
+  trainable 2-layer MLP (`192 → 256 → 2·B`) producing FiLM `(γ, β)`,
+  `B=128` each. The ECAPA model itself is *not* part of this — the 192-dim
+  vector is a plain input.
+- **Separator** — causal Temporal Convolutional Network, `R=2` repeats ×
+  `X=6` depthwise-separable conv blocks, dilations `1,2,4,8,16,32`. Each
+  block: 1×1 conv → causal dilated depthwise conv (left-pad only) → PReLU →
+  cumulative (causal) layer norm → FiLM → 1×1 residual + skip. Bottleneck
+  `B=128`, conv channels `H=256`, depthwise kernel `P=3`.
+- **Mask + decoder** — skip-sum → 1×1 conv → sigmoid mask over the `N`
+  basis → multiply with the encoder output → 1-D transposed-conv decoder.
+
+~1.41 M parameters with the confirmed dims (a touch under the 1.5–2.5 M
+design target; kept as-is because the dims are the approved architecture).
+
+### Two forward modes (numerically equivalent)
+
+1. **Full-sequence** — `model(mixture, cond)` processes a whole waveform at
+   once, for training. Causal via left-padding + cumulative layer norm.
+2. **Streaming** — `model.forward_streaming(chunk, cond, conv_states) ->
+   (extracted_chunk, new_conv_states)` processes one fixed-size chunk at a
+   time with explicit causal-conv state buffers (depthwise-conv ring
+   buffers, cumulative-LN running stats, encoder/decoder overlap). This is
+   what exports to ONNX.
+
+The two modes agree to ~1e-6 (see `smoke.py` check 2 and the tests). The
+streaming-state layout is documented at the top of `model.py`.
+
+## PoC vs. production — a config swap, not a rewrite
+
+| | PoC (default) | Production (later) |
+|---|---|---|
+| Sample rate | 16 kHz | 48 kHz |
+| Encoder kernel / stride | 32 / 16 | 96 / 48 |
+| Latent frame rate | 1 kHz | 1 kHz (held constant) |
+| Datasets | LibriSpeech / LibriMix `train-100` + MUSAN | VCTK + DEMAND |
+| Separator | identical | identical |
+
+`TSEConfig.poc_16k()` is the default. `TSEConfig.prod_48k()` triples the
+encoder kernel/stride so the latent rate stays at 1 kHz; everything
+downstream is byte-identical. Production is a config + dataset swap.
+
+## Running the local validation gate
+
+`smoke.py` is the Phase 2 local-CPU gate. It (1) runs a forward+backward
+and prints the param count, (2) asserts full-sequence == streaming, (3)
+overfits one synthetic mixture for ~200 steps and asserts the SI-SDR loss
+collapses, (4) exports to ONNX and round-trips a clip through
+`onnxruntime`, checking per-chunk PyTorch↔ONNX parity. No datasets needed
+— it runs on an in-memory synthetic fixture set.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install onnx onnxruntime onnxscript numpy soundfile
+python -m training.tse.smoke          # exits non-zero on any failure
+python -m pytest training/tse/tests/  # unit tests
+ruff check training/tse scripts/export_tse_onnx.py
+```
+
+## Training
+
+`train.py` runs from the same code path locally and on Kaggle:
+
+```bash
+# Local sanity: overfit one synthetic mixture (no data needed).
+python -m training.tse.train --overfit-steps 200 --out build/tse
+
+# Full training on the synthetic fixture set (scaffold check only).
+python -m training.tse.train --epochs 10 --out build/tse
+
+# Full training on real data (Phase 3 — see the data.py stub).
+python -m training.tse.train --epochs 100 --data-dir data/ --out build/tse
+```
+
+It writes per-epoch checkpoints (`ckpt_epoch*.pt`) and a `metrics.json`,
+and supports `--resume`.
+
+### How this maps to Kaggle (Phase 3)
+
+1. **Enrollment embeddings** — `prepare_enrollment_embeddings.py`
+   precomputes per-utterance frozen ECAPA embeddings into an `.npz`, using
+   the existing ECAPA ONNX (`$MELLONELLA_ECAPA_ONNX`). The ECAPA model is
+   never in the training loop.
+2. **Data** — `data.py::librispeech_musan_sources` (currently a documented
+   stub) builds `TSESourceItem` bundles from local LibriSpeech + MUSAN,
+   reusing the `bench` dataset infrastructure. The same `TSEMixtureDataset`
+   then does on-the-fly target+interferer(+noise) mixing.
+3. **Train** — `train.py --data-dir … --epochs …` on a Kaggle GPU.
+4. **Export** — `scripts/export_tse_onnx.py export-and-verify
+   --checkpoint <ckpt>` produces the streaming ONNX for the Rust core.
+
+## Files
+
+- `config.py` — `TSEConfig` frozen dataclass + `poc_16k()` / `prod_48k()`.
+- `model.py` — `CausalConvTasNetTSE` (two forward modes), FiLM MLP,
+  cumulative LN, causal TCN blocks, param-count helper.
+- `data.py` — `TSEMixtureDataset` + `synthetic_fixture_dataset` (in-memory,
+  no downloads) + `librispeech_musan_sources` (Phase 3 stub).
+- `loss.py` — negative SI-SDR loss, consistent with `bench`'s `si_sdr`.
+- `train.py` — overfit-one-batch + full training loop, CLI, checkpointing.
+- `prepare_enrollment_embeddings.py` — offline ECAPA embedding precompute
+  (validated in Phase 3).
+- `smoke.py` — the local-CPU validation gate (four checks).
+- `tests/test_model.py` — param count, causality, full-vs-streaming, FiLM,
+  loss sign/scale, dataset.
+- `../../scripts/export_tse_onnx.py` — stateful per-chunk ONNX export +
+  PyTorch↔ONNX parity verification.
