@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "config": {
+    "engine": "python",
     "sample_rate": 16000,
     "snrs_db": [
       5.0,
@@ -11,6 +12,24 @@
       9.0,
       0.0
     ],
+    "vary_snr_schedule_db": [
+      15.0,
+      4.0,
+      12.0,
+      3.0,
+      14.0,
+      5.0
+    ],
+    "speaker_turn_pattern": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      true
+    ],
+    "speaker_turn_seg_sec": 2.5,
+    "speaker_turn_snr_db": 12.0,
     "seed": 0,
     "theta_pass": 0.3,
     "theta_learn": 0.8,
@@ -25,34 +44,53 @@
     "fpr_relative": 0.05,
     "fpr_absolute_floor_when_zero": 0.05,
     "si_sdr_absolute_db": 1.0,
-    "other_rms_absolute_db": 3.0
+    "other_rms_absolute_db": 3.0,
+    "gate_transitions_absolute": 4,
+    "latency_absolute_ms": 100.0
   },
   "metrics": {
     "snr_5_db": {
       "tpr": 0.29,
       "fpr": 0.0,
       "si_sdr_db": -1.99,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 6
     },
     "snr_10_db": {
       "tpr": 0.4286,
       "fpr": 0.0,
       "si_sdr_db": -1.06,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 6
     },
     "snr_15_db": {
       "tpr": 0.7619,
       "fpr": 0.0,
       "si_sdr_db": 4.22,
-      "other_rms_db": -120.0
+      "other_rms_db": -120.0,
+      "gate_transitions": 1
     },
     "sim4_9db": {
       "tpr": 0.4632,
-      "si_sdr_db": -4.03
+      "si_sdr_db": -4.03,
+      "gate_transitions": 6
     },
     "sim4_0db": {
       "tpr": 0.1472,
-      "si_sdr_db": -27.02
+      "si_sdr_db": -27.02,
+      "gate_transitions": 4
+    },
+    "vary_snr": {
+      "tpr": 0.4589,
+      "si_sdr_db": -0.35,
+      "gate_transitions": 4
+    },
+    "speaker_turn": {
+      "tpr": 0.3974,
+      "fpr": 0.1496,
+      "gate_transitions": 5,
+      "onset_latency_ms": 1493.3,
+      "offset_latency_ms": 560.0
     }
   }
 }
