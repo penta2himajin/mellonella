@@ -100,7 +100,13 @@ fn process_offline_matches_python_reference() {
         score_ema_alpha: 1.0,
         ..PipelineConfig::default()
     };
-    let gate_cfg = GateConfig::default();
+    // adaptive_theta defaults to true (#120) but the Python reference
+    // has no adaptive threshold — pin it off so the per-frame gate
+    // decisions stay byte-equal.
+    let gate_cfg = GateConfig {
+        adaptive_theta: false,
+        ..GateConfig::default()
+    };
     let result = process_offline(
         &audio,
         16_000,
