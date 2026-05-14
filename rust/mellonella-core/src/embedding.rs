@@ -422,7 +422,10 @@ mod tests {
             eprintln!("[skip] {ENV_ENCODER} / {ENV_POOLER} not set");
             return None;
         };
-        let (enc, pool) = (std::path::PathBuf::from(enc), std::path::PathBuf::from(pool));
+        let (enc, pool) = (
+            std::path::PathBuf::from(enc),
+            std::path::PathBuf::from(pool),
+        );
         if !enc.exists() || !pool.exists() {
             eprintln!("[skip] split ONNX file(s) missing");
             return None;
