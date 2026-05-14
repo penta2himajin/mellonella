@@ -126,7 +126,7 @@ jobs:
       - name: Export ECAPA ONNX + resolve VAD ONNX + ORT dylib
         run: |
           set -euo pipefail
-          python scripts/export_ecapa_onnx.py \
+          python scripts/export_ecapa_onnx.py export \
             --mode embedding-only \
             --output build/ecapa_tdnn.onnx
           vad_onnx=$(python -c "import silero_vad, glob, os; print(glob.glob(os.path.join(os.path.dirname(silero_vad.__file__), '**', '*.onnx'), recursive=True)[0])")
