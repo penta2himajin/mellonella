@@ -120,17 +120,21 @@ jobs:
         run: cargo build --release -p mellonella-cli --manifest-path rust/Cargo.toml
 
       # ECAPA: exported from the SpeechBrain checkpoint (embedding-only —
-      # the mode the Rust EcapaTdnn expects). VAD: silero ships its ONNX
-      # inside the pip package. ORT dylib: the onnxruntime wheel bundles
-      # libonnxruntime, which `ort`'s load-dynamic feature needs.
+      # the mode the Rust EcapaTdnn expects). VAD: silero ships several
+      # ONNX variants in the pip package — the Rust SileroVad wrapper
+      # only accepts the standard `silero_vad.onnx` (the `_half` /
+      # `_op18` / `_16k` variants drop the `sr` input and fail at
+      # runtime), so select it by exact basename rather than glob order.
+      # ORT dylib: the onnxruntime wheel bundles libonnxruntime; pick
+      # `libonnxruntime.so*`, not the `_providers_shared` sibling.
       - name: Export ECAPA ONNX + resolve VAD ONNX + ORT dylib
         run: |
           set -euo pipefail
           python scripts/export_ecapa_onnx.py export \
             --mode embedding-only \
             --output build/ecapa_tdnn.onnx
-          vad_onnx=$(python -c "import silero_vad, glob, os; print(glob.glob(os.path.join(os.path.dirname(silero_vad.__file__), '**', '*.onnx'), recursive=True)[0])")
-          ort_dylib=$(python -c "import onnxruntime, glob, os; print(glob.glob(os.path.join(os.path.dirname(onnxruntime.__file__), '**', 'libonnxruntime*'), recursive=True)[0])")
+          vad_onnx=$(python -c "import silero_vad, glob, os; cands=[p for p in glob.glob(os.path.join(os.path.dirname(silero_vad.__file__), '**', '*.onnx'), recursive=True) if os.path.basename(p) == 'silero_vad.onnx']; print(cands[0])")
+          ort_dylib=$(python -c "import onnxruntime, glob, os; cands=[p for p in glob.glob(os.path.join(os.path.dirname(onnxruntime.__file__), '**', 'libonnxruntime*'), recursive=True) if os.path.basename(p).startswith('libonnxruntime.so')]; print(cands[0])")
           echo "MELLONELLA_ECAPA_ONNX=$PWD/build/ecapa_tdnn.onnx" >> "$GITHUB_ENV"
           echo "MELLONELLA_VAD_ONNX=$vad_onnx" >> "$GITHUB_ENV"
           echo "ORT_DYLIB_PATH=$ort_dylib" >> "$GITHUB_ENV"
