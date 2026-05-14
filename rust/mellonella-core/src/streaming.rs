@@ -766,7 +766,7 @@ impl StreamingState {
             }
         }
 
-        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms, now_speech);
         let is_on = is_on_score
             && !(pipeline_cfg.silence_force_off_ms > 0.0
                 && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
@@ -893,7 +893,7 @@ impl StreamingState {
             }
         }
 
-        let is_on_score = self.gate_state.update(self.last_score, dt_ms);
+        let is_on_score = self.gate_state.update(self.last_score, dt_ms, now_speech);
         let is_on = is_on_score
             && !(pipeline_cfg.silence_force_off_ms > 0.0
                 && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);

@@ -716,7 +716,7 @@ fn process_offline_async(
                 }
             }
 
-            let is_on_score = gate_state.update(last_score, dt_ms);
+            let is_on_score = gate_state.update(last_score, dt_ms, now_speech);
             let is_on = is_on_score
                 && !(pipeline_cfg.silence_force_off_ms > 0.0
                     && silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms);
