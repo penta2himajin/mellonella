@@ -490,9 +490,7 @@ impl TurnDetector {
                 } else {
                     self.turn_stable_counter = 0;
                 }
-                if self.shrunk_refresh_done
-                    && self.turn_stable_counter >= cfg.turn_stable_frames
-                {
+                if self.shrunk_refresh_done && self.turn_stable_counter >= cfg.turn_stable_frames {
                     self.state = TurnState::Regrowing;
                     self.effective_window = cfg.sv_window_samples;
                 }
@@ -798,29 +796,21 @@ pub(crate) trait RefreshChannel {
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize);
     /// Non-blocking poll for the next completed inference:
     /// `(trigger_frame, embedding, f0_mu)`.
-    fn try_recv_result(
-        &mut self,
-    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError>;
+    fn try_recv_result(&mut self) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError>;
     /// Blocking drain of every outstanding inference. Used at
     /// end-of-stream so the trailing scores / auto-learn events are
     /// captured before the worker is torn down.
-    fn drain_blocking(
-        &mut self,
-    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError>;
+    fn drain_blocking(&mut self) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError>;
 }
 
 impl RefreshChannel for AsyncWorker {
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
         AsyncWorker::submit(self, window, frame_idx);
     }
-    fn try_recv_result(
-        &mut self,
-    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
+    fn try_recv_result(&mut self) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
         AsyncWorker::try_recv_result(self)
     }
-    fn drain_blocking(
-        &mut self,
-    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
+    fn drain_blocking(&mut self) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
         AsyncWorker::drain_blocking(self)
     }
 }
@@ -879,12 +869,7 @@ impl RefreshStrategy for SyncRefresh<'_> {
         score.last_score = smooth_score(score.last_score, new_score, self.score_ema_alpha);
 
         if self.enable_auto_learn
-            && should_admit_auto_learn(
-                score.last_score,
-                fm,
-                consecutive_speech_ms,
-                &self.gate_cfg,
-            )
+            && should_admit_auto_learn(score.last_score, fm, consecutive_speech_ms, &self.gate_cfg)
         {
             let admitted = self.pool.adapt(embedding);
             let kind = if admitted {
@@ -946,7 +931,6 @@ impl ScopedRefreshChannel {
             refresh_frame_indices: VecDeque::new(),
         }
     }
-
 }
 
 impl RefreshChannel for ScopedRefreshChannel {
@@ -961,9 +945,7 @@ impl RefreshChannel for ScopedRefreshChannel {
         }
     }
 
-    fn try_recv_result(
-        &mut self,
-    ) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
+    fn try_recv_result(&mut self) -> Result<Option<(usize, Vec<f32>, f32)>, EmbeddingError> {
         if self.outstanding == 0 {
             return Ok(None);
         }
@@ -986,9 +968,7 @@ impl RefreshChannel for ScopedRefreshChannel {
         }
     }
 
-    fn drain_blocking(
-        &mut self,
-    ) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
+    fn drain_blocking(&mut self) -> Result<Vec<(usize, Vec<f32>, f32)>, EmbeddingError> {
         let mut results = Vec::new();
         while self.outstanding > 0 {
             let msg = self
@@ -1424,9 +1404,7 @@ impl StreamingState {
             && self.new_speech_samples_after_silence
                 >= pipeline_cfg.sv_min_new_samples_after_silence;
         let due_turn = turn_decision.entered_shrunk;
-        if (due_normal || due_early || due_turn)
-            && self.speech_buffer.len() >= refresh_window
-        {
+        if (due_normal || due_early || due_turn) && self.speech_buffer.len() >= refresh_window {
             self.samples_since_update = 0;
             self.silence_seen_since_refresh = false;
             self.new_speech_samples_after_silence = 0;
