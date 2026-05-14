@@ -102,8 +102,7 @@ use crate::enrollment::EmbeddingPool;
 use crate::f0::{estimate_f0_track, f0_statistics, DEFAULT_F_MAX, DEFAULT_F_MIN};
 use crate::features::{Fbank, N_MELS};
 use crate::gating::{
-    as_norm_score, cos_sim_max_iter, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig,
-    GateState,
+    as_norm_score, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig, GateState,
 };
 use crate::pipeline::{
     apply_refresh_result, fbank_ecapa_one, smooth_score, AutoLearnEvent, AutoLearnKind,
@@ -732,13 +731,7 @@ impl StreamingState {
             );
             let (f0_mu, _) = f0_statistics(&f0_track);
 
-            let cs = cos_sim_max_iter(
-                &embedding,
-                pool.anchors()
-                    .iter()
-                    .chain(pool.auto_learn().iter())
-                    .map(Vec::as_slice),
-            );
+            let cs = pool.match_score(&embedding);
             let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
             self.last_cs = cs;
             self.last_fm = fm;
