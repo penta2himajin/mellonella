@@ -15,6 +15,8 @@ Inputs
 * simultaneous mix sweep    = target+other at +9, 0 dB      (case B)
 * varying-SNR segmented     = contiguous target segments at the
                               VARY_SNR_SCHEDULE_DB schedule    (case D)
+* speaker-turn alternation  = other / target segments per
+                              SPEAKER_TURN_PATTERN             (case E)
 
 Per measurement key we record the metrics that apply:
 
@@ -43,6 +45,19 @@ Per measurement key we record the metrics that apply:
                             expected to move — the stationary cases above
                             are too steady to show those gains.
 
+    speaker_turn (case E — alternating speakers; exercises #119)
+        tpr               — gate-on rate during target segments
+        fpr               — gate-on rate during other-speaker segments
+        gate_transitions  — ON<->OFF flips in the per-frame gate
+        onset_latency_ms  — mean ms from an other->target turn to the
+                            gate switching ON
+        offset_latency_ms — mean ms from a target->other turn to the
+                            gate switching OFF — onset / offset latency
+                            is the metric the decision-cadence work
+                            (#119) would move, and the read on whether
+                            the 500 ms ECAPA refresh hop is a real
+                            bottleneck.
+
 Tolerances (worse-side only; improvements are ignored):
 
     TPR              :  current >= baseline * 0.95        (relative -5%)
@@ -51,6 +66,7 @@ Tolerances (worse-side only; improvements are ignored):
     SI-SDR           :  current >= baseline - 1.0 dB      (absolute, dB)
     other_rms_db     :  current <= baseline + 3.0 dB      (absolute, dB up = worse)
     gate_transitions :  current <= baseline + 4           (absolute, more = worse)
+    latency_ms       :  current <= baseline + 100 ms      (absolute, more = worse)
 
 A measurement key absent from the baseline (a newly added scenario or
 metric) is reported as a note, not a failure — refresh the baseline
@@ -113,6 +129,21 @@ OTHER_RMS_ABS_TOL_DB = 3.0  # output_rms_db growing by > 3 dB = mute weakening
 # "chatter" measure (lower = steadier). Allowed to grow by this many
 # flips before it counts as a regression.
 GATE_TRANSITIONS_ABS_TOL = 4
+# `speaker_turn` case (case E): alternating other / target segments —
+# the speaker-turn test the stationary + vary_snr cases all lack.
+# onset_latency_ms / offset_latency_ms (ms from a turn boundary to the
+# gate switching) are the metrics the decision-cadence work (#119)
+# would move; measuring them on the current code also answers whether
+# the 500 ms ECAPA refresh hop is actually a bottleneck.
+SPEAKER_TURN_PATTERN: tuple[bool, ...] = (False, True, False, True, False, True)
+SPEAKER_TURN_SEG_SEC = 2.5
+SPEAKER_TURN_SNR_DB = 12.0
+# VAD decision frame: 512 samples @ 16 kHz = 32 ms — the rate the
+# `gate_per_frame` diagnostics are reported at.
+DECISION_FRAME_SAMPLES = 512
+# onset / offset latency may grow by this many ms before it counts as
+# a regression.
+LATENCY_ABS_TOL_MS = 100.0
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -214,6 +245,45 @@ def _mix_vary_snr(
     return np.concatenate(out).astype(np.float32)
 
 
+def _build_speaker_turn(
+    target: np.ndarray,
+    other: np.ndarray,
+    noise: np.ndarray,
+) -> tuple[np.ndarray, list[tuple[bool, int, int]]]:
+    """Concatenate alternating other / target segments per
+    ``SPEAKER_TURN_PATTERN``, each a consecutive slice of its source
+    mixed with white noise at ``SPEAKER_TURN_SNR_DB``.
+
+    Returns the mixture and the segment layout
+    ``[(is_target, start_sample, end_sample), ...]`` so the latency
+    metric knows where the turn boundaries are. A slice that runs past
+    the end of its source is zero-padded; an all-silence segment
+    degrades to pure noise rather than raising on zero speech energy.
+    """
+    seg_len = int(SPEAKER_TURN_SEG_SEC * SAMPLE_RATE)
+    out: list[np.ndarray] = []
+    segments: list[tuple[bool, int, int]] = []
+    cursors = {True: 0, False: 0}
+    pos = 0
+    for is_target in SPEAKER_TURN_PATTERN:
+        src = target if is_target else other
+        cur = cursors[is_target]
+        seg = src[cur : cur + seg_len]
+        if seg.size < seg_len:
+            seg = np.concatenate(
+                [seg, np.zeros(seg_len - seg.size, dtype=np.float32)]
+            )
+        cursors[is_target] = cur + seg_len
+        noise_seg = noise[pos : pos + seg_len]
+        if float(np.mean(seg.astype(np.float64) ** 2)) <= 0.0:
+            out.append(noise_seg.astype(np.float32))
+        else:
+            out.append(_mix_at_snr(seg, noise_seg, SPEAKER_TURN_SNR_DB))
+        segments.append((is_target, pos, pos + seg_len))
+        pos += seg_len
+    return np.concatenate(out).astype(np.float32), segments
+
+
 def _gate_on_rate(gate_per_frame: np.ndarray) -> float:
     if gate_per_frame.size == 0:
         return 0.0
@@ -227,6 +297,51 @@ def _gate_transitions(gate_per_frame: np.ndarray) -> int:
     if gate_per_frame.size < 2:
         return 0
     return int(np.sum(gate_per_frame[1:] != gate_per_frame[:-1]))
+
+
+def _speaker_turn_target_mask(
+    segments: list[tuple[bool, int, int]], n_frames: int
+) -> np.ndarray:
+    """Per-frame boolean mask — `True` where the frame falls inside a
+    target segment. Frame `f` covers samples `[f*512, (f+1)*512)`."""
+    mask = np.zeros(n_frames, dtype=bool)
+    for is_target, start, end in segments:
+        if not is_target:
+            continue
+        fb = start // DECISION_FRAME_SAMPLES
+        fe = min(end // DECISION_FRAME_SAMPLES, n_frames)
+        mask[fb:fe] = True
+    return mask
+
+
+def _speaker_turn_latencies(
+    gate_per_frame: np.ndarray,
+    segments: list[tuple[bool, int, int]],
+) -> tuple[list[float], list[float]]:
+    """Latency (ms) from each speaker-turn boundary to the gate
+    reaching the expected state. other->target boundaries yield onset
+    latencies; target->other boundaries yield offset latencies. A gate
+    that never switches within the new segment is charged the full
+    segment duration. This is the metric the decision-cadence work
+    (#119) is meant to move."""
+    frame_ms = 1000.0 * DECISION_FRAME_SAMPLES / SAMPLE_RATE
+    n_frames = gate_per_frame.size
+    onset: list[float] = []
+    offset: list[float] = []
+    for prev, cur in zip(segments, segments[1:]):
+        prev_target = prev[0]
+        cur_target, start, end = cur
+        if prev_target == cur_target:
+            continue  # not a turn
+        b = start // DECISION_FRAME_SAMPLES
+        e = min(end // DECISION_FRAME_SAMPLES, n_frames)
+        latency = (e - b) * frame_ms  # default: gate never switched
+        for f in range(b, e):
+            if bool(gate_per_frame[f]) == cur_target:
+                latency = (f - b) * frame_ms
+                break
+        (onset if cur_target else offset).append(latency)
+    return onset, offset
 
 
 def _rms_db(audio: np.ndarray) -> float:
@@ -453,6 +568,31 @@ def measure(
         "gate_transitions": _gate_transitions(vary_gate),
     }
 
+    # --- Case E: speaker-turn latency (exercises #119) -----------------------
+    # Alternating other / target segments. onset_latency_ms /
+    # offset_latency_ms measure how fast the gate follows a speaker
+    # turn — the metric the decision-cadence work (#119) would move,
+    # and the read on whether the 500 ms ECAPA refresh hop is a real
+    # bottleneck. The stationary + vary_snr cases have no turns at all.
+    turn_noise = rng.standard_normal(
+        len(SPEAKER_TURN_PATTERN) * int(SPEAKER_TURN_SEG_SEC * SAMPLE_RATE)
+    ).astype(np.float32)
+    turn_mix, turn_segments = _build_speaker_turn(target_test, other_audio, turn_noise)
+    turn_gate, _, _ = run(turn_mix)
+    turn_target_mask = _speaker_turn_target_mask(turn_segments, turn_gate.size)
+    turn_tpr = float(turn_gate[turn_target_mask].mean()) if turn_target_mask.any() else 0.0
+    turn_fpr = (
+        float(turn_gate[~turn_target_mask].mean()) if (~turn_target_mask).any() else 0.0
+    )
+    onsets, offsets = _speaker_turn_latencies(turn_gate, turn_segments)
+    metrics["speaker_turn"] = {
+        "tpr": round(turn_tpr, 4),
+        "fpr": round(turn_fpr, 4),
+        "gate_transitions": _gate_transitions(turn_gate),
+        "onset_latency_ms": round(float(np.mean(onsets)) if onsets else 0.0, 1),
+        "offset_latency_ms": round(float(np.mean(offsets)) if offsets else 0.0, 1),
+    }
+
     return metrics
 
 
@@ -512,6 +652,17 @@ def _check_metric_pair(
             f"{base['gate_transitions']} + {GATE_TRANSITIONS_ABS_TOL} (more gate chatter)"
         )
 
+    for lat_key in ("onset_latency_ms", "offset_latency_ms"):
+        if (
+            lat_key in cur
+            and lat_key in base
+            and cur[lat_key] > base[lat_key] + LATENCY_ABS_TOL_MS
+        ):
+            failures.append(
+                f"{key} {lat_key} regressed: {cur[lat_key]:.1f} ms > "
+                f"{base[lat_key]:.1f} ms + {LATENCY_ABS_TOL_MS} ms"
+            )
+
 
 def _check_against_baseline(
     current: dict[str, dict[str, float]],
@@ -546,6 +697,9 @@ def _config_payload(engine: str, use_as_norm: bool) -> dict[str, object]:
         "snrs_db": list(SNRS_DB),
         "sim4_ratios_db": list(SIM4_RATIOS_DB),
         "vary_snr_schedule_db": list(VARY_SNR_SCHEDULE_DB),
+        "speaker_turn_pattern": [bool(t) for t in SPEAKER_TURN_PATTERN],
+        "speaker_turn_seg_sec": SPEAKER_TURN_SEG_SEC,
+        "speaker_turn_snr_db": SPEAKER_TURN_SNR_DB,
         "seed": SEED,
     }
     if engine == "python":
@@ -609,7 +763,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[ci-accuracy] engine={args.engine}; running mini scenario_1 at "
         f"{SAMPLE_RATE} Hz, SNRs={SNRS_DB} dB; sim4 ratios={SIM4_RATIOS_DB} dB; "
-        f"vary_snr schedule={VARY_SNR_SCHEDULE_DB} dB"
+        f"vary_snr schedule={VARY_SNR_SCHEDULE_DB} dB; "
+        f"speaker_turn pattern={SPEAKER_TURN_PATTERN}"
         + (f"; AS-Norm cohort={args.as_norm_cohort}" if use_as_norm else "")
     )
     metrics = measure(as_norm_cohort=args.as_norm_cohort, engine=args.engine)
@@ -629,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
                 "si_sdr_absolute_db": SI_SDR_ABS_TOL_DB,
                 "other_rms_absolute_db": OTHER_RMS_ABS_TOL_DB,
                 "gate_transitions_absolute": GATE_TRANSITIONS_ABS_TOL,
+                "latency_absolute_ms": LATENCY_ABS_TOL_MS,
             },
             "metrics": metrics,
         }

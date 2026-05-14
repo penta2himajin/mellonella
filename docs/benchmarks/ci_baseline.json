@@ -20,6 +20,16 @@
       14.0,
       5.0
     ],
+    "speaker_turn_pattern": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      true
+    ],
+    "speaker_turn_seg_sec": 2.5,
+    "speaker_turn_snr_db": 12.0,
     "seed": 0,
     "theta_pass": 0.3,
     "theta_learn": 0.8,
@@ -32,7 +42,8 @@
     "fpr_absolute_floor_when_zero": 0.05,
     "si_sdr_absolute_db": 1.0,
     "other_rms_absolute_db": 3.0,
-    "gate_transitions_absolute": 4
+    "gate_transitions_absolute": 4,
+    "latency_absolute_ms": 100.0
   },
   "metrics": {
     "snr_5_db": {
@@ -70,6 +81,13 @@
       "tpr": 0.2857,
       "si_sdr_db": -3.47,
       "gate_transitions": 4
+    },
+    "speaker_turn": {
+      "tpr": 0.4658,
+      "fpr": 0.1496,
+      "gate_transitions": 5,
+      "onset_latency_ms": 1322.7,
+      "offset_latency_ms": 560.0
     }
   }
 }
