@@ -705,3 +705,164 @@ F3. Hand-rolled polyphase to match scipy `resample_poly` byte-for-byte.
 - handoff issue #66 (Phase 3: Rust port — desktop CLI 先行)
 - Phase 3 step PRs #65, #67-#86 (16 step PRs covering export →
   workspace → port → integration → CLI)
+
+## D-012: ECAPA encoder/pooler split does not enable streaming-cadence decoupling
+
+### Context
+
+Issue #119 (within the speaker-verification-score-stabilisation
+workstream, handoff issue #130) proposed splitting the ECAPA-TDNN
+embedding graph at the attentive-pooling boundary so a streaming
+caller could run the *heavy, time-invariant* conv front-end (encoder)
+at a coarse cadence and the *cheap, time-pooling* head (pooler) at a
+finer one — cutting speaker-turn onset/offset latency without paying
+the full ECAPA cost on every refresh. The plan had three stages:
+
+1. **Stage 1** (PR #129, merged): export-side split — `export --mode
+   encoder|pooler` + `verify-split`. Confirmed `pooler(encoder(x))`
+   reproduces the monolithic graph (cosine max|Δ| = 2.1 × 10⁻⁷).
+2. **Stage 2**: Rust `EcapaTdnn` gains a split backend
+   (`encode_features` / `pool_frame_features`).
+3. **Stage 3**: a frame-feature ring buffer in the streaming engine,
+   with a "twofold sliding window" to discard receptive-field-invalid
+   edge frames, so the encoder runs incrementally and the pooler runs
+   at a finer "decision hop".
+
+Stage 3's design rests on the premise that the encoder front-end has a
+**bounded** receptive field — that an incremental encode over a
+sub-window produces *valid interior frames* once the conv context is
+covered. This entry records that the premise is false and the
+streaming-cadence half of #119 cannot be built as designed.
+
+### Alternatives considered
+
+**A. Frame-feature ring + incremental encoder ("twofold sliding
+window", #119 Stage 3 as originally specified).** Run the encoder on
+overlapping fbank windows, keep the receptive-field-valid interior
+frames in a ring, pool the ring at a finer cadence.
+
+**B. Cache one full encode, re-pool sub-ranges.** Run the encoder once
+per coarse hop, run the pooler often over sub-ranges of the cached
+frame-feature map.
+
+**C. Finer full re-encode.** Drop the ring/incremental idea; just run
+the full monolithic ECAPA more often (smaller `sv_update_samples`),
+and/or shrink `sv_window_samples`.
+
+**D. Re-scope #119: land the Stage 2 split backend as a refactor, do
+not build the streaming-cadence path; treat speaker-turn latency as a
+separate problem.**
+
+### Investigation (the measurements that decided this)
+
+**The encoder receptive field is effectively global.** The
+SpeechBrain ECAPA encoder half includes SE (Squeeze-Excitation) blocks
+and `mean_var_norm`, both of which compute statistics over the *entire*
+time axis. Empirically, on the exported `ecapa_encoder.onnx`:
+
+- A single-frame perturbation propagates across the *whole* output
+  (far-edge effect ≈ 0.67 × the reference magnitude).
+- A sub-window encode vs. a full-window encode differs in the
+  "interior" by mean 0.31 / max 1.0, against a reference magnitude of
+  0.13 — i.e. **there are no valid interior frames**.
+
+So Alternative A cannot produce faithful frame features: the SE / norm
+global statistics change with the window. Alternative B is a no-op for
+latency — the cached frame features are static between encoder runs,
+so re-pooling them yields the same embedding. And the pooler is not
+cheap enough for B to be worthwhile anyway (per 1 s window: encoder
+36 ms, pooler 23 ms, monolithic 58 ms).
+
+**Latency is coupled to window length and refresh granularity — and
+tightening either trades steady-state accuracy.** Running the
+`speaker_turn` scenario (`ci_accuracy.py --engine rust`, the case
+built to answer "is the 500 ms refresh hop the bottleneck"):
+
+| config (`sv_update` / `sv_window`) | onset ms | offset ms | side effect |
+|---|---|---|---|
+| 8000 / 16000 (baseline) | 970.7 | 1088.0 | — |
+| 2000 / 16000 (finer refresh) | 714.7 | 832.0 | snr_5 TPR 0.75 → 0.70 |
+| 2000 / 8000 (finer + shorter window) | 501.3 | 768.0 | snr_5/10/sim4_0 TPR regress badly; FPR 0 → 0.05 |
+
+The refresh hop *is* a real contributor (~256 ms), but the bulk of the
+latency is the 1 s embedding window still being full of the previous
+speaker after a turn. Both levers (`sv_update_samples`,
+`sv_window_samples`) are already `PipelineConfig` knobs, and tightening
+them regresses the steady-state low-SNR / FPR cases. The split does not
+break this coupling — #119 implicitly assumed the cost of a finer
+cadence was *compute*, but the binding cost is *accuracy*.
+
+### Chosen: D (re-scope #119)
+
+- **Stage 2 lands as a refactor.** `EcapaTdnn` keeps the monolithic
+  backend byte-unchanged and gains a split (`encoder` + `pooler`)
+  backend; `from_split_onnx_paths` / `encode_features` /
+  `pool_frame_features` / `supports_split`. It mirrors the merged
+  export-side Stage 1, is parity-verified (the Rust `split_encoder_
+  pooler_matches_monolithic` test), and is a harmless, self-contained
+  building block — but it provides **no streaming-cadence lever** and
+  is currently unused by the pipeline.
+- **Stage 3 is not built.** The frame-feature ring / twofold sliding
+  window cannot be made correct for this encoder.
+- **Speaker-turn latency is re-scoped to a separate investigation.**
+  The only approach that breaks the accuracy/latency coupling is
+  *adaptive* — detect a speaker turn (e.g. a sharp score/embedding
+  drop) and then adaptively shrink the window / force a refresh, so
+  the steady-state cases keep the long window. Tracked as a new
+  issue.
+
+### Reasons
+
+- **Correctness over a latency number.** An incremental encoder that
+  silently computes SE / norm statistics over the wrong window would
+  degrade every embedding — worse than the latency it set out to fix,
+  and invisible without per-frame parity checks.
+- **The lever already exists and is honest about its cost.**
+  `sv_update_samples` / `sv_window_samples` already expose the
+  latency/accuracy trade; the measurements above quantify it. There is
+  no free win hiding behind the graph split.
+- **Stage 2 is cheap to keep and cheap to revert.** It is additive,
+  parity-tested, and matches Stage 1 — leaving it in costs nothing and
+  keeps the encoder/pooler ONNX path available for future
+  adaptive-window or model-surgery work.
+
+### Trade-offs
+
+- **Stage 2 ships unused.** The split backend has no caller in the
+  pipeline today. Accepted: it is small, tested, and consistent with
+  the already-merged export-side Stage 1; reverting it later is
+  trivial if it never finds a use.
+- **Speaker-turn latency is unchanged by this work.** The baseline
+  onset 970.7 ms / offset 1088.0 ms stands. The re-scoped
+  adaptive-window investigation, not this PR, is where that moves.
+- **`pipeline_parity` was found broken, pre-existing.** During
+  verification the `pipeline_parity` integration test fails
+  (`rust=63 vs python=62` frames) — the `pipeline_input.bin` fixture
+  is exactly 32000 samples (62.5 VAD frames); the Rust streaming
+  engine's `flush()` zero-pads the trailing half-frame into a 63rd
+  frame while `scripts/dump_pipeline_fixture.py` drops it. It
+  reproduces on the pre-Stage-2 commit, so it is unrelated to D-012,
+  but it means the Rust↔Python pipeline parity gate is currently only
+  "green" because CI's `rust.yml` never sets the ONNX env vars and the
+  test early-skips. Tracked for follow-up.
+
+### Future revisit triggers
+
+- **Model surgery makes the encoder genuinely streamable.** Freezing
+  `mean_var_norm` to fixed stats and replacing the SE blocks' global
+  temporal pooling with a causal / cumulative variant would give the
+  encoder a bounded receptive field — at the cost of numeric
+  divergence from the reference and an accuracy re-validation. If
+  live-path (async) speaker-turn latency becomes a priority, this is
+  the path that resurrects #119's intent.
+- **An adaptive-window / turn-detection design lands.** That work may
+  consume the Stage 2 split backend (e.g. a cheap pooler-only re-score
+  on a shrunk window once a turn is suspected).
+
+### References
+
+- handoff issue #130 (speaker-verification-score-stabilisation
+  workstream, §1 = #119)
+- #119 (decision-cadence split), PR #129 (Stage 1, merged)
+- D-011 (Rust port — the `EcapaTdnn` / `PipelineConfig` surfaces this
+  builds on)
