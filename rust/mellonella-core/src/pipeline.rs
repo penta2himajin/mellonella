@@ -62,8 +62,7 @@ pub struct PipelineConfig {
     /// to the speech buffer. Default 0.5.
     pub vad_threshold: f32,
     /// Master switch for auto-learn admission. When false, candidates
-    /// are never admitted into the FIFO and `maybe_reset` is never
-    /// invoked.
+    /// are never folded into the pool's λ-residual adapted embedding.
     pub enable_auto_learn: bool,
     /// Minimum new-speech samples accumulated after a speech→silence
     /// transition before an *early* (cadence-skipping) ECAPA refresh
@@ -220,14 +219,11 @@ pub struct AutoLearnEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoLearnKind {
     /// Candidate cleared every gate AND the pool's anchor-distance check
-    /// — added to the auto-learn FIFO.
+    /// — folded into the λ-residual adapted embedding (#118).
     Admit,
     /// Candidate cleared rule-based gates but the pool refused it via
     /// `can_auto_learn`.
     RejectAnchorDistance,
-    /// `EmbeddingPool::maybe_reset` cleared the auto-learn FIFO due to
-    /// drift.
-    Reset,
 }
 
 /// EMA smoothing for `last_score`: `alpha * new + (1 - alpha) * old`,
@@ -416,9 +412,9 @@ fn apply_envelope_dual_rate(
 /// Run the offline gating pipeline on a 16 kHz mono buffer.
 ///
 /// `pool` is mutated in place: anchors stay untouched, but the
-/// `auto_learn` FIFO and `metadata` may grow / drop entries during the
-/// run depending on `pipeline_cfg.enable_auto_learn` and the pool's
-/// `maybe_reset` outcome.
+/// λ-residual adapted embedding may be updated during the run when
+/// `pipeline_cfg.enable_auto_learn` is set and a refresh clears the
+/// auto-learn gates.
 ///
 /// # Errors
 /// * [`PipelineError::Embedding`] when ECAPA / VAD inference fails
@@ -844,7 +840,7 @@ pub(crate) fn apply_refresh_result(
     if enable_auto_learn
         && should_admit_auto_learn(*last_score, fm, consecutive_speech_ms, gate_cfg)
     {
-        let admitted = pool.add_auto_learn(embedding);
+        let admitted = pool.adapt(embedding);
         let kind = if admitted {
             AutoLearnKind::Admit
         } else {
@@ -856,14 +852,6 @@ pub(crate) fn apply_refresh_result(
             score: *last_score,
             f0_match: fm,
         });
-        if admitted && pool.maybe_reset() {
-            auto_learn_events.push(AutoLearnEvent {
-                frame_idx: trigger_frame,
-                kind: AutoLearnKind::Reset,
-                score: *last_score,
-                f0_match: fm,
-            });
-        }
     }
 }
 
