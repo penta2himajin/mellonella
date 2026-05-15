@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
+from torch import nn
 
-from tse.train import _build_scheduler
+from tse.train import (
+    ExponentialMovingAverage,
+    _build_optimizer,
+    _build_scheduler,
+    _resolve_amp_dtype,
+)
+
+
+def _w(linear: nn.Module) -> torch.Tensor:
+    """Typed accessor for ``Linear.weight`` (mypy treats it as Tensor | Module)."""
+    return cast(nn.Linear, linear).weight
 
 
 def _opt(lr: float = 0.01) -> torch.optim.Optimizer:
@@ -94,3 +107,131 @@ def test_resolve_providers_cuda_strict_raises_when_unavailable(
     monkeypatch.setattr(ort, "get_available_providers", lambda: ["CPUExecutionProvider"])
     with pytest.raises(RuntimeError, match="CUDAExecutionProvider"):
         _resolve_providers("cuda")
+
+
+# ---------------------------------------------------------------------------
+# Optimizer factory
+# ---------------------------------------------------------------------------
+
+
+def _tiny_model() -> nn.Module:
+    return nn.Linear(4, 4)
+
+
+def test_build_optimizer_adam() -> None:
+    opt = _build_optimizer(_tiny_model(), "adam", lr=1e-3, weight_decay=0.0)
+    assert isinstance(opt, torch.optim.Adam)
+    assert not isinstance(opt, torch.optim.AdamW)
+
+
+def test_build_optimizer_adamw_carries_weight_decay() -> None:
+    opt = _build_optimizer(_tiny_model(), "adamw", lr=1e-3, weight_decay=0.05)
+    assert isinstance(opt, torch.optim.AdamW)
+    assert opt.param_groups[0]["weight_decay"] == pytest.approx(0.05)
+
+
+def test_build_optimizer_unknown_raises() -> None:
+    with pytest.raises(ValueError, match="unknown optimizer"):
+        _build_optimizer(_tiny_model(), "lion", lr=1e-3, weight_decay=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Warmup scheduler
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_warmup_then_cosine_ramps_up_then_anneals() -> None:
+    opt = _opt(lr=0.01)
+    sched = _build_scheduler(opt, "cosine", epochs=10, warmup_epochs=3, min_lr_ratio=0.01)
+    assert sched is not None
+    # Warmup starts at lr * start_factor (0.01)
+    assert opt.param_groups[0]["lr"] == pytest.approx(0.01 * 0.01)
+    # After warmup (3 steps), LR should be back at the peak.
+    for _ in range(3):
+        sched.step()
+    assert opt.param_groups[0]["lr"] == pytest.approx(0.01)
+    # Then anneal — final LR should approach eta_min.
+    for _ in range(7):
+        sched.step()
+    assert opt.param_groups[0]["lr"] == pytest.approx(0.01 * 0.01, rel=1e-3)
+
+
+def test_scheduler_warmup_only_when_schedule_is_none() -> None:
+    opt = _opt(lr=0.01)
+    sched = _build_scheduler(opt, "none", epochs=10, warmup_epochs=4)
+    assert sched is not None
+    assert isinstance(sched, torch.optim.lr_scheduler.LinearLR)
+
+
+# ---------------------------------------------------------------------------
+# AMP dtype resolver
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_amp_off_returns_none() -> None:
+    assert _resolve_amp_dtype("off", "cuda") is None
+    assert _resolve_amp_dtype("off", "cpu") is None
+
+
+def test_resolve_amp_auto_cuda_fp16() -> None:
+    assert _resolve_amp_dtype("auto", "cuda") is torch.float16
+
+
+def test_resolve_amp_auto_cpu_returns_none() -> None:
+    assert _resolve_amp_dtype("auto", "cpu") is None
+
+
+def test_resolve_amp_on_cpu_bf16() -> None:
+    assert _resolve_amp_dtype("on", "cpu") is torch.bfloat16
+
+
+def test_resolve_amp_on_cuda_fp16() -> None:
+    assert _resolve_amp_dtype("on", "cuda") is torch.float16
+
+
+# ---------------------------------------------------------------------------
+# Exponential moving average
+# ---------------------------------------------------------------------------
+
+
+def test_ema_decay_one_keeps_initial_weights() -> None:
+    model = _tiny_model()
+    initial = _w(model).detach().clone()
+    ema = ExponentialMovingAverage(model, decay=0.999)
+    # Mutate the live model — EMA shadow should barely move at decay=0.999.
+    with torch.no_grad():
+        _w(model).add_(torch.ones_like(_w(model)))
+    ema.update(model)
+    # Shadow shifted by (1 - 0.999) = 0.001 in the direction of the new weights.
+    expected = initial + (1.0 - 0.999) * 1.0
+    assert torch.allclose(ema.shadow["weight"], expected, atol=1e-6)
+
+
+def test_ema_decay_zero_tracks_live_weights() -> None:
+    model = _tiny_model()
+    ema = ExponentialMovingAverage(model, decay=0.0)
+    with torch.no_grad():
+        _w(model).fill_(42.0)
+    ema.update(model)
+    assert torch.allclose(ema.shadow["weight"], _w(model))
+
+
+def test_ema_invalid_decay_raises() -> None:
+    with pytest.raises(ValueError, match="decay"):
+        ExponentialMovingAverage(_tiny_model(), decay=1.0)
+    with pytest.raises(ValueError, match="decay"):
+        ExponentialMovingAverage(_tiny_model(), decay=-0.1)
+
+
+def test_ema_state_dict_roundtrips() -> None:
+    model = _tiny_model()
+    ema = ExponentialMovingAverage(model, decay=0.5)
+    with torch.no_grad():
+        _w(model).fill_(3.0)
+    ema.update(model)
+    saved = ema.state_dict()
+    # Mutate shadow, then restore.
+    with torch.no_grad():
+        ema.shadow["weight"].fill_(0.0)
+    ema.load_state_dict(saved)
+    assert torch.allclose(ema.shadow["weight"], saved["weight"])

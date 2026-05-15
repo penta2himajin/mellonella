@@ -149,36 +149,53 @@ def main() -> int:
     lr = os.environ.get("POC_LR", "1e-3")
     lr_schedule = os.environ.get("POC_LR_SCHEDULE", "none")
     n_pairs = os.environ.get("POC_N_PAIRS", "5000")
-    _run(
-        [
-            sys.executable,
-            "-m",
-            "tse.train",
-            "--config",
-            "poc_16k",
-            "--data-dir",
-            str(data_root),
-            "--embeddings-npz",
-            str(emb_out),
-            "--n-pairs",
-            n_pairs,
-            "--epochs",
-            epochs,
-            "--batch-size",
-            batch,
-            "--lr",
-            lr,
-            "--lr-schedule",
-            lr_schedule,
-            "--device",
-            "cuda",
-            "--num-workers",
-            "2",
-            "--out",
-            str(out_dir),
-        ],
-        cwd=repo_dir / "training",
-    )
+    optimizer = os.environ.get("POC_OPTIMIZER", "adam")
+    weight_decay = os.environ.get("POC_WEIGHT_DECAY", "0.0")
+    warmup_epochs = os.environ.get("POC_WARMUP_EPOCHS", "0")
+    ema_decay = os.environ.get("POC_EMA_DECAY", "0.0")
+    amp = os.environ.get("POC_AMP", "auto")
+    poc_device = os.environ.get("POC_DEVICE", "cuda")
+    num_workers = os.environ.get("POC_NUM_WORKERS", "2")
+    cmd = [
+        sys.executable,
+        "-m",
+        "tse.train",
+        "--config",
+        "poc_16k",
+        "--data-dir",
+        str(data_root),
+        "--embeddings-npz",
+        str(emb_out),
+        "--n-pairs",
+        n_pairs,
+        "--epochs",
+        epochs,
+        "--batch-size",
+        batch,
+        "--lr",
+        lr,
+        "--lr-schedule",
+        lr_schedule,
+        "--warmup-epochs",
+        warmup_epochs,
+        "--optimizer",
+        optimizer,
+        "--weight-decay",
+        weight_decay,
+        "--ema-decay",
+        ema_decay,
+        "--amp",
+        amp,
+        "--device",
+        poc_device,
+        "--num-workers",
+        num_workers,
+        "--out",
+        str(out_dir),
+    ]
+    if os.environ.get("POC_COMPILE", "0") not in ("0", "", "false", "False"):
+        cmd.append("--compile")
+    _run(cmd, cwd=repo_dir / "training")
 
     print(f"[kaggle] done — outputs under {out_dir}", flush=True)
     return 0
