@@ -28,9 +28,11 @@ Env-var overrides (set in the kernel UI under "Settings → Environment"):
 * ``MELLONELLA_REF`` — git ref to clone (default ``main``).
 * ``LIBRISPEECH_DATA``, ``MUSAN_DATA``, ``ECAPA_ONNX`` — override the
   ``/kaggle/input/<slug>/...`` paths.
-* ``POC_EPOCHS``, ``POC_BATCH``, ``POC_N_PAIRS``, ``POC_LR`` —
-  training knobs.
-* ``ENROLL_LIMIT`` — cap on enrollment-embedding utterances.
+* ``POC_EPOCHS``, ``POC_BATCH``, ``POC_N_PAIRS``, ``POC_LR``,
+  ``POC_LR_SCHEDULE`` (``none`` / ``cosine`` / ``step``) — training knobs.
+* ``ENROLL_LIMIT``, ``ENROLL_DEVICE`` (``auto`` / ``cuda`` / ``cpu``) —
+  enrollment-embedding precompute knobs. ``auto`` uses CUDA when
+  ``onnxruntime-gpu`` is available, otherwise CPU.
 
 This file is also locally importable for development (it is just a
 module); the heavy lifting only runs from ``main`` so ``import`` is cheap.
@@ -117,6 +119,7 @@ def main() -> int:
     emb_out = KAGGLE_WORKING / "enroll_embeddings.npz"
     if not emb_out.exists():
         enroll_limit = os.environ.get("ENROLL_LIMIT", "2000")
+        enroll_device = os.environ.get("ENROLL_DEVICE", "auto")
         env = os.environ.copy()
         env["MELLONELLA_ECAPA_ONNX"] = str(ecapa_onnx)
         _run(
@@ -130,6 +133,8 @@ def main() -> int:
                 str(emb_out),
                 "--limit",
                 str(enroll_limit),
+                "--device",
+                enroll_device,
             ],
             cwd=repo_dir / "training",
             env=env,
@@ -142,6 +147,7 @@ def main() -> int:
     epochs = os.environ.get("POC_EPOCHS", "20")
     batch = os.environ.get("POC_BATCH", "16")
     lr = os.environ.get("POC_LR", "1e-3")
+    lr_schedule = os.environ.get("POC_LR_SCHEDULE", "none")
     n_pairs = os.environ.get("POC_N_PAIRS", "5000")
     _run(
         [
@@ -162,6 +168,8 @@ def main() -> int:
             batch,
             "--lr",
             lr,
+            "--lr-schedule",
+            lr_schedule,
             "--device",
             "cuda",
             "--num-workers",

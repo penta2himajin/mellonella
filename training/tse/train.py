@@ -170,6 +170,35 @@ def train_epoch(
     return {"loss": total_loss / max(n, 1), "si_sdr": total_sisdr / max(n, 1)}
 
 
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    schedule: str,
+    epochs: int,
+    *,
+    min_lr_ratio: float = 0.01,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """Build a per-epoch LR scheduler.
+
+    ``schedule`` is one of:
+
+    * ``"none"`` — no scheduling, returns ``None``.
+    * ``"cosine"`` — cosine anneal from ``lr`` to ``lr * min_lr_ratio`` over
+      ``epochs`` steps. Matches the warmup-free standard for short-to-medium
+      training runs.
+    * ``"step"`` — halve the LR every ``max(epochs // 3, 1)`` epochs.
+
+    The scheduler is stepped once per epoch by :func:`run_training`.
+    """
+    if schedule == "none":
+        return None
+    if schedule == "cosine":
+        eta_min = optimizer.param_groups[0]["lr"] * min_lr_ratio
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=eta_min)
+    if schedule == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.5)
+    raise ValueError(f"unknown lr schedule: {schedule!r}")
+
+
 def run_training(
     config: TSEConfig,
     dataset: TSEMixtureDataset,
@@ -178,6 +207,7 @@ def run_training(
     epochs: int = 10,
     batch_size: int = 4,
     lr: float = 1e-3,
+    lr_schedule: str = "none",
     device: str = "cpu",
     resume: bool = False,
     num_workers: int = 0,
@@ -189,6 +219,7 @@ def run_training(
 
     model = CausalConvTasNetTSE(config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = _build_scheduler(optimizer, lr_schedule, epochs)
 
     start_epoch = 0
     global_step = 0
@@ -197,6 +228,10 @@ def run_training(
         if latest is not None:
             start_epoch, global_step = load_checkpoint(latest, model, optimizer)
             print(f"[train] resumed from {latest} (epoch {start_epoch})", file=sys.stderr)
+            if scheduler is not None:
+                # Advance the schedule to match the resumed epoch.
+                for _ in range(start_epoch):
+                    scheduler.step()
 
     loader = DataLoader(
         dataset,
@@ -207,8 +242,8 @@ def run_training(
     )
 
     print(
-        f"[train] params={count_parameters(model):,}  "
-        f"epochs={epochs}  batch={batch_size}  device={device}",
+        f"[train] params={count_parameters(model):,}  epochs={epochs}  "
+        f"batch={batch_size}  lr={lr}  schedule={lr_schedule}  device={device}",
         file=sys.stderr,
     )
     history: list[dict[str, float]] = []
@@ -219,13 +254,16 @@ def run_training(
         elapsed = time.perf_counter() - t0
         stats["epoch"] = float(epoch)
         stats["elapsed_sec"] = elapsed
+        stats["lr"] = float(optimizer.param_groups[0]["lr"])
         history.append(stats)
         print(
             f"[train] epoch {epoch:3d}  loss {stats['loss']:+.4f}  "
-            f"si_sdr {stats['si_sdr']:+.4f} dB  ({elapsed:.1f}s)",
+            f"si_sdr {stats['si_sdr']:+.4f} dB  lr={stats['lr']:.2e}  ({elapsed:.1f}s)",
             file=sys.stderr,
         )
         save_checkpoint(out_dir / f"ckpt_epoch{epoch:04d}.pt", model, optimizer, epoch, global_step)
+        if scheduler is not None:
+            scheduler.step()
 
     metrics = {
         "config": vars(config),
@@ -261,6 +299,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=10, help="full-mode training epochs")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("none", "cosine", "step"),
+        default="none",
+        help="per-epoch LR schedule (cosine anneals to lr*0.01 over `epochs`)",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -352,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_schedule=args.lr_schedule,
         device=args.device,
         resume=args.resume,
         num_workers=args.num_workers,
