@@ -10,7 +10,6 @@ from torch import nn
 
 from tse.train import (
     ExponentialMovingAverage,
-    Lion,
     MuonHybrid,
     _build_optimizer,
     _build_scheduler,
@@ -238,34 +237,6 @@ def test_ema_state_dict_roundtrips() -> None:
         ema.shadow["weight"].fill_(0.0)
     ema.load_state_dict(saved)
     assert torch.allclose(ema.shadow["weight"], saved["weight"])
-
-
-# ---------------------------------------------------------------------------
-# Lion
-# ---------------------------------------------------------------------------
-
-
-def test_lion_step_moves_weights_against_gradient_sign() -> None:
-    p = nn.Parameter(torch.tensor([1.0, -2.0, 0.5]))
-    opt = Lion([p], lr=0.1, betas=(0.9, 0.99), weight_decay=0.0)
-    p.grad = torch.tensor([3.0, -4.0, 0.0])
-    initial = p.detach().clone()
-    opt.step()
-    # On the first step, m=0 so update direction = sign(g). Lion subtracts
-    # lr * sign(g). sign(0) = 0 so the zero-grad element is unchanged.
-    expected = initial - 0.1 * torch.tensor([1.0, -1.0, 0.0])
-    assert torch.allclose(p.detach(), expected, atol=1e-6)
-
-
-def test_lion_invalid_lr_raises() -> None:
-    p = nn.Parameter(torch.zeros(2))
-    with pytest.raises(ValueError, match="lr"):
-        Lion([p], lr=0.0)
-
-
-def test_build_optimizer_lion() -> None:
-    opt = _build_optimizer(_tiny_model(), "lion", lr=1e-4, weight_decay=0.1)
-    assert isinstance(opt, Lion)
 
 
 # ---------------------------------------------------------------------------

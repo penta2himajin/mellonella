@@ -305,62 +305,6 @@ def _build_scheduler(
     )
 
 
-class Lion(torch.optim.Optimizer):
-    """Lion optimizer (Chen et al. 2023, "Symbolic Discovery of Optimization Algorithms").
-
-    Drop-in replacement for AdamW that keeps only the first moment and uses
-    the *sign* of the interpolated momentum-gradient as the update. Memory
-    is roughly halved vs Adam (no second moment) and the per-step cost is
-    slightly lower.
-
-    Tuning recipe (vs AdamW):
-
-    * ``lr`` should be **3-10× smaller** than the AdamW LR (the ±1 sign
-      output is unscaled by gradient magnitude).
-    * ``weight_decay`` should be **3-10× larger** to keep the same effective
-      regularisation strength.
-    * Default betas ``(0.9, 0.99)`` match the paper.
-
-    Untested for Conv-TasNet TSE — treat as an experiment vs the AdamW
-    baseline rather than a guaranteed win.
-    """
-
-    def __init__(
-        self,
-        params,  # noqa: ANN001 - torch.optim convention
-        lr: float = 1e-4,
-        betas: tuple[float, float] = (0.9, 0.99),
-        weight_decay: float = 0.0,
-    ) -> None:
-        if lr <= 0.0:
-            raise ValueError(f"Lion lr must be > 0, got {lr}")
-        if weight_decay < 0.0:
-            raise ValueError(f"Lion weight_decay must be >= 0, got {weight_decay}")
-        defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay}
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):  # type: ignore[override]  # noqa: ANN001, ANN201
-        loss = closure() if closure is not None else None
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            wd = group["weight_decay"]
-            lr = group["lr"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                if not state:
-                    state["exp_avg"] = torch.zeros_like(p)
-                m = state["exp_avg"]
-                if wd != 0.0:
-                    p.mul_(1.0 - lr * wd)
-                update = (m.mul(beta1).add(p.grad, alpha=1.0 - beta1)).sign_()
-                p.add_(update, alpha=-lr)
-                m.mul_(beta2).add_(p.grad, alpha=1.0 - beta2)
-        return loss
-
-
 def _newton_schulz_orthogonalize(
     g: torch.Tensor, *, steps: int = 5, eps: float = 1e-7
 ) -> torch.Tensor:
@@ -534,10 +478,9 @@ def _build_optimizer(
     """Construct the optimizer by name.
 
     Supported: ``adam`` | ``adamw`` | ``adamw-fused`` (CUDA fused kernels;
-    falls back to non-fused on CPU) | ``lion`` (experimental) | ``muon``
-    (experimental hybrid; uses ``lr`` for the Muon group and a fixed
-    ``adamw_lr = lr / 20`` for the 1-D / depthwise AdamW group, mirroring
-    the Muon paper's recipe).
+    falls back to non-fused on CPU) | ``muon`` (experimental hybrid; uses
+    ``lr`` for the Muon group and a fixed ``adamw_lr = lr / 20`` for the
+    1-D / depthwise AdamW group, mirroring the Muon paper's recipe).
     """
     if name == "adam":
         return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -548,8 +491,6 @@ def _build_optimizer(
         return torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay, fused=on_cuda
         )
-    if name == "lion":
-        return Lion(model.parameters(), lr=lr, weight_decay=weight_decay)
     if name == "muon":
         return MuonHybrid(model, lr=lr, adamw_lr=lr / 20.0, weight_decay=weight_decay)
     raise ValueError(f"unknown optimizer: {name!r}")
@@ -745,13 +686,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--optimizer",
-        choices=("adam", "adamw", "adamw-fused", "lion", "muon"),
+        choices=("adam", "adamw", "adamw-fused", "muon"),
         default="adam",
         help=(
             "adamw: decoupled WD; adamw-fused: CUDA-fused kernels; "
-            "lion: sign-momentum, use lr~1/5 of adamw + wd~5x larger; "
             "muon: experimental hybrid (Muon for 2D weights + AdamW elsewhere). "
-            "lion / muon untested for TSE — experimental."
+            "muon untested for TSE — experimental."
         ),
     )
     parser.add_argument(
