@@ -267,6 +267,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="root of LibriSpeech/MUSAN data (full mode). Omit to use the synthetic fixture set.",
     )
+    parser.add_argument(
+        "--embeddings-npz",
+        type=Path,
+        default=None,
+        help=(
+            "path to the .npz of frozen ECAPA enrollment embeddings produced "
+            "by tse.prepare_enrollment_embeddings. Required for real training. "
+            "Without it, librispeech_musan_sources falls back to a deterministic "
+            "per-speaker placeholder vector (plumbing-only)."
+        ),
+    )
+    parser.add_argument(
+        "--n-pairs",
+        type=int,
+        default=None,
+        help="cap the number of (target, interferer) source items built from --data-dir",
+    )
     parser.add_argument("--out", type=Path, default=Path("build/tse"), help="output directory")
     parser.add_argument("--resume", action="store_true", help="resume from latest checkpoint")
     parser.add_argument("--device", default="cpu")
@@ -303,9 +320,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.data_dir is not None:
         from .data import librispeech_musan_sources
 
-        sources = librispeech_musan_sources(args.data_dir, sample_rate=config.sample_rate)
+        sources = librispeech_musan_sources(
+            args.data_dir,
+            sample_rate=config.sample_rate,
+            embeddings_npz=args.embeddings_npz,
+            n_pairs=args.n_pairs,
+            seed=args.seed,
+        )
+        print(f"[train] {len(sources)} source items from {args.data_dir}", file=sys.stderr)
         dataset = TSEMixtureDataset(
-            sources, segment_samples=config.sample_rate, random_crop=True, seed=args.seed
+            sources,
+            sample_rate=config.sample_rate,
+            segment_samples=config.sample_rate,  # 1 s segments
+            random_crop=True,
+            seed=args.seed,
         )
     else:
         print(

@@ -6,12 +6,19 @@ the interferer (and optional noise) at a sampled power ratio and returns
 ``(mixture, cond_embedding, clean_target)`` ready for the training loop.
 
 The dataset deliberately does *not* hard-code where the audio comes from:
-it takes an explicit list of :class:`TSESourceItem`. This lets the smoke /
-overfit tests run with a tiny in-memory synthetic fixture set
-(:func:`synthetic_fixture_dataset`) with **no datasets downloaded**, while
-the real LibriSpeech / LibriMix + MUSAN loading path
-(:func:`librispeech_musan_sources` — currently a documented stub) plugs the
-same :class:`TSESourceItem` list in from disk.
+it takes an explicit list of :class:`TSESourceItem`, whose audio fields may
+be either pre-loaded ``np.ndarray``\\ s (synthetic / smoke fixtures) or
+:class:`pathlib.Path`\\ s loaded lazily on access (real data, so a 6 GB
+LibriSpeech subset never has to live in RAM).
+
+The two paths in:
+
+* :func:`synthetic_fixture_dataset` — tiny in-memory harmonic-stack
+  'voices'. Nothing is downloaded; this is what the smoke and overfit
+  tests run on.
+* :func:`librispeech_musan_sources` — real LibriSpeech + MUSAN from disk,
+  with per-target ECAPA enrollment embeddings looked up from the
+  ``prepare_enrollment_embeddings.py`` ``.npz``.
 
 Mixing reuses the ratio convention from
 ``bench/mellonella_bench/scenarios/scenario_4.py`` (``mix_at_ratio``):
@@ -20,11 +27,16 @@ positive dB == target louder.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import sys
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 from torch.utils.data import Dataset
 
@@ -40,24 +52,26 @@ class TSESourceItem:
     Attributes
     ----------
     target:
-        Clean target-speaker waveform, 1-D float32 array at the dataset rate.
+        Clean target-speaker audio. Either a 1-D ``float32`` array at the
+        dataset rate, or a :class:`~pathlib.Path` to an audio file decoded
+        lazily on access.
     interferer:
-        Competing-speaker waveform, 1-D float32.
+        Competing-speaker audio, same type rules as ``target``.
     cond_embedding:
         Frozen 192-dim ECAPA enrollment embedding for the target speaker,
         1-D float32. In the synthetic fixtures this is just a fixed random
         vector — no ECAPA model is needed.
     noise:
-        Optional background noise waveform, 1-D float32. ``None`` disables
-        the noise term.
+        Optional background noise (array or Path). ``None`` disables the
+        noise term.
     sample_id:
         Human-readable identifier (for logging / debugging).
     """
 
-    target: np.ndarray
-    interferer: np.ndarray
+    target: np.ndarray | Path
+    interferer: np.ndarray | Path
     cond_embedding: np.ndarray
-    noise: np.ndarray | None = None
+    noise: np.ndarray | Path | None = None
     sample_id: str = ""
 
 
@@ -86,6 +100,31 @@ def _fit_length(x: np.ndarray, length: int) -> np.ndarray:
     if x.size >= length:
         return x[:length].astype(np.float32, copy=False)
     return np.concatenate([x, np.zeros(length - x.size, dtype=np.float32)])
+
+
+def _load_audio_field(field: np.ndarray | Path, target_sr: int) -> np.ndarray:
+    """Materialise an audio field to a mono ``float32`` array.
+
+    Arrays are returned as-is (no copy). Paths are decoded with
+    ``soundfile`` and resampled to ``target_sr`` if needed.
+    """
+    if isinstance(field, np.ndarray):
+        return field
+    if not isinstance(field, Path):
+        field = Path(field)
+    audio, sr = sf.read(str(field), dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1).astype(np.float32)
+    if sr != target_sr:
+        # librosa is an optional dep — only required when actually resampling.
+        try:
+            import librosa  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - librosa is in the onnx extra
+            raise RuntimeError(
+                f"{field}: {sr} Hz, need {target_sr} Hz; install librosa to resample"
+            ) from exc
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr).astype(np.float32)
+    return np.ascontiguousarray(audio, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +159,7 @@ class TSEMixtureDataset(Dataset):
         self,
         sources: Sequence[TSESourceItem],
         *,
+        sample_rate: int = 16_000,
         segment_samples: int = 16_000,
         target_interferer_ratio_db: tuple[float, float] = (-5.0, 5.0),
         target_noise_ratio_db: tuple[float, float] = (5.0, 20.0),
@@ -129,6 +169,7 @@ class TSEMixtureDataset(Dataset):
         if len(sources) == 0:
             raise ValueError("TSEMixtureDataset needs at least one source item")
         self.sources = list(sources)
+        self.sample_rate = sample_rate
         self.segment_samples = segment_samples
         self.ti_ratio_db = target_interferer_ratio_db
         self.tn_ratio_db = target_noise_ratio_db
@@ -155,14 +196,17 @@ class TSEMixtureDataset(Dataset):
         src = self.sources[index]
         rng = self._rng(index)
 
-        target = self._crop(np.asarray(src.target, dtype=np.float32), rng)
-        interferer = _fit_length(np.asarray(src.interferer, dtype=np.float32), self.segment_samples)
+        target_raw = _load_audio_field(src.target, self.sample_rate)
+        interferer_raw = _load_audio_field(src.interferer, self.sample_rate)
+        target = self._crop(target_raw.astype(np.float32, copy=False), rng)
+        interferer = _fit_length(interferer_raw, self.segment_samples)
 
         ti_db = float(rng.uniform(*self.ti_ratio_db))
         mixture = target + _scale_to_ratio(target, interferer, ti_db)
 
         if src.noise is not None:
-            noise = _fit_length(np.asarray(src.noise, dtype=np.float32), self.segment_samples)
+            noise_raw = _load_audio_field(src.noise, self.sample_rate)
+            noise = _fit_length(noise_raw, self.segment_samples)
             tn_db = float(rng.uniform(*self.tn_ratio_db))
             mixture = mixture + _scale_to_ratio(target, noise, tn_db)
 
@@ -230,6 +274,7 @@ def synthetic_fixture_dataset(
         )
     return TSEMixtureDataset(
         sources,
+        sample_rate=sample_rate,
         segment_samples=segment_samples or n_samples,
         random_crop=False,
         seed=seed,
@@ -237,45 +282,194 @@ def synthetic_fixture_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Real-data loading path — documented stub (Phase 3)
+# Real-data loading path — LibriSpeech + MUSAN
 # ---------------------------------------------------------------------------
+
+
+def _default_data_dir() -> Path:
+    """Mirror ``bench``'s ``default_data_dir`` without importing bench.
+
+    Honours ``$MELLONELLA_DATA_DIR``; defaults to ``./data`` relative to
+    the current working directory.
+    """
+    raw = os.environ.get("MELLONELLA_DATA_DIR")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.cwd() / "data"
+
+
+def _scan_musan_noise(data_dir: Path, musan_subset: str) -> list[Path]:
+    """Find MUSAN noise ``.wav`` files under standard ``bench`` layouts.
+
+    ``bench/mellonella_bench/datasets/musan.py`` extracts under
+    ``$MELLONELLA_DATA_DIR/musan/extracted/musan/<category>``; it also builds
+    a deterministic ``subset/`` directory. We look in both, plus a flat
+    ``musan/<category>`` layout for ad-hoc setups.
+    """
+    musan_root = data_dir / "musan"
+    candidates = [
+        musan_root / "extracted" / "musan" / musan_subset,
+        musan_root / "subset" / musan_subset,
+        musan_root / musan_subset,
+    ]
+    for c in candidates:
+        if c.is_dir():
+            files = sorted(c.rglob("*.wav"))
+            if files:
+                return files
+    return []
+
+
+def _deterministic_cond(speaker_id: str, cond_dim: int) -> np.ndarray:
+    """Deterministic per-speaker random conditioning vector (no ECAPA needed).
+
+    Used as the fallback when ``embeddings_npz`` is omitted, so the data
+    plumbing can be smoke-tested without the ECAPA ONNX. Seeded from a
+    stable SHA-256 of the speaker id so the same speaker always gets the
+    same vector — distinct speakers get distinct, deterministic vectors.
+    This vector carries **no** speaker-identity information, so a model
+    trained on it cannot actually condition on the target — use a real
+    ``embeddings_npz`` for proper training.
+    """
+    seed = int(hashlib.sha256(speaker_id.encode()).hexdigest()[:8], 16)
+    return np.random.default_rng(seed).standard_normal(cond_dim).astype(np.float32)
 
 
 def librispeech_musan_sources(
     data_dir: Path | None = None,
     *,
     split: str = "train-clean-100",
+    librispeech_root: str = "LibriSpeech",
+    musan_subset: str | None = "noise",
     n_pairs: int | None = None,
     sample_rate: int = 16_000,
     embeddings_npz: Path | None = None,
+    cond_dim: int = 192,
+    seed: int = 0,
 ) -> list[TSESourceItem]:
     """Build :class:`TSESourceItem` bundles from local LibriSpeech + MUSAN.
 
-    **Phase 3 stub.** The structure is wired; the actual disk loading is a
-    TODO. The intended implementation:
+    Layout expected under ``data_dir`` (defaults to ``$MELLONELLA_DATA_DIR``
+    or ``./data``):
 
-    1. ``data_dir`` defaults to ``bench``'s ``default_data_dir()`` (honours
-       ``$MELLONELLA_DATA_DIR``). LibriSpeech ``train-clean-100`` lives under
-       ``data_dir / "librispeech" / split``; MUSAN noise under
-       ``data_dir / "musan"`` (see ``bench/mellonella_bench/datasets/musan.py``
-       for the fetch + subset helpers to reuse).
-    2. Enumerate per-speaker utterances. For each *target* utterance pick a
-       different-speaker *interferer* utterance and (optionally) a MUSAN
-       noise clip — reuse ``bench``'s loaders rather than re-implementing.
-    3. The frozen 192-dim ECAPA enrollment embedding per target utterance is
-       precomputed offline by ``prepare_enrollment_embeddings.py`` into an
-       ``.npz``; ``embeddings_npz`` points at it and we look each one up by
-       utterance id. (No ECAPA model is loaded here.)
-    4. Resample to ``sample_rate`` if needed (LibriSpeech is 16 kHz natively;
-       the 48 kHz production path uses VCTK + DEMAND instead — a config swap,
-       not a code change here).
+    ::
 
-    Until that lands this raises :class:`NotImplementedError` so callers
-    fail loudly rather than silently training on nothing.
+        <data_dir>/<librispeech_root>/<split>/<speaker>/<chapter>/<utt>.flac
+        <data_dir>/musan/...                       # any of the layouts
+                                                   # bench.datasets.musan produces
+
+    For each LibriSpeech utterance the function picks a different-speaker
+    interferer utterance and (when ``musan_subset`` is given and files are
+    found) a random MUSAN noise clip. Audio is **not** loaded here — only
+    paths — so the source list stays small; :class:`TSEMixtureDataset`
+    decodes lazily per access.
+
+    ``embeddings_npz``
+        Path to the ``.npz`` written by
+        :mod:`tse.prepare_enrollment_embeddings`, keyed by utterance id
+        (the LibriSpeech relative path without the ``.flac`` suffix). When
+        provided, only utterances with a precomputed embedding are kept.
+        When omitted, a deterministic per-speaker placeholder is used
+        (plumbing only — carries no speaker information; a model trained
+        on it cannot generalise).
+
+    ``n_pairs``
+        Optional cap on the number of returned items.
+
+    ``sample_rate``
+        Stored on the eventual :class:`TSEMixtureDataset`; LibriSpeech is
+        natively 16 kHz so no resampling is performed at this rate.
     """
-    raise NotImplementedError(
-        "librispeech_musan_sources is a Phase 3 stub — wire LibriSpeech/MUSAN "
-        "loading via bench dataset infra, then look up ECAPA embeddings from "
-        "the prepare_enrollment_embeddings.py .npz. For now use "
-        "synthetic_fixture_dataset() for smoke/overfit."
-    )
+    data_dir = data_dir if data_dir is not None else _default_data_dir()
+    libri_split = data_dir / librispeech_root / split
+    if not libri_split.is_dir():
+        raise FileNotFoundError(f"LibriSpeech split not found: {libri_split}")
+
+    # LibriSpeech filename: <speaker>-<chapter>-<utt>.flac → speaker = stem[:3].
+    by_speaker: dict[str, list[Path]] = {}
+    for flac in libri_split.rglob("*.flac"):
+        speaker_id = flac.stem.split("-", 1)[0]
+        by_speaker.setdefault(speaker_id, []).append(flac)
+    if len(by_speaker) < 2:
+        raise RuntimeError(f"need >= 2 speakers under {libri_split}, found {len(by_speaker)}")
+
+    embeddings: dict[str, np.ndarray] | None = None
+    if embeddings_npz is not None:
+        loaded = np.load(embeddings_npz)
+        embeddings = {k: loaded[k].astype(np.float32) for k in loaded.files}
+        print(
+            f"[data] loaded {len(embeddings)} enrollment embeddings from {embeddings_npz}",
+            file=sys.stderr,
+        )
+    else:
+        warnings.warn(
+            "librispeech_musan_sources called without embeddings_npz — using a "
+            "deterministic per-speaker placeholder vector. This is for plumbing "
+            "tests only; a model trained against it cannot condition on the "
+            "target. Pass embeddings_npz= for real training.",
+            stacklevel=2,
+        )
+
+    noise_files: list[Path] = []
+    if musan_subset is not None:
+        noise_files = _scan_musan_noise(data_dir, musan_subset)
+        if not noise_files:
+            warnings.warn(
+                f"no MUSAN noise files found under {data_dir / 'musan'!s}; "
+                f"training without noise augmentation.",
+                stacklevel=2,
+            )
+
+    rng = np.random.default_rng(seed)
+    speakers = sorted(by_speaker.keys())
+    for s in speakers:
+        by_speaker[s].sort()
+
+    # Flat shuffled (speaker, target_path) list, then pair each with a
+    # different-speaker interferer.
+    all_utts: list[tuple[str, Path]] = [(s, p) for s in speakers for p in by_speaker[s]]
+    rng.shuffle(all_utts)  # numpy default_rng shuffles lists in place
+
+    items: list[TSESourceItem] = []
+    for target_speaker, target_path in all_utts:
+        # Look up cond embedding by utterance id (relative path no suffix).
+        utt_id = target_path.relative_to(libri_split).with_suffix("").as_posix()
+        if embeddings is not None:
+            if utt_id not in embeddings:
+                continue
+            cond = embeddings[utt_id]
+        else:
+            cond = _deterministic_cond(target_speaker, cond_dim)
+
+        # Pick a different-speaker interferer.
+        other_speaker = target_speaker
+        while other_speaker == target_speaker:
+            other_speaker = speakers[int(rng.integers(0, len(speakers)))]
+        interferer_choices = by_speaker[other_speaker]
+        interferer_path = interferer_choices[int(rng.integers(0, len(interferer_choices)))]
+
+        noise_path: Path | None = None
+        if noise_files:
+            noise_path = noise_files[int(rng.integers(0, len(noise_files)))]
+
+        items.append(
+            TSESourceItem(
+                target=target_path,
+                interferer=interferer_path,
+                cond_embedding=cond,
+                noise=noise_path,
+                sample_id=utt_id,
+            )
+        )
+        if n_pairs is not None and len(items) >= n_pairs:
+            break
+
+    if not items:
+        msg = f"no source items built from {libri_split}"
+        if embeddings is not None:
+            msg += " (utterance ids in embeddings_npz did not match any audio file)"
+        raise RuntimeError(msg)
+    # sample_rate is plumbed through for documentation and is consumed by the
+    # downstream TSEMixtureDataset (which does the actual resampling).
+    _ = sample_rate
+    return items
