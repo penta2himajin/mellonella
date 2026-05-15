@@ -1,8 +1,8 @@
 """pytest bootstrap: make the ``tse`` package importable without an install.
 
 The package directory is ``training/tse``; importing it as ``tse`` requires
-``training/`` on ``sys.path``. Adding it here keeps ``pytest training/tse``
-working straight from a fresh checkout.
+``training/`` on ``sys.path``. Adding it here keeps ``pytest training/``
+working straight from a fresh checkout, without an editable install.
 """
 
 from __future__ import annotations

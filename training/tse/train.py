@@ -21,6 +21,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import TypedDict
 
 import torch
 from torch.utils.data import DataLoader
@@ -29,6 +30,16 @@ from .config import TSEConfig
 from .data import TSEMixtureDataset, synthetic_fixture_dataset
 from .loss import neg_si_sdr_loss, si_sdr
 from .model import CausalConvTasNetTSE, count_parameters
+
+
+class OverfitResult(TypedDict):
+    """Return type of :func:`overfit_one_batch`."""
+
+    loss_curve: list[float]
+    start_loss: float
+    end_loss: float
+    final_si_sdr: float
+
 
 # ---------------------------------------------------------------------------
 # Checkpointing
@@ -85,7 +96,7 @@ def overfit_one_batch(
     device: str = "cpu",
     log_every: int = 25,
     seed: int = 0,
-) -> dict[str, float | list[float]]:
+) -> OverfitResult:
     """Overfit a single synthetic mixture for ``steps`` steps.
 
     Returns a dict with the loss curve and start/end SI-SDR — the smoke
@@ -232,7 +243,9 @@ def run_training(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--config",
         choices=("poc_16k", "prod_48k"),
@@ -252,8 +265,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-dir",
         type=Path,
         default=None,
-        help="root of LibriSpeech/MUSAN data (full mode). Omit to use the "
-        "synthetic fixture set.",
+        help="root of LibriSpeech/MUSAN data (full mode). Omit to use the synthetic fixture set.",
     )
     parser.add_argument("--out", type=Path, default=Path("build/tse"), help="output directory")
     parser.add_argument("--resume", action="store_true", help="resume from latest checkpoint")

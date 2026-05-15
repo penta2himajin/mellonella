@@ -67,10 +67,10 @@ collapses, (4) exports to ONNX and round-trips a clip through
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install onnx onnxruntime onnxscript numpy soundfile
-python -m training.tse.smoke          # exits non-zero on any failure
-python -m pytest training/tse/tests/  # unit tests
-ruff check training/tse scripts/export_tse_onnx.py
+pip install -e training[dev,onnx]
+python -m tse.smoke              # exits non-zero on any failure
+pytest training/                 # unit tests
+ruff check training scripts/export_tse_onnx.py
 ```
 
 ## Training
@@ -79,13 +79,13 @@ ruff check training/tse scripts/export_tse_onnx.py
 
 ```bash
 # Local sanity: overfit one synthetic mixture (no data needed).
-python -m training.tse.train --overfit-steps 200 --out build/tse
+python -m tse.train --overfit-steps 200 --out build/tse
 
 # Full training on the synthetic fixture set (scaffold check only).
-python -m training.tse.train --epochs 10 --out build/tse
+python -m tse.train --epochs 10 --out build/tse
 
 # Full training on real data (Phase 3 — see the data.py stub).
-python -m training.tse.train --epochs 100 --data-dir data/ --out build/tse
+python -m tse.train --epochs 100 --data-dir data/ --out build/tse
 ```
 
 It writes per-epoch checkpoints (`ckpt_epoch*.pt`) and a `metrics.json`,
