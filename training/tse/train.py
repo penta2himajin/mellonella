@@ -305,14 +305,253 @@ def _build_scheduler(
     )
 
 
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al. 2023, "Symbolic Discovery of Optimization Algorithms").
+
+    Drop-in replacement for AdamW that keeps only the first moment and uses
+    the *sign* of the interpolated momentum-gradient as the update. Memory
+    is roughly halved vs Adam (no second moment) and the per-step cost is
+    slightly lower.
+
+    Tuning recipe (vs AdamW):
+
+    * ``lr`` should be **3-10× smaller** than the AdamW LR (the ±1 sign
+      output is unscaled by gradient magnitude).
+    * ``weight_decay`` should be **3-10× larger** to keep the same effective
+      regularisation strength.
+    * Default betas ``(0.9, 0.99)`` match the paper.
+
+    Untested for Conv-TasNet TSE — treat as an experiment vs the AdamW
+    baseline rather than a guaranteed win.
+    """
+
+    def __init__(
+        self,
+        params,  # noqa: ANN001 - torch.optim convention
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr <= 0.0:
+            raise ValueError(f"Lion lr must be > 0, got {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Lion weight_decay must be >= 0, got {weight_decay}")
+        defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):  # type: ignore[override]  # noqa: ANN001, ANN201
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            wd = group["weight_decay"]
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:
+                    state["exp_avg"] = torch.zeros_like(p)
+                m = state["exp_avg"]
+                if wd != 0.0:
+                    p.mul_(1.0 - lr * wd)
+                update = (m.mul(beta1).add(p.grad, alpha=1.0 - beta1)).sign_()
+                p.add_(update, alpha=-lr)
+                m.mul_(beta2).add_(p.grad, alpha=1.0 - beta2)
+        return loss
+
+
+def _newton_schulz_orthogonalize(
+    g: torch.Tensor, *, steps: int = 5, eps: float = 1e-7
+) -> torch.Tensor:
+    """Approximate the orthogonal factor of ``g`` via the quintic Newton-Schulz iteration.
+
+    Returns a matrix ``U V^T`` (where ``g = U Σ V^T`` is the SVD) without
+    the singular values. Coefficients ``(a, b, c) = (3.4445, -4.7750,
+    2.0315)`` are the standard quintic from Bernstein & Newhouse / Keller
+    Jordan's Muon. The iteration is done in fp32 for stability; the result
+    is cast back to ``g.dtype``.
+    """
+    if g.ndim != 2:
+        raise ValueError(f"_newton_schulz_orthogonalize requires 2D input, got {g.ndim}D")
+    a, b, c = 3.4445, -4.7750, 2.0315
+    x = g.detach().to(torch.float32)
+    transposed = False
+    if x.size(0) > x.size(1):
+        x = x.T
+        transposed = True
+    x = x / (x.norm() + eps)
+    for _ in range(steps):
+        a_mat = x @ x.T
+        b_mat = b * a_mat + c * (a_mat @ a_mat)
+        x = a * x + b_mat @ x
+    if transposed:
+        x = x.T
+    return x.to(g.dtype)
+
+
+class MuonHybrid(torch.optim.Optimizer):
+    """Muon (Newton-Schulz orthogonalisation) for 2D weight matrices, AdamW for the rest.
+
+    Following Keller Jordan's 2024 recipe: 2D-or-higher ``nn.Linear``-like
+    weights have their momentum-smoothed gradient *orthogonalised* before
+    application, producing a faster-converging update direction. 1-D
+    parameters (norm scale/bias, PReLU, embeddings), depthwise conv
+    weights, and biases stay with AdamW.
+
+    The split is decided at construction time by inspecting the model's
+    modules:
+
+    * ``nn.Linear.weight`` → Muon.
+    * ``nn.Conv1d.weight`` / ``nn.ConvTranspose1d.weight`` with
+      ``groups == 1`` → Muon. Depthwise / grouped convs (groups > 1) →
+      AdamW. (Newton-Schulz on a stack of independent 1-D filters has no
+      meaning.)
+    * Everything else (biases, 1-D params) → AdamW.
+
+    Untested for Conv-TasNet TSE — the published evidence is on
+    transformers. Use as an experiment, not a default.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        lr: float = 0.02,
+        adamw_lr: float = 1e-3,
+        momentum: float = 0.95,
+        adamw_betas: tuple[float, float] = (0.9, 0.999),
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+    ) -> None:
+        muon_ids, muon_params, adamw_params = self._split_params(model)
+        if not muon_params:
+            raise ValueError("MuonHybrid: no matrix params found — use AdamW directly")
+        param_groups = [
+            {
+                "params": muon_params,
+                "lr": lr,
+                "kind": "muon",
+                "momentum": momentum,
+                "weight_decay": weight_decay,
+                "ns_steps": ns_steps,
+            },
+            {
+                "params": adamw_params,
+                "lr": adamw_lr,
+                "kind": "adamw",
+                "betas": adamw_betas,
+                "weight_decay": weight_decay,
+                "eps": 1e-8,
+            },
+        ]
+        super().__init__(param_groups, defaults={})
+        # Stash the ids so test code can verify the routing without poking state.
+        self._muon_param_ids: set[int] = muon_ids
+
+    @staticmethod
+    def _split_params(
+        model: nn.Module,
+    ) -> tuple[set[int], list[torch.Tensor], list[torch.Tensor]]:
+        muon_ids: set[int] = set()
+        for mod in model.modules():
+            # Linear → matrix; Conv1d/ConvTranspose1d with groups==1 → matrix-like
+            # (depthwise grouped convs route to AdamW — orthogonalising a stack
+            # of independent 1-D filters has no meaning).
+            is_matrix = isinstance(mod, nn.Linear) or (
+                isinstance(mod, nn.Conv1d | nn.ConvTranspose1d) and mod.groups == 1
+            )
+            if is_matrix and mod.weight.requires_grad:
+                muon_ids.add(id(mod.weight))
+        muon_params: list[torch.Tensor] = []
+        adamw_params: list[torch.Tensor] = []
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            (muon_params if id(p) in muon_ids else adamw_params).append(p)
+        return muon_ids, muon_params, adamw_params
+
+    @torch.no_grad()
+    def step(self, closure=None):  # type: ignore[override]  # noqa: ANN001, ANN201
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            kind = group["kind"]
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            if kind == "muon":
+                mom = group["momentum"]
+                ns = group["ns_steps"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(mom).add_(p.grad)
+                    update = p.grad.add(buf, alpha=mom)  # Nesterov-style lookahead
+                    orig_shape = update.shape
+                    update_2d = update.reshape(orig_shape[0], -1)
+                    update_2d = _newton_schulz_orthogonalize(update_2d, steps=ns)
+                    # Preserve the per-row scale: the orthogonal matrix has
+                    # ~unit norm per row, so scale by sqrt(fan_out / fan_in).
+                    scale = max(1.0, orig_shape[0] / max(update_2d.size(1), 1)) ** 0.5
+                    update = (update_2d * scale).reshape(orig_shape)
+                    if wd != 0.0:
+                        p.mul_(1.0 - lr * wd)
+                    p.add_(update, alpha=-lr)
+            elif kind == "adamw":
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if not state:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["step"] += 1
+                    m_, v_ = state["exp_avg"], state["exp_avg_sq"]
+                    g = p.grad
+                    m_.mul_(beta1).add_(g, alpha=1.0 - beta1)
+                    v_.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+                    bc1 = 1.0 - beta1 ** state["step"]
+                    bc2 = 1.0 - beta2 ** state["step"]
+                    step_size = lr / bc1
+                    denom = (v_.sqrt() / (bc2**0.5)).add_(eps)
+                    if wd != 0.0:
+                        p.mul_(1.0 - lr * wd)
+                    p.addcdiv_(m_, denom, value=-step_size)
+            else:  # pragma: no cover - constructor restricts kind
+                raise RuntimeError(f"unknown param-group kind: {kind!r}")
+        return loss
+
+
 def _build_optimizer(
     model: nn.Module, name: str, lr: float, weight_decay: float
 ) -> torch.optim.Optimizer:
-    """Construct the optimizer by name (``adam`` or ``adamw``)."""
+    """Construct the optimizer by name.
+
+    Supported: ``adam`` | ``adamw`` | ``adamw-fused`` (CUDA fused kernels;
+    falls back to non-fused on CPU) | ``lion`` (experimental) | ``muon``
+    (experimental hybrid; uses ``lr`` for the Muon group and a fixed
+    ``adamw_lr = lr / 20`` for the 1-D / depthwise AdamW group, mirroring
+    the Muon paper's recipe).
+    """
     if name == "adam":
         return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if name == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if name == "adamw-fused":
+        on_cuda = any(p.is_cuda for p in model.parameters())
+        return torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay, fused=on_cuda
+        )
+    if name == "lion":
+        return Lion(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if name == "muon":
+        return MuonHybrid(model, lr=lr, adamw_lr=lr / 20.0, weight_decay=weight_decay)
     raise ValueError(f"unknown optimizer: {name!r}")
 
 
@@ -506,9 +745,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--optimizer",
-        choices=("adam", "adamw"),
+        choices=("adam", "adamw", "adamw-fused", "lion", "muon"),
         default="adam",
-        help="optimizer (adamw applies decoupled weight decay; usually better with `--lr-schedule cosine`)",
+        help=(
+            "adamw: decoupled WD; adamw-fused: CUDA-fused kernels; "
+            "lion: sign-momentum, use lr~1/5 of adamw + wd~5x larger; "
+            "muon: experimental hybrid (Muon for 2D weights + AdamW elsewhere). "
+            "lion / muon untested for TSE — experimental."
+        ),
     )
     parser.add_argument(
         "--weight-decay",

@@ -10,8 +10,11 @@ from torch import nn
 
 from tse.train import (
     ExponentialMovingAverage,
+    Lion,
+    MuonHybrid,
     _build_optimizer,
     _build_scheduler,
+    _newton_schulz_orthogonalize,
     _resolve_amp_dtype,
 )
 
@@ -132,7 +135,7 @@ def test_build_optimizer_adamw_carries_weight_decay() -> None:
 
 def test_build_optimizer_unknown_raises() -> None:
     with pytest.raises(ValueError, match="unknown optimizer"):
-        _build_optimizer(_tiny_model(), "lion", lr=1e-3, weight_decay=0.0)
+        _build_optimizer(_tiny_model(), "lookahead", lr=1e-3, weight_decay=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -235,3 +238,119 @@ def test_ema_state_dict_roundtrips() -> None:
         ema.shadow["weight"].fill_(0.0)
     ema.load_state_dict(saved)
     assert torch.allclose(ema.shadow["weight"], saved["weight"])
+
+
+# ---------------------------------------------------------------------------
+# Lion
+# ---------------------------------------------------------------------------
+
+
+def test_lion_step_moves_weights_against_gradient_sign() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0, 0.5]))
+    opt = Lion([p], lr=0.1, betas=(0.9, 0.99), weight_decay=0.0)
+    p.grad = torch.tensor([3.0, -4.0, 0.0])
+    initial = p.detach().clone()
+    opt.step()
+    # On the first step, m=0 so update direction = sign(g). Lion subtracts
+    # lr * sign(g). sign(0) = 0 so the zero-grad element is unchanged.
+    expected = initial - 0.1 * torch.tensor([1.0, -1.0, 0.0])
+    assert torch.allclose(p.detach(), expected, atol=1e-6)
+
+
+def test_lion_invalid_lr_raises() -> None:
+    p = nn.Parameter(torch.zeros(2))
+    with pytest.raises(ValueError, match="lr"):
+        Lion([p], lr=0.0)
+
+
+def test_build_optimizer_lion() -> None:
+    opt = _build_optimizer(_tiny_model(), "lion", lr=1e-4, weight_decay=0.1)
+    assert isinstance(opt, Lion)
+
+
+# ---------------------------------------------------------------------------
+# Muon (Newton-Schulz + hybrid)
+# ---------------------------------------------------------------------------
+
+
+def test_newton_schulz_singular_values_in_quintic_envelope() -> None:
+    """The quintic NS iteration (Keller Jordan / Muon) produces *approximate*
+    orthogonalisation — the output's singular values land in roughly
+    ``[0.5, 1.5]`` rather than exactly 1. This is by design (the coefficients
+    maximise slope-at-zero, not exact convergence to 1) and turns out not
+    to hurt model performance in published Muon results.
+    """
+    torch.manual_seed(0)
+    g = torch.randn(8, 16)
+    o = _newton_schulz_orthogonalize(g, steps=8)
+    assert o.shape == g.shape
+    sigma = torch.linalg.svdvals(o)
+    # Looser bounds than the docstring's nominal [0.5, 1.5] to absorb tail
+    # cases; the key property is "no singular value blows up or vanishes".
+    assert sigma.min() > 0.3, f"NS collapsed a direction: σ_min={sigma.min().item():.4f}"
+    assert sigma.max() < 2.0, f"NS exploded: σ_max={sigma.max().item():.4f}"
+
+
+def test_newton_schulz_rejects_non_2d() -> None:
+    with pytest.raises(ValueError, match="2D"):
+        _newton_schulz_orthogonalize(torch.zeros(3, 4, 5))
+
+
+def test_muon_hybrid_routes_matrix_vs_1d_params_correctly() -> None:
+    """Linear weights → Muon, 1×1 conv → Muon, depthwise conv + biases → AdamW."""
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(4, 4, bias=True)
+            self.pointwise = nn.Conv1d(4, 4, kernel_size=1)
+            self.depthwise = nn.Conv1d(4, 4, kernel_size=3, groups=4)
+            self.gamma = nn.Parameter(torch.ones(4))  # 1-D scale
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+            return x
+
+    model = Tiny()
+    opt = MuonHybrid(model, lr=0.02, adamw_lr=1e-3, weight_decay=0.0)
+    muon_ids = opt._muon_param_ids
+    assert id(model.linear.weight) in muon_ids
+    assert id(model.pointwise.weight) in muon_ids
+    assert id(model.depthwise.weight) not in muon_ids  # depthwise → AdamW
+    assert id(model.linear.bias) not in muon_ids  # bias → AdamW
+    assert id(model.gamma) not in muon_ids  # 1-D scale → AdamW
+    # Two groups, kinds == ['muon', 'adamw']
+    assert [g["kind"] for g in opt.param_groups] == ["muon", "adamw"]
+
+
+def test_muon_hybrid_step_updates_both_groups() -> None:
+    torch.manual_seed(0)
+
+    class Tiny(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(4, 4, bias=True)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+            return self.linear(x)
+
+    model = Tiny()
+    opt = MuonHybrid(model, lr=0.02, adamw_lr=1e-3, weight_decay=0.0)
+    w0 = model.linear.weight.detach().clone()
+    b0 = model.linear.bias.detach().clone()
+    # Inject gradients and step.
+    model.linear.weight.grad = torch.randn_like(model.linear.weight)
+    model.linear.bias.grad = torch.ones_like(model.linear.bias)
+    opt.step()
+    assert not torch.allclose(model.linear.weight.detach(), w0)
+    assert not torch.allclose(model.linear.bias.detach(), b0)
+
+
+def test_build_optimizer_muon() -> None:
+    opt = _build_optimizer(_tiny_model(), "muon", lr=0.02, weight_decay=0.0)
+    assert isinstance(opt, MuonHybrid)
+
+
+def test_build_optimizer_adamw_fused_works_on_cpu() -> None:
+    # On CPU, fused=False is auto-selected; the call should not raise.
+    opt = _build_optimizer(_tiny_model(), "adamw-fused", lr=1e-3, weight_decay=0.01)
+    assert isinstance(opt, torch.optim.AdamW)
