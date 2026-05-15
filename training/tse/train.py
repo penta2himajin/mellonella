@@ -313,13 +313,17 @@ def _newton_schulz_orthogonalize(
     Returns a matrix ``U V^T`` (where ``g = U Σ V^T`` is the SVD) without
     the singular values. Coefficients ``(a, b, c) = (3.4445, -4.7750,
     2.0315)`` are the standard quintic from Bernstein & Newhouse / Keller
-    Jordan's Muon. The iteration is done in fp32 for stability; the result
-    is cast back to ``g.dtype``.
+    Jordan's Muon.
+
+    The iteration is run in ``bfloat16`` to match Keller Jordan's reference
+    implementation — the quintic is range-bounded so bf16 precision is
+    sufficient, and on modern Xeons / GPUs the matmul throughput is ~2x
+    fp32. The result is cast back to ``g.dtype`` before return.
     """
     if g.ndim != 2:
         raise ValueError(f"_newton_schulz_orthogonalize requires 2D input, got {g.ndim}D")
     a, b, c = 3.4445, -4.7750, 2.0315
-    x = g.detach().to(torch.float32)
+    x = g.detach().to(torch.bfloat16)
     transposed = False
     if x.size(0) > x.size(1):
         x = x.T
