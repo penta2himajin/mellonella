@@ -97,11 +97,18 @@ and supports `--resume`.
    precomputes per-utterance frozen ECAPA embeddings into an `.npz`, using
    the existing ECAPA ONNX (`$MELLONELLA_ECAPA_ONNX`). The ECAPA model is
    never in the training loop.
-2. **Data** — `data.py::librispeech_musan_sources` (currently a documented
-   stub) builds `TSESourceItem` bundles from local LibriSpeech + MUSAN,
-   reusing the `bench` dataset infrastructure. The same `TSEMixtureDataset`
+2. **Data** — `data.py::librispeech_musan_sources` builds `TSESourceItem`
+   bundles from local LibriSpeech + MUSAN. Audio is **not** loaded eagerly
+   (sources hold `Path`\ s); `TSEMixtureDataset` decodes lazily per access
+   so a 6 GB train-clean-100 never has to live in RAM. The same dataset
    then does on-the-fly target+interferer(+noise) mixing.
-3. **Train** — `train.py --data-dir … --epochs …` on a Kaggle GPU.
+3. **Train** — `tse.kaggle_train` is a self-contained kernel entrypoint
+   (`python -m tse.kaggle_train` on Kaggle): clones the repo, installs
+   `training[onnx]` + SpeechBrain, stitches `/kaggle/input/` datasets into
+   the layout the loader expects, runs `prepare_enrollment_embeddings`,
+   and then `train.py` on GPU. Knobs via env vars: `POC_EPOCHS`,
+   `POC_BATCH`, `POC_N_PAIRS`, `POC_LR`, `ENROLL_LIMIT`,
+   `LIBRISPEECH_DATA` / `MUSAN_DATA` / `ECAPA_ONNX` (path overrides).
 4. **Export** — `scripts/export_tse_onnx.py export-and-verify
    --checkpoint <ckpt>` produces the streaming ONNX for the Rust core.
 
@@ -110,8 +117,11 @@ and supports `--resume`.
 - `config.py` — `TSEConfig` frozen dataclass + `poc_16k()` / `prod_48k()`.
 - `model.py` — `CausalConvTasNetTSE` (two forward modes), FiLM MLP,
   cumulative LN, causal TCN blocks, param-count helper.
-- `data.py` — `TSEMixtureDataset` + `synthetic_fixture_dataset` (in-memory,
-  no downloads) + `librispeech_musan_sources` (Phase 3 stub).
+- `data.py` — `TSEMixtureDataset` (lazy `Path` decoding) +
+  `synthetic_fixture_dataset` (in-memory, no downloads) +
+  `librispeech_musan_sources` (real LibriSpeech + MUSAN loader).
+- `kaggle_train.py` — Kaggle kernel entrypoint (env-var knobs, idempotent
+  re-runs).
 - `loss.py` — negative SI-SDR loss, consistent with `bench`'s `si_sdr`.
 - `train.py` — overfit-one-batch + full training loop, CLI, checkpointing.
 - `prepare_enrollment_embeddings.py` — offline ECAPA embedding precompute
