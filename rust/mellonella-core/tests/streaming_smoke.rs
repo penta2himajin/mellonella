@@ -83,6 +83,7 @@ fn build_components(ecapa_path: &str, vad_path: &str) -> (PipelineComponents, Em
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     };
     let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
     pool.add_anchors([vec![0.0_f32; 192]]);

@@ -193,6 +193,7 @@ impl AppState {
             fbank,
             ecapa,
             cohort: Vec::new(),
+            tse: None,
         })
     }
 
@@ -391,7 +392,7 @@ impl AppState {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
             streaming: StreamingConfig {
-                pipeline: self.pipeline_cfg,
+                pipeline: self.pipeline_cfg.clone(),
                 gate: self.gate_cfg,
                 audio_sample_rate: OUTPUT_SAMPLE_RATE,
                 diagnostics: false,

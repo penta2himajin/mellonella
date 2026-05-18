@@ -1151,7 +1151,7 @@ impl StreamingState {
         let sync_cfg = StreamingConfig {
             pipeline: PipelineConfig {
                 async_refresh: false,
-                ..config.pipeline
+                ..config.pipeline.clone()
             },
             ..config.clone()
         };
@@ -1506,12 +1506,15 @@ impl StreamingState {
         out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
         // Disjoint borrows: `vad` drives the core, `fbank` / `ecapa` /
-        // `cohort` go into the refresh strategy.
+        // `cohort` go into the refresh strategy. The `tse` field is
+        // ignored here — Stage C TSE is currently only wired through
+        // the offline `process_offline` path.
         let PipelineComponents {
             vad,
             fbank,
             ecapa,
             cohort,
+            tse: _,
         } = components;
         let mut strategy = SyncRefresh {
             fbank,
@@ -1776,6 +1779,7 @@ impl StreamingPipeline {
                 fbank,
                 ecapa,
                 cohort,
+                tse: _,
             } = components;
             let state = StreamingState::new_async(&config, fbank, ecapa)?;
             Ok(Self {
@@ -1894,6 +1898,11 @@ impl StreamingPipeline {
                     fbank,
                     ecapa,
                     cohort,
+                    // Stage C TSE is not threaded through the
+                    // async-refresh streaming worker yet; rebuild the
+                    // recovered `PipelineComponents` with `None` and
+                    // let callers stitch their own stage on top.
+                    tse: None,
                 }
             }
         };

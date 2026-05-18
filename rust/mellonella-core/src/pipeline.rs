@@ -38,14 +38,20 @@ use crate::resample::{resample_to, ResampleError};
 use crate::streaming::{
     AsyncRefresh, ScopedRefreshChannel, StreamingConfig, StreamingOutput, StreamingState,
 };
+use crate::tse::TSE_COND_DIM;
+use crate::tse_stage::{TseStage, TseStageConfig, TseStageError};
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 /// SV-side cadence for the offline pipeline.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 // A plain configuration struct — each bool is an independent,
 // documented opt-in knob (async refresh, auto-learn, the three
 // Stage B switches). Bundling them into sub-structs or an enum would
 // only obscure the flat, greppable config surface callers rely on.
+//
+// `Copy` was dropped in Phase 5 — `PipelineConfig` now carries an
+// optional [`TseStageConfig`] (with a `PathBuf` inside), so callers
+// pass `&PipelineConfig` and clone when they need an owned copy.
 #[allow(clippy::struct_excessive_bools)]
 pub struct PipelineConfig {
     /// Sample rate of the input buffer. Currently fixed at 16 kHz so the
@@ -237,6 +243,29 @@ pub struct PipelineConfig {
     /// Default `false`. Requires `turn_detect_enabled` to have any
     /// effect (the offset-suspect signal comes from turn detection).
     pub offset_fail_closed: bool,
+    /// **Stage C, Phase 5** — opt-in target-speaker-extraction. When
+    /// `Some`, the offline pipeline loads the streaming TSE ONNX at
+    /// the supplied path, snapshots the enrolled target speaker's
+    /// embedding from the pool, runs the audio through the TSE model
+    /// **before** the envelope is applied, and feeds the extracted
+    /// audio (instead of the raw input) to the envelope stage.
+    /// Decisions from VAD / SV / gating are unchanged — they're still
+    /// computed on the raw decision-rate audio — only the audio the
+    /// gate's envelope is applied to changes.
+    ///
+    /// **PoC restriction (16 kHz only):** the PoC TSE model is trained
+    /// at 16 kHz. When this is `Some`, the offline pipeline rejects
+    /// any `(audio_sample_rate, sample_rate)` pair other than
+    /// `(16_000, 16_000)` with a clear [`PipelineError::TseRateMismatch`].
+    /// The 48 kHz prod TSE model is Phase 4 and will lift this
+    /// restriction — see `docs/architecture.md` and the TODO comment
+    /// at the rate-check call site in `process_offline`.
+    ///
+    /// Default `None` — with the default the TSE stage is never
+    /// constructed and the offline pipeline behaves byte-identically
+    /// to pre-Phase-5 builds (the `pipeline_parity` byte-equal
+    /// contract is unaffected).
+    pub tse: Option<TseStageConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -263,6 +292,9 @@ impl Default for PipelineConfig {
             sv_turn_window_samples: 8_000,
             sv_turn_update_samples: 2_000,
             offset_fail_closed: false,
+            // Stage C TSE — opt-in, default OFF so the offline pipeline
+            // remains byte-identical to pre-Phase-5 builds.
+            tse: None,
         }
     }
 }
@@ -296,6 +328,16 @@ pub struct PipelineComponents {
     pub fbank: Fbank,
     pub ecapa: EcapaTdnn,
     pub cohort: Vec<Vec<f32>>,
+    /// Optional Stage C TSE stage. Lazily constructed by
+    /// [`process_offline`] from the [`PipelineConfig::tse`] config on
+    /// first use (and reset on each subsequent run); callers may also
+    /// pre-build the stage with [`crate::tse_stage::TseStage::from_config`]
+    /// and pass it in here to share the loaded ONNX across runs.
+    ///
+    /// Default `None`. The streaming engine ([`crate::streaming`])
+    /// ignores this field — TSE in the streaming path is a Phase 5
+    /// follow-up.
+    pub tse: Option<TseStage>,
 }
 
 /// Auto-learn lifecycle event emitted during `process_offline`.
@@ -387,6 +429,11 @@ pub struct ProcessResult {
     /// Auto-learn admission / rejection / reset events in chronological
     /// order.
     pub auto_learn_events: Vec<AutoLearnEvent>,
+    /// `true` when the Stage C TSE stage was actually invoked on this
+    /// run (i.e. `cfg.tse.is_some()` and the rate-check passed). Used
+    /// by tests to assert the default-OFF / opt-in behaviour. Always
+    /// `false` for the async path (TSE wiring there is a follow-up).
+    pub tse_applied: bool,
 }
 
 /// Errors returned by [`process_offline`].
@@ -395,6 +442,25 @@ pub enum PipelineError {
     Embedding(EmbeddingError),
     Envelope(ApplyEnvelopeError),
     Resample(ResampleError),
+    /// Forwarded from the Stage C TSE stage (ONNX load failures,
+    /// invalid chunk lengths, etc.).
+    TseStage(TseStageError),
+    /// The Stage C TSE config requires `audio_sample_rate ==
+    /// pipeline_cfg.sample_rate == 16_000` (PoC model is 16 kHz only).
+    /// The 48 kHz prod model will lift this restriction in Phase 4.
+    TseRateMismatch {
+        audio_sr: u32,
+        decision_sr: u32,
+    },
+    /// The Stage C TSE config was set but the embedding pool has no
+    /// anchors yet (no enrolled target speaker) — TSE needs a 192-dim
+    /// cond embedding to condition on.
+    TseMissingEnrollment,
+    /// The Stage C TSE config was combined with `async_refresh = true`.
+    /// TSE wiring through the async-refresh worker is a Phase 5
+    /// follow-up; sync `process_offline` is the only supported path
+    /// for now.
+    TseAsyncUnsupported,
 }
 
 impl std::fmt::Display for PipelineError {
@@ -403,6 +469,26 @@ impl std::fmt::Display for PipelineError {
             Self::Embedding(e) => write!(f, "embedding error: {e}"),
             Self::Envelope(e) => write!(f, "envelope error: {e}"),
             Self::Resample(e) => write!(f, "resample error: {e}"),
+            Self::TseStage(e) => write!(f, "TSE stage error: {e}"),
+            Self::TseRateMismatch {
+                audio_sr,
+                decision_sr,
+            } => write!(
+                f,
+                "Stage C TSE requires 16 kHz audio and decision rates; \
+                 got audio_sr={audio_sr}, decision_sr={decision_sr}. \
+                 The 48 kHz prod TSE model is Phase 4."
+            ),
+            Self::TseMissingEnrollment => write!(
+                f,
+                "Stage C TSE was enabled but the embedding pool has no \
+                 anchors — enroll a target speaker first"
+            ),
+            Self::TseAsyncUnsupported => write!(
+                f,
+                "Stage C TSE with async_refresh = true is not yet \
+                 wired up — use the sync offline path"
+            ),
         }
     }
 }
@@ -411,8 +497,12 @@ impl std::error::Error for PipelineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Embedding(e) => Some(e),
-            Self::Envelope(_) => None,
+            Self::Envelope(_)
+            | Self::TseRateMismatch { .. }
+            | Self::TseMissingEnrollment
+            | Self::TseAsyncUnsupported => None,
             Self::Resample(e) => Some(e),
+            Self::TseStage(e) => Some(e),
         }
     }
 }
@@ -433,6 +523,95 @@ impl From<ResampleError> for PipelineError {
     fn from(e: ResampleError) -> Self {
         Self::Resample(e)
     }
+}
+
+impl From<TseStageError> for PipelineError {
+    fn from(e: TseStageError) -> Self {
+        Self::TseStage(e)
+    }
+}
+
+/// Snapshot the cond-conditioning embedding the Stage C TSE model is
+/// conditioned on from the embedding pool.
+///
+/// Picks the **anchor centroid** (`E_enroll`, the element-wise mean of
+/// the enrollment anchors — what
+/// [`crate::enrollment::EmbeddingPool::anchor_centroid`] returns) as
+/// the single 192-dim vector representing the enrolled target speaker:
+///
+/// * It's the longest-lived, drift-free identity reference in the
+///   pool — anchors are written once at enrollment and never
+///   modified. The λ-residual `adapted` embedding moves with runtime
+///   evidence, so using it here would let TSE conditioning drift with
+///   the pool; the centroid is what `match_score` always keeps in
+///   play (see `enrollment.rs` docstring).
+/// * For a single-anchor pool the centroid is that anchor verbatim
+///   (each `f32 * 1.0` is exact), so the chosen accessor reduces to
+///   "the enrolled embedding" on the simplest path.
+/// * The 48 kHz prod path may want to compare against `adapted` as
+///   well; for the PoC, sticking to the centroid keeps the run
+///   deterministic.
+///
+/// # Errors
+/// Returns [`PipelineError::TseMissingEnrollment`] when the pool has
+/// no anchors yet (centroid is `None`).
+fn tse_cond_embedding(pool: &EmbeddingPool) -> Result<Vec<f32>, PipelineError> {
+    let centroid = pool
+        .anchor_centroid()
+        .ok_or(PipelineError::TseMissingEnrollment)?;
+    if centroid.len() != TSE_COND_DIM {
+        return Err(PipelineError::TseStage(TseStageError::InvalidCondLength {
+            got: centroid.len(),
+            expected: TSE_COND_DIM,
+        }));
+    }
+    Ok(centroid.to_vec())
+}
+
+/// Ensure `components.tse` holds a TSE stage compatible with the
+/// supplied config + cond embedding.
+///
+/// Cases:
+/// * stage already present → reset its accumulator + state, update
+///   its cond embedding from the current snapshot.
+/// * stage absent → load the ONNX from `config.tse.unwrap().onnx_path`
+///   and stash it on `components`.
+fn ensure_tse_stage(
+    components: &mut PipelineComponents,
+    pipeline_cfg: &PipelineConfig,
+    cond: &[f32],
+) -> Result<(), PipelineError> {
+    let Some(stage_cfg) = pipeline_cfg.tse.as_ref() else {
+        // Caller only invokes this when `tse.is_some()`; defensive
+        // early-out keeps the body single-level.
+        return Ok(());
+    };
+    if let Some(stage) = components.tse.as_mut() {
+        stage.reset();
+        stage.set_cond_embedding(cond)?;
+    } else {
+        let stage = TseStage::from_config(stage_cfg, cond)?;
+        components.tse = Some(stage);
+    }
+    Ok(())
+}
+
+/// Drive a [`TseStage`] over a whole offline audio buffer at the
+/// decision rate and return exactly `audio.len()` extracted samples.
+/// Output is zero-padded if the underlying flush ran short or
+/// truncated if it overshot — matching [`crate::dfn3::Dfn3Pipeline::process`]'s
+/// fixed-length output contract so the envelope step can apply a
+/// pre-computed decision sequence sample-for-sample.
+fn run_tse_offline(stage: &mut TseStage, audio: &[f32]) -> Result<Vec<f32>, PipelineError> {
+    stage.reset();
+    let mut out = stage.process(audio)?;
+    let tail = stage.flush()?;
+    out.extend(tail);
+    out.truncate(audio.len());
+    if out.len() < audio.len() {
+        out.resize(audio.len(), 0.0);
+    }
+    Ok(out)
 }
 
 /// Resample `audio` from `audio_sr` to `decision_sr` for the
@@ -556,7 +735,37 @@ pub fn process_offline(
     gate_cfg: &GateConfig,
     components: &mut PipelineComponents,
 ) -> Result<ProcessResult, PipelineError> {
+    // Stage C TSE setup runs on **both** sync and async offline paths.
+    // The pool may evolve via auto-learn during the run; snapshotting
+    // the cond embedding here ("frozen for the run") is the simplest
+    // correct semantics for this PR. The 48 kHz prod TSE model
+    // (Phase 4) will replace this rate check with a per-config branch.
+    //
+    // TODO(phase-4-48k-tse): drop the hard 16 kHz check below in
+    // favour of "the model's expected SR must match audio_sr and
+    // decision_sr" so the 48 kHz prod export works without resample
+    // shenanigans. For the PoC the model is 16 kHz only.
+    let tse_enabled = pipeline_cfg.tse.is_some();
+    if tse_enabled {
+        let decision_sr = pipeline_cfg.sample_rate;
+        if audio_sample_rate != 16_000 || decision_sr != 16_000 {
+            return Err(PipelineError::TseRateMismatch {
+                audio_sr: audio_sample_rate,
+                decision_sr,
+            });
+        }
+        let cond = tse_cond_embedding(pool)?;
+        ensure_tse_stage(components, pipeline_cfg, &cond)?;
+    }
+
     if pipeline_cfg.async_refresh {
+        // Async path: TSE wiring through the scoped worker is a
+        // follow-up. The rate/cond-availability checks above still
+        // ran so a misconfigured `Some(_)` is rejected before any
+        // audio enters the pipeline.
+        if tse_enabled {
+            return Err(PipelineError::TseAsyncUnsupported);
+        }
         return process_offline_async(
             audio,
             audio_sample_rate,
@@ -571,7 +780,15 @@ pub fn process_offline(
     // monolithic implementation byte-for-byte at identity rate
     // (`streaming_identity_rate_per_frame_matches_offline`).
     let cfg = StreamingConfig {
-        pipeline: *pipeline_cfg,
+        pipeline: PipelineConfig {
+            // The streaming engine doesn't consume `tse` (and its
+            // `StreamingConfig::Default` derives off `PipelineConfig`,
+            // which now carries the new field). Strip it on the
+            // engine's own config copy to be unambiguous — TSE in the
+            // streaming engine itself is a Phase 5 follow-up.
+            tse: None,
+            ..pipeline_cfg.clone()
+        },
         gate: *gate_cfg,
         audio_sample_rate,
         diagnostics: true,
@@ -621,6 +838,31 @@ pub fn process_offline(
         )?;
     }
 
+    // Stage C TSE: run target-speaker extraction on the raw audio
+    // **before** the envelope is applied, then re-apply the envelope
+    // over the extracted audio with the (possibly pre-roll-shifted)
+    // decision sequence. The decisions themselves came from the
+    // unmodified streaming engine — i.e. VAD / SV / gating saw the
+    // original mixture — so a future iteration may want to score on
+    // TSE-cleaned audio; for now we keep gating untouched.
+    //
+    // The rate-mismatch check at the head of `process_offline`
+    // guarantees `audio_sample_rate == pipeline_cfg.sample_rate ==
+    // 16_000` when we reach this branch, so the envelope's
+    // `decision_sr` argument matches the audio rate exactly.
+    let mut tse_applied = false;
+    if let Some(stage) = components.tse.as_mut().filter(|_| tse_enabled) {
+        let extracted = run_tse_offline(stage, audio)?;
+        head.audio = apply_envelope_dual_rate(
+            &extracted,
+            &decisions,
+            audio_sample_rate,
+            audio_sample_rate,
+            *gate_cfg,
+        )?;
+        tse_applied = true;
+    }
+
     Ok(ProcessResult {
         audio: head.audio,
         gate_decisions: decisions,
@@ -629,6 +871,7 @@ pub fn process_offline(
         cos_sim_max_per_frame: head.cos_sim_max_per_frame,
         f0_match_per_frame: head.f0_match_per_frame,
         auto_learn_events: head.events,
+        tse_applied,
     })
 }
 
@@ -682,7 +925,7 @@ fn process_offline_async(
             // not from the `StreamingState` worker, so this flag must
             // be cleared on the state's own config copy.
             async_refresh: false,
-            ..*pipeline_cfg
+            ..pipeline_cfg.clone()
         },
         gate: *gate_cfg,
         // Identity rate: `audio_dec` is already at the decision rate.
@@ -701,6 +944,10 @@ fn process_offline_async(
         fbank,
         ecapa,
         cohort,
+        // TSE wiring through the async-refresh worker is a Phase 5
+        // follow-up; the sync `process_offline` rejects
+        // `tse.is_some() && async_refresh` up front.
+        tse: _,
     } = components;
     let cohort: &Vec<Vec<f32>> = cohort;
 
@@ -795,6 +1042,10 @@ fn process_offline_async(
         cos_sim_max_per_frame: cs_per_frame,
         f0_match_per_frame: fm_per_frame,
         auto_learn_events,
+        // TSE wiring through the async-refresh worker is a Phase 5
+        // follow-up — the sync `process_offline` rejects
+        // `tse.is_some() && async_refresh` up front.
+        tse_applied: false,
     })
 }
 

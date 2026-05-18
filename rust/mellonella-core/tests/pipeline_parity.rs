@@ -75,6 +75,7 @@ fn process_offline_matches_python_reference() {
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     };
 
     let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());

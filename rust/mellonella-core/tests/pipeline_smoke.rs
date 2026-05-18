@@ -78,6 +78,7 @@ fn process_offline_runs_end_to_end() {
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     };
 
     // Pre-seed the pool with a synthetic anchor so cos_sim_max has
@@ -153,6 +154,7 @@ fn process_offline_async_runs_end_to_end() {
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     };
 
     let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());

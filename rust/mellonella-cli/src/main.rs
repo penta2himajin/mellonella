@@ -387,6 +387,7 @@ fn build_components() -> Result<PipelineComponents, CliError> {
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     })
 }
 
