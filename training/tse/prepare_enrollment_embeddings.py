@@ -136,6 +136,31 @@ def _utterance_id(path: Path, audio_dir: Path) -> str:
     return rel.with_suffix("").as_posix()
 
 
+def _resolve_providers(device: str) -> list[str]:
+    """Pick onnxruntime providers for ``device`` (``auto`` / ``cuda`` / ``cpu``).
+
+    ``auto`` prefers CUDA when ``onnxruntime`` reports it available, otherwise
+    falls back to CPU. ``cuda`` is strict — raises if CUDA is unavailable.
+    """
+    import onnxruntime as ort  # type: ignore[import-not-found]
+
+    available = set(ort.get_available_providers())
+    if device == "cpu":
+        return ["CPUExecutionProvider"]
+    cuda_avail = "CUDAExecutionProvider" in available
+    if device == "cuda":
+        if not cuda_avail:
+            raise RuntimeError(
+                "device='cuda' requested but onnxruntime has no CUDAExecutionProvider. "
+                "Install onnxruntime-gpu (and a CUDA runtime) or pass --device cpu."
+            )
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    # auto
+    if cuda_avail:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
 def prepare(
     audio_dir: Path,
     out_npz: Path,
@@ -143,11 +168,13 @@ def prepare(
     ecapa_onnx: Path,
     pattern: str = "*.flac",
     limit: int | None = None,
+    device: str = "auto",
 ) -> dict[str, np.ndarray]:
     """Compute embeddings for every ``pattern``-matching file under ``audio_dir``.
 
     Writes ``out_npz`` mapping ``utterance_id -> float32[192]`` and also
-    returns the dict.
+    returns the dict. ``device`` selects the onnxruntime provider — defaults
+    to ``auto`` (CUDA if available).
     """
     import onnxruntime as ort  # type: ignore[import-not-found]
 
@@ -157,8 +184,10 @@ def prepare(
     if not files:
         raise RuntimeError(f"no files matching {pattern!r} under {audio_dir}")
 
+    providers = _resolve_providers(device)
     print(f"[enroll] ECAPA ONNX: {ecapa_onnx}", file=sys.stderr)
-    session = ort.InferenceSession(str(ecapa_onnx), providers=["CPUExecutionProvider"])
+    print(f"[enroll] providers: {providers}", file=sys.stderr)
+    session = ort.InferenceSession(str(ecapa_onnx), providers=providers)
     compute_features = _build_fbank_extractor()
 
     embeddings: dict[str, np.ndarray] = {}
@@ -195,6 +224,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pattern", default="*.flac", help="glob for audio files (LibriSpeech: *.flac)"
     )
     parser.add_argument("--limit", type=int, default=None, help="cap the number of files")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cuda", "cpu"),
+        help="onnxruntime provider: auto (CUDA if available, else CPU), cuda, or cpu",
+    )
     return parser
 
 
@@ -207,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         ecapa_onnx=ecapa_onnx,
         pattern=args.pattern,
         limit=args.limit,
+        device=args.device,
     )
     return 0
 
