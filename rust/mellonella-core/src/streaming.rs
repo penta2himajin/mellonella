@@ -108,9 +108,10 @@ use crate::gating::{
     as_norm_score, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig, GateState,
 };
 use crate::pipeline::{
-    apply_refresh_result, fbank_ecapa_one, smooth_score, AutoLearnEvent, AutoLearnKind,
-    PipelineComponents, PipelineConfig, PipelineError, ScoreState,
+    apply_refresh_result, fbank_ecapa_one, smooth_score, tse_cond_embedding, AutoLearnEvent,
+    AutoLearnKind, PipelineComponents, PipelineConfig, PipelineError, ScoreState,
 };
+use crate::tse_stage::TseStage;
 use crate::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 /// Pair returned by [`StreamingState::drain_one_frame`]: the
@@ -198,6 +199,13 @@ pub struct StreamingOutput {
     pub cos_sim_max_per_frame: Vec<f32>,
     /// Per-VAD-frame F0 match. Empty unless diagnostics on.
     pub f0_match_per_frame: Vec<f32>,
+    /// **Stage C, Phase 5 part 3** — `true` when the streaming engine
+    /// actually routed audio through a [`TseStage`] before applying the
+    /// envelope on this call. Mirrors the offline
+    /// [`crate::pipeline::ProcessResult::tse_applied`] flag so tests can
+    /// assert the default-OFF / opt-in behaviour. Always `false` when
+    /// `StreamingConfig::pipeline.tse` is `None`.
+    pub tse_applied: bool,
 }
 
 /// Decision-rate sample window length the per-frame fast-F0 cue runs
@@ -598,6 +606,29 @@ pub(crate) struct StreamingState {
     /// machine. Inert (stays `Steady`, `effective_window ==
     /// sv_window_samples`) unless `turn_detect_enabled` is set.
     turn: TurnDetector,
+    /// **Stage C, Phase 5 part 3** — optional target-speaker-extraction
+    /// stage. Present only when `StreamingConfig::pipeline.tse` is
+    /// `Some` (and `audio_sample_rate == decision_sr == 16_000`,
+    /// enforced at construction time). When present, every emitted
+    /// audio chunk is routed through the stage **before** the envelope
+    /// is applied; the gate's `is_on` decisions still come from the
+    /// raw decision-rate audio.
+    ///
+    /// Owned by the state (rather than left on `PipelineComponents`)
+    /// so the buffered accumulator inside the stage persists naturally
+    /// across `push_samples` calls — the same ownership pattern the
+    /// async-refresh worker uses for `fbank` + `ecapa`.
+    pub(crate) tse_stage: Option<TseStage>,
+    /// **Stage C, Phase 5 part 3** — gain values queued for emission
+    /// behind the TSE stage's accumulator. Pushed at the input-audio
+    /// rate (one per audio-rate sample handed to the TSE stage),
+    /// consumed at the same rate as TSE emits extracted samples. While
+    /// streaming, up to `tse_stage.chunk_samples() - 1` gains are
+    /// pending at any time; the [`Self::flush`] tail drains the
+    /// remainder.
+    ///
+    /// Empty (and unused) when `tse_stage` is `None`.
+    tse_pending_gain: VecDeque<f32>,
 }
 
 /// Persistent worker thread for `async_refresh = true` streaming.
@@ -1127,6 +1158,12 @@ impl StreamingState {
             async_worker: None,
             fast_f0_cue: FastF0Cue::new(),
             turn: TurnDetector::new(config.pipeline.sv_window_samples),
+            // The TSE stage is plumbed in by `StreamingPipeline::new`
+            // after rate-checking and snapshotting the cond embedding.
+            // Plain `StreamingState::new` callers (offline async path,
+            // ad-hoc tests) keep the TSE-off byte-equal contract.
+            tse_stage: None,
+            tse_pending_gain: VecDeque::new(),
         })
     }
 
@@ -1185,6 +1222,13 @@ impl StreamingState {
         self.audio_samples_emitted = 0;
         self.fast_f0_cue.reset();
         self.turn.reset(config.pipeline.sv_window_samples);
+        // Stage C, Phase 5 part 3: drain the TSE accumulator and the
+        // pending-gain queue so a `reset()` is a clean restart even
+        // when TSE is active.
+        if let Some(stage) = self.tse_stage.as_mut() {
+            stage.reset();
+        }
+        self.tse_pending_gain.clear();
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -1485,8 +1529,30 @@ impl StreamingState {
         // span. `EnvelopeState::advance` returns one gain per
         // sample.
         let gain = self.envelope_state.advance(is_on, audio_chunk.len());
-        for (k, &g) in gain.iter().enumerate() {
-            out.audio.push(audio_chunk[k] * g);
+        if let Some(stage) = self.tse_stage.as_mut() {
+            // Stage C, Phase 5 part 3: TSE-extract this frame's audio
+            // first, then apply the envelope to whatever extracted
+            // samples are available. The stage's accumulator can buffer
+            // up to `chunk_samples - 1` samples between emits, so we
+            // queue the matching gains and pair them up one-for-one as
+            // TSE produces output. `audio_samples_emitted` continues to
+            // track the **input** audio timeline (matching the gate
+            // decisions); `out.audio` lags by the buffered residue until
+            // [`Self::flush`] drains the tail.
+            let extracted = stage.process(audio_chunk).map_err(PipelineError::from)?;
+            self.tse_pending_gain.extend(gain.iter().copied());
+            for &x in &extracted {
+                let g = self
+                    .tse_pending_gain
+                    .pop_front()
+                    .expect("pending_gain length matches TSE input cumulative length");
+                out.audio.push(x * g);
+            }
+            out.tse_applied = true;
+        } else {
+            for (k, &g) in gain.iter().enumerate() {
+                out.audio.push(audio_chunk[k] * g);
+            }
         }
         self.audio_samples_emitted += audio_chunk.len();
         self.frame_idx += 1;
@@ -1507,8 +1573,12 @@ impl StreamingState {
     ) -> Result<(), PipelineError> {
         // Disjoint borrows: `vad` drives the core, `fbank` / `ecapa` /
         // `cohort` go into the refresh strategy. The `tse` field is
-        // ignored here — Stage C TSE is currently only wired through
-        // the offline `process_offline` path.
+        // ignored here — Phase 5 part 3 moves the live `TseStage` out
+        // of `components.tse` and into `StreamingState::tse_stage` at
+        // construction time so the buffered accumulator persists
+        // across `push_samples` calls; `components.tse` is left as
+        // `None` for the duration of the run (handed back through
+        // `StreamingPipeline::into_parts`).
         let PipelineComponents {
             vad,
             fbank,
@@ -1658,31 +1728,70 @@ impl StreamingState {
         components: &mut PipelineComponents,
         config: &StreamingConfig,
     ) -> Result<StreamingOutput, PipelineError> {
-        if self.audio_ring.is_empty() {
-            return Ok(StreamingOutput::default());
-        }
-        let n_input = self.input_per_frame();
-        if self.audio_ring.len() < n_input {
-            // Pad with silence so one more frame can flow through.
-            let pad = n_input - self.audio_ring.len();
-            self.audio_ring.extend(std::iter::repeat(0.0_f32).take(pad));
-        }
         let mut out = StreamingOutput::default();
-        // Drain remaining whole frames (may be > 1 if the caller
-        // pushed a chunk that's just shy of multiple frames).
-        // `drain_one_frame` itself returns `None` when the ring no
-        // longer has a full frame's worth of samples.
-        while let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? {
-            self.step_one_frame(
-                &audio_chunk,
-                &decision_chunk,
-                pool,
-                components,
-                config,
-                &mut out,
-            )?;
+        if !self.audio_ring.is_empty() {
+            let n_input = self.input_per_frame();
+            if self.audio_ring.len() < n_input {
+                // Pad with silence so one more frame can flow through.
+                let pad = n_input - self.audio_ring.len();
+                self.audio_ring.extend(std::iter::repeat(0.0_f32).take(pad));
+            }
+            // Drain remaining whole frames (may be > 1 if the caller
+            // pushed a chunk that's just shy of multiple frames).
+            // `drain_one_frame` itself returns `None` when the ring no
+            // longer has a full frame's worth of samples.
+            while let Some((audio_chunk, decision_chunk)) = self.drain_one_frame()? {
+                self.step_one_frame(
+                    &audio_chunk,
+                    &decision_chunk,
+                    pool,
+                    components,
+                    config,
+                    &mut out,
+                )?;
+            }
         }
+        // Stage C, Phase 5 part 3: drain the TSE accumulator tail so
+        // the final samples emerge. `TseStage::flush` zero-pads the
+        // partial chunk to `chunk_samples` and runs one last inference;
+        // we apply pending gains to as many of those samples as we have
+        // unconsumed gains and drop the rest (they correspond to the
+        // zero-pad).
+        self.drain_tse_tail(&mut out)?;
         Ok(out)
+    }
+
+    /// Drain any partial chunk left in the TSE accumulator into
+    /// `out.audio` by running `TseStage::flush()` and applying the
+    /// queued gains to its output. No-op when TSE is disabled or the
+    /// pending-gain queue is empty.
+    fn drain_tse_tail(&mut self, out: &mut StreamingOutput) -> Result<(), PipelineError> {
+        let Some(stage) = self.tse_stage.as_mut() else {
+            return Ok(());
+        };
+        if self.tse_pending_gain.is_empty() {
+            return Ok(());
+        }
+        let extracted = stage.flush().map_err(PipelineError::from)?;
+        // `flush()` either returns a full chunk (the zero-padded tail
+        // inference) or an empty vector when the accumulator was
+        // already empty. We only emit as many of those samples as we
+        // have pending gains for — the rest correspond to the
+        // zero-pad and are discarded.
+        let n_take = extracted.len().min(self.tse_pending_gain.len());
+        for &x in &extracted[..n_take] {
+            let g = self
+                .tse_pending_gain
+                .pop_front()
+                .expect("n_take <= pending_gain.len()");
+            out.audio.push(x * g);
+        }
+        // Any residual pending gains beyond what `flush()` returned
+        // are dropped — they referenced samples the TSE stage never
+        // saw a complete chunk for.
+        self.tse_pending_gain.clear();
+        out.tse_applied = true;
+        Ok(())
     }
 
     /// Async counterpart of [`Self::flush`]. Drains any residue +
@@ -1766,19 +1875,62 @@ impl StreamingPipeline {
     /// # Errors
     ///
     /// Returns `PipelineError` if the resampler can't be built
-    /// (only when `audio_sample_rate != pipeline.sample_rate`) or
-    /// if spawning the async worker fails.
+    /// (only when `audio_sample_rate != pipeline.sample_rate`), if
+    /// spawning the async worker fails, or — when
+    /// `config.pipeline.tse.is_some()` — if either the rate check
+    /// (`PipelineError::TseRateMismatch`), the async-mode rejection
+    /// (`PipelineError::TseAsyncUnsupported`), or the cond-embedding
+    /// snapshot (`PipelineError::TseMissingEnrollment`) fails, or the
+    /// TSE ONNX session can't be loaded.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on internal invariant violation — the
+    /// `tse_enabled implies Some` `expect` is unreachable because the
+    /// surrounding `if tse_enabled` reads the same flag.
     pub fn new(
         pool: EmbeddingPool,
         config: StreamingConfig,
-        components: PipelineComponents,
+        mut components: PipelineComponents,
     ) -> Result<Self, PipelineError> {
+        // Stage C, Phase 5 part 3: TSE wiring for streaming. The hard
+        // rate check + async rejection match the offline
+        // `process_offline` contract exactly. The cond embedding is
+        // snapshotted **once** here (mirroring offline's
+        // "frozen for the run" semantics); the embedding pool may
+        // evolve via auto-learn during streaming but the TSE stage
+        // keeps the construction-time anchor centroid as its conditioning.
+        //
+        // TODO(phase-4-48k-tse): drop the 16 kHz check below once the
+        // prod TSE export lands; the check becomes "model's expected
+        // SR == audio_sr == decision_sr".
+        // TODO(phase-5-followup): refresh the cond embedding on each
+        // auto-learn anchor update. Right now the snapshot is taken
+        // exactly once at stream start.
+        let tse_enabled = config.pipeline.tse.is_some();
+        if tse_enabled && config.pipeline.async_refresh {
+            return Err(PipelineError::TseAsyncUnsupported);
+        }
+        if tse_enabled {
+            let decision_sr = config.pipeline.sample_rate;
+            if config.audio_sample_rate != 16_000 || decision_sr != 16_000 {
+                return Err(PipelineError::TseRateMismatch {
+                    audio_sr: config.audio_sample_rate,
+                    decision_sr,
+                });
+            }
+        }
+
         if config.pipeline.async_refresh {
             let PipelineComponents {
                 vad,
                 fbank,
                 ecapa,
                 cohort,
+                // The async-refresh rejection above ensures
+                // `tse.is_none()` here when the rejection didn't
+                // already early-return; the destructure is just to
+                // keep the pattern exhaustive.
                 tse: _,
             } = components;
             let state = StreamingState::new_async(&config, fbank, ecapa)?;
@@ -1789,7 +1941,30 @@ impl StreamingPipeline {
                 components: ComponentsStorage::Async { vad, cohort },
             })
         } else {
-            let state = StreamingState::new(&config)?;
+            let mut state = StreamingState::new(&config)?;
+            if tse_enabled {
+                let stage_cfg = config
+                    .pipeline
+                    .tse
+                    .as_ref()
+                    .expect("tse_enabled implies Some");
+                let cond = tse_cond_embedding(&pool)?;
+                // Reuse a pre-built `components.tse` (reset + new cond)
+                // when the caller pre-loaded the ONNX; otherwise build
+                // a fresh stage from the config. Mirrors
+                // `ensure_tse_stage` in `pipeline.rs` so both wirings
+                // share the same caching contract.
+                let live_stage = if let Some(mut existing) = components.tse.take() {
+                    existing.reset();
+                    existing
+                        .set_cond_embedding(&cond)
+                        .map_err(PipelineError::from)?;
+                    existing
+                } else {
+                    TseStage::from_config(stage_cfg, &cond).map_err(PipelineError::from)?
+                };
+                state.tse_stage = Some(live_stage);
+            }
             Ok(Self {
                 state,
                 config,
@@ -1887,7 +2062,19 @@ impl StreamingPipeline {
     /// worker).
     pub fn into_parts(mut self) -> Result<(EmbeddingPool, PipelineComponents), PipelineError> {
         let components = match self.components {
-            ComponentsStorage::Sync(c) => *c,
+            ComponentsStorage::Sync(c) => {
+                let mut components = *c;
+                // Stage C, Phase 5 part 3: hand the live TSE stage
+                // back to the caller via `components.tse` so it can be
+                // persisted / inspected. The stage's accumulator is
+                // already drained (callers should `flush()` before
+                // `into_parts`), but the loaded ONNX session itself is
+                // worth preserving — building it costs ~tens of ms.
+                if let Some(stage) = self.state.tse_stage.take() {
+                    components.tse = Some(stage);
+                }
+                components
+            }
             ComponentsStorage::Async { vad, cohort } => {
                 let (fbank, ecapa) = self
                     .state
@@ -1898,10 +2085,13 @@ impl StreamingPipeline {
                     fbank,
                     ecapa,
                     cohort,
-                    // Stage C TSE is not threaded through the
-                    // async-refresh streaming worker yet; rebuild the
-                    // recovered `PipelineComponents` with `None` and
-                    // let callers stitch their own stage on top.
+                    // Stage C TSE in the async-refresh streaming worker
+                    // is rejected up-front by `StreamingPipeline::new`
+                    // (it returns `PipelineError::TseAsyncUnsupported`
+                    // before reaching this branch), so the recovered
+                    // `PipelineComponents` is always TSE-less here.
+                    // The live TSE state in a sync pipeline is handed
+                    // back via the `Sync` branch above.
                     tse: None,
                 }
             }
