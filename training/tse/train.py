@@ -201,6 +201,7 @@ def train_epoch(
     amp_dtype: torch.dtype | None = None,
     scaler: torch.amp.GradScaler | None = None,
     ema: ExponentialMovingAverage | None = None,
+    clip_grad_norm: float = 5.0,
 ) -> dict[str, float]:
     """One training epoch.
 
@@ -208,6 +209,12 @@ def train_epoch(
     (``torch.float16`` or ``torch.bfloat16``). ``scaler`` is only needed
     with fp16 on CUDA — bf16 trains stably without loss scaling. ``ema``,
     when given, is updated after every successful optimizer step.
+
+    ``clip_grad_norm`` is the max global gradient norm (defaults to ``5.0``,
+    matching the v3/v4 PoC runs). Tighter clipping (``1.0`` / ``0.5``) is
+    the standard fp16-AMP stability mitigation — fp16 underflow can spike
+    the gradient norm at low LR and a tighter clamp stops the resulting
+    NaN cascade.
 
     Accumulators stay on the model's device; the per-batch ``.item()``
     sync that v1 paid is consolidated into a single sync at epoch end.
@@ -231,12 +238,12 @@ def train_epoch(
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
             optimizer.step()
         if ema is not None:
             ema.update(model)
@@ -536,6 +543,7 @@ def run_training(
     weight_decay: float = 0.0,
     ema_decay: float = 0.0,
     amp: str = "auto",
+    clip_grad_norm: float = 5.0,
     compile_model: bool = False,
     device: str = "cpu",
     resume: bool = False,
@@ -598,6 +606,7 @@ def run_training(
         f"[train] params={count_parameters(model):,}  epochs={epochs}  "
         f"batch={batch_size}  lr={lr}  schedule={lr_schedule}+warmup{warmup_epochs}  "
         f"opt={optimizer_name}(wd={weight_decay})  amp={amp}({amp_dtype})  "
+        f"clip_grad_norm={clip_grad_norm}  "
         f"ema={ema_decay if ema is not None else 'off'}  device={device}",
         file=sys.stderr,
     )
@@ -612,6 +621,7 @@ def run_training(
             amp_dtype=amp_dtype,
             scaler=scaler,
             ema=ema,
+            clip_grad_norm=clip_grad_norm,
         )
         global_step += len(loader)
         elapsed = time.perf_counter() - t0
@@ -647,6 +657,7 @@ def run_training(
             "ema_decay": ema_decay if ema is not None else 0.0,
             "amp": amp,
             "amp_dtype": str(amp_dtype),
+            "clip_grad_norm": clip_grad_norm,
             "compile": compile_model,
         },
     }
@@ -720,6 +731,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="autocast: auto = fp16 on CUDA / off on CPU, on = also enable bf16 on CPU",
     )
     parser.add_argument(
+        "--clip-grad-norm",
+        type=float,
+        default=5.0,
+        help=(
+            "max global gradient norm before optimizer step (default 5.0). "
+            "Lower values (1.0 / 0.5) are the standard fp16-AMP stability "
+            "mitigation — tighter clamp prevents the underflow-driven NaN "
+            "cascade seen in v3 at low LR."
+        ),
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="wrap the model in torch.compile (falls back silently if unsupported)",
@@ -728,7 +750,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-dir",
         type=Path,
         default=None,
-        help="root of LibriSpeech/MUSAN data (full mode). Omit to use the synthetic fixture set.",
+        help="root of training data (full mode). Omit to use the synthetic fixture set.",
+    )
+    parser.add_argument(
+        "--data-source",
+        choices=("librispeech-musan", "vctk-demand"),
+        default="librispeech-musan",
+        help=(
+            "real-data loader to use under --data-dir. "
+            "'librispeech-musan' is the 16 kHz PoC path; 'vctk-demand' is the "
+            "48 kHz production path (VCTK speakers + DEMAND ch01.wav noise)."
+        ),
     )
     parser.add_argument(
         "--embeddings-npz",
@@ -797,15 +829,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.data_dir is not None:
-        from .data import librispeech_musan_sources
+        if args.data_source == "vctk-demand":
+            from .data import vctk_demand_sources
 
-        sources = librispeech_musan_sources(
-            args.data_dir,
-            sample_rate=config.sample_rate,
-            embeddings_npz=args.embeddings_npz,
-            n_pairs=args.n_pairs,
-            seed=args.seed,
-        )
+            sources = vctk_demand_sources(
+                args.data_dir,
+                sample_rate=config.sample_rate,
+                embeddings_npz=args.embeddings_npz,
+                n_pairs=args.n_pairs,
+                seed=args.seed,
+            )
+        else:
+            from .data import librispeech_musan_sources
+
+            sources = librispeech_musan_sources(
+                args.data_dir,
+                sample_rate=config.sample_rate,
+                embeddings_npz=args.embeddings_npz,
+                n_pairs=args.n_pairs,
+                seed=args.seed,
+            )
         print(f"[train] {len(sources)} source items from {args.data_dir}", file=sys.stderr)
         dataset = TSEMixtureDataset(
             sources,
@@ -839,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
         ema_decay=args.ema_decay,
         amp=args.amp,
+        clip_grad_norm=args.clip_grad_norm,
         compile_model=args.compile,
         device=args.device,
         resume=args.resume,

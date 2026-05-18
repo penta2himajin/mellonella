@@ -12,9 +12,11 @@ from tse.train import (
     ExponentialMovingAverage,
     MuonHybrid,
     _build_optimizer,
+    _build_parser,
     _build_scheduler,
     _newton_schulz_orthogonalize,
     _resolve_amp_dtype,
+    train_epoch,
 )
 
 
@@ -325,3 +327,81 @@ def test_build_optimizer_adamw_fused_works_on_cpu() -> None:
     # On CPU, fused=False is auto-selected; the call should not raise.
     opt = _build_optimizer(_tiny_model(), "adamw-fused", lr=1e-3, weight_decay=0.01)
     assert isinstance(opt, torch.optim.AdamW)
+
+
+# ---------------------------------------------------------------------------
+# Gradient-norm clipping plumbing (--clip-grad-norm)
+# ---------------------------------------------------------------------------
+
+
+def test_train_epoch_clip_grad_norm_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """train_epoch must pass its ``clip_grad_norm`` arg to ``clip_grad_norm_``.
+
+    The default is ``5.0`` (preserving the old v3/v4 behaviour); a CLI
+    setting like ``--clip-grad-norm 0.5`` is the standard fp16-AMP stability
+    knob. We capture every call into ``torch.nn.utils.clip_grad_norm_`` and
+    assert the max-norm threshold it received matches what we passed.
+    """
+    from tse.config import TSEConfig
+    from tse.data import synthetic_fixture_dataset
+    from tse.model import CausalConvTasNetTSE
+
+    config = TSEConfig.poc_16k()
+    model = CausalConvTasNetTSE(config)
+    ds = synthetic_fixture_dataset(n=2, sample_rate=config.sample_rate, duration_sec=0.5, seed=0)
+    loader = torch.utils.data.DataLoader(ds, batch_size=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    captured: list[float] = []
+    original = torch.nn.utils.clip_grad_norm_
+
+    def _spy(params, max_norm, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append(float(max_norm))
+        return original(params, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _spy)
+
+    train_epoch(model, loader, optimizer, "cpu", clip_grad_norm=0.5)
+
+    assert captured, "clip_grad_norm_ was never called"
+    assert all(c == pytest.approx(0.5) for c in captured)
+
+
+def test_train_epoch_default_clip_grad_norm_is_five(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default clip_grad_norm preserves the v3/v4 PoC value of 5.0."""
+    from tse.config import TSEConfig
+    from tse.data import synthetic_fixture_dataset
+    from tse.model import CausalConvTasNetTSE
+
+    config = TSEConfig.poc_16k()
+    model = CausalConvTasNetTSE(config)
+    ds = synthetic_fixture_dataset(n=2, sample_rate=config.sample_rate, duration_sec=0.5, seed=0)
+    loader = torch.utils.data.DataLoader(ds, batch_size=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    captured: list[float] = []
+    original = torch.nn.utils.clip_grad_norm_
+
+    def _spy(params, max_norm, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append(float(max_norm))
+        return original(params, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _spy)
+
+    # Omit clip_grad_norm — exercise the default branch.
+    train_epoch(model, loader, optimizer, "cpu")
+
+    assert captured
+    assert all(c == pytest.approx(5.0) for c in captured)
+
+
+def test_cli_clip_grad_norm_flag() -> None:
+    """The new --clip-grad-norm flag is wired into the argparser."""
+    parser = _build_parser()
+    args = parser.parse_args(["--clip-grad-norm", "0.5"])
+    assert args.clip_grad_norm == pytest.approx(0.5)
+    # Default preserves v3/v4 behaviour.
+    args_default = parser.parse_args([])
+    assert args_default.clip_grad_norm == pytest.approx(5.0)

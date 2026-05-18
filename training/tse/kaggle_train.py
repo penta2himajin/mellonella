@@ -1,14 +1,25 @@
-"""Kaggle kernel entrypoint for the Stage C 16 kHz PoC.
+"""Kaggle kernel entrypoint for the Stage C training runs.
 
-Designed to run as a Kaggle Python kernel against three uploaded datasets:
+Designed to run as a Kaggle Python kernel. Supports two model presets via
+the ``POC_CONFIG`` env var:
+
+* ``POC_CONFIG=poc_16k`` (default) — the 16 kHz PoC path:
+  LibriSpeech + MUSAN, ``TSEConfig.poc_16k()``.
+* ``POC_CONFIG=prod_48k`` — the 48 kHz production path:
+  VCTK + DEMAND, ``TSEConfig.prod_48k()`` (encoder kernel/stride 96/48 so
+  the latent rate stays at 1 kHz; the separator is byte-identical).
+
+Expected Kaggle inputs (override via env vars below):
 
 ================  ============================================================
-Dataset slug      Expected contents (override via env vars below)
+Preset            Expected datasets
 ================  ============================================================
-LibriSpeech       ``LibriSpeech/train-clean-100/<speaker>/<chapter>/*.flac``
-MUSAN noise       ``noise/.../*.wav``  (subset suffices — 10-30 clips is fine)
-ECAPA ONNX        ``ecapa_tdnn.onnx`` (the ``embedding-only`` graph from
-                  ``scripts/export_ecapa_onnx.py``)
+poc_16k           LibriSpeech (``LibriSpeech/train-clean-100/<spk>/<ch>/*.flac``)
+                  + MUSAN noise (``noise/.../*.wav``)
+                  + ECAPA ONNX (``ecapa_tdnn.onnx``)
+prod_48k          VCTK (``<pXXX>_<utt>.wav`` somewhere under the dataset root)
+                  + DEMAND (``<CATEGORY>/ch01.wav`` per noise category)
+                  + ECAPA ONNX
 ================  ============================================================
 
 The kernel:
@@ -16,20 +27,25 @@ The kernel:
 1. ``git clone`` mellonella (branch configurable via ``MELLONELLA_REF``).
 2. ``pip install -e training[onnx]`` plus SpeechBrain for the ECAPA Fbank
    front-end.
-3. Symlinks the input datasets into a single ``data/`` root that
-   :func:`tse.data.librispeech_musan_sources` understands.
+3. Symlinks the input datasets into a single ``data/`` root that the
+   loader understands.
 4. Runs :mod:`tse.prepare_enrollment_embeddings` (skipped if the
    ``.npz`` already exists from a previous run).
-5. Runs :mod:`tse.train` on GPU for the PoC.
+5. Runs :mod:`tse.train` on GPU.
 6. Writes checkpoints + ``metrics.json`` to ``/kaggle/working/tse_poc/``.
 
 Env-var overrides (set in the kernel UI under "Settings → Environment"):
 
 * ``MELLONELLA_REF`` — git ref to clone (default ``main``).
+* ``POC_CONFIG`` — ``poc_16k`` (default) or ``prod_48k``.
 * ``LIBRISPEECH_DATA``, ``MUSAN_DATA``, ``ECAPA_ONNX`` — override the
-  ``/kaggle/input/<slug>/...`` paths.
+  ``/kaggle/input/<slug>/...`` paths (poc_16k).
+* ``VCTK_DATA``, ``DEMAND_DATA`` — same idea for the 48 kHz path.
 * ``POC_EPOCHS``, ``POC_BATCH``, ``POC_N_PAIRS``, ``POC_LR``,
   ``POC_LR_SCHEDULE`` (``none`` / ``cosine`` / ``step``) — training knobs.
+* ``POC_CLIP_GRAD_NORM`` — max global gradient norm (default ``5.0`` to
+  preserve v3/v4; lower values like ``1.0`` / ``0.5`` are the standard
+  fp16-AMP stability mitigation).
 * ``ENROLL_LIMIT``, ``ENROLL_DEVICE`` (``auto`` / ``cuda`` / ``cpu``) —
   enrollment-embedding precompute knobs. ``auto`` uses CUDA when
   ``onnxruntime-gpu`` is available, otherwise CPU.
@@ -90,30 +106,55 @@ def main() -> int:
     _run([sys.executable, "-m", "pip", "install", "-q", "-e", f"{repo_dir}/training[onnx]"])
     _run([sys.executable, "-m", "pip", "install", "-q", "speechbrain>=1.0", "librosa>=0.10"])
 
-    # 3. Stitch the Kaggle input datasets into the data layout that
-    # librispeech_musan_sources / prepare_enrollment_embeddings expect.
-    libri_src = _env_path("LIBRISPEECH_DATA", KAGGLE_INPUT / "librispeech-train-clean-100")
-    musan_src = _env_path("MUSAN_DATA", KAGGLE_INPUT / "musan-subset")
+    # 3. Stitch the Kaggle input datasets into the data layout the loaders
+    # expect. The poc_16k path uses LibriSpeech + MUSAN; prod_48k uses
+    # VCTK + DEMAND. ECAPA ONNX is required either way for enrollment
+    # embedding precompute.
+    poc_config = os.environ.get("POC_CONFIG", "poc_16k")
+    if poc_config not in ("poc_16k", "prod_48k"):
+        raise ValueError(f"POC_CONFIG must be 'poc_16k' or 'prod_48k', got {poc_config!r}")
+
     ecapa_onnx = _env_path("ECAPA_ONNX", KAGGLE_INPUT / "ecapa-onnx" / "ecapa_tdnn.onnx")
-    for required in (libri_src, musan_src, ecapa_onnx):
-        if not required.exists():
-            raise FileNotFoundError(f"required kaggle input missing: {required}")
+    if not ecapa_onnx.exists():
+        raise FileNotFoundError(f"required kaggle input missing: {ecapa_onnx}")
 
     data_root = KAGGLE_WORKING / "data"
-    # librispeech_musan_sources looks for data_root/LibriSpeech/<split>; users
-    # commonly upload the split directory directly, so accept either shape.
-    libri_dst = data_root / "LibriSpeech" / "train-clean-100"
-    if (libri_src / "train-clean-100").is_dir():
-        _symlink(libri_src / "train-clean-100", libri_dst)
-    else:
-        _symlink(libri_src, libri_dst)
-    # MUSAN: _scan_musan_noise looks in extracted/musan/<subset>, subset/<subset>,
-    # or musan/<subset>. We materialise the first.
-    musan_dst = data_root / "musan" / "extracted" / "musan" / "noise"
-    if (musan_src / "noise").is_dir():
-        _symlink(musan_src / "noise", musan_dst)
-    else:
-        _symlink(musan_src, musan_dst)
+
+    if poc_config == "poc_16k":
+        libri_src = _env_path("LIBRISPEECH_DATA", KAGGLE_INPUT / "librispeech-train-clean-100")
+        musan_src = _env_path("MUSAN_DATA", KAGGLE_INPUT / "musan-subset")
+        for required in (libri_src, musan_src):
+            if not required.exists():
+                raise FileNotFoundError(f"required kaggle input missing: {required}")
+        # librispeech_musan_sources looks for data_root/LibriSpeech/<split>;
+        # users commonly upload the split directory directly, so accept either.
+        libri_dst = data_root / "LibriSpeech" / "train-clean-100"
+        if (libri_src / "train-clean-100").is_dir():
+            _symlink(libri_src / "train-clean-100", libri_dst)
+        else:
+            _symlink(libri_src, libri_dst)
+        # MUSAN: _scan_musan_noise looks in extracted/musan/<subset>,
+        # subset/<subset>, or musan/<subset>. We materialise the first.
+        musan_dst = data_root / "musan" / "extracted" / "musan" / "noise"
+        if (musan_src / "noise").is_dir():
+            _symlink(musan_src / "noise", musan_dst)
+        else:
+            _symlink(musan_src, musan_dst)
+        enroll_audio_dir = libri_dst
+        data_source = "librispeech-musan"
+    else:  # prod_48k
+        vctk_src = _env_path("VCTK_DATA", KAGGLE_INPUT / "vctk")
+        demand_src = _env_path("DEMAND_DATA", KAGGLE_INPUT / "demand")
+        for required in (vctk_src, demand_src):
+            if not required.exists():
+                raise FileNotFoundError(f"required kaggle input missing: {required}")
+        # vctk_demand_sources expects data_root/VCTK-Corpus and data_root/demand.
+        vctk_dst = data_root / "VCTK-Corpus"
+        _symlink(vctk_src, vctk_dst)
+        demand_dst = data_root / "demand"
+        _symlink(demand_src, demand_dst)
+        enroll_audio_dir = vctk_dst
+        data_source = "vctk-demand"
 
     # 4. Precompute enrollment embeddings (idempotent — skip if up-to-date).
     emb_out = KAGGLE_WORKING / "enroll_embeddings.npz"
@@ -128,7 +169,7 @@ def main() -> int:
                 "-m",
                 "tse.prepare_enrollment_embeddings",
                 "--audio-dir",
-                str(libri_dst),
+                str(enroll_audio_dir),
                 "--out",
                 str(emb_out),
                 "--limit",
@@ -154,6 +195,7 @@ def main() -> int:
     warmup_epochs = os.environ.get("POC_WARMUP_EPOCHS", "0")
     ema_decay = os.environ.get("POC_EMA_DECAY", "0.0")
     amp = os.environ.get("POC_AMP", "auto")
+    clip_grad_norm = os.environ.get("POC_CLIP_GRAD_NORM", "5.0")
     poc_device = os.environ.get("POC_DEVICE", "cuda")
     num_workers = os.environ.get("POC_NUM_WORKERS", "2")
     cmd = [
@@ -161,9 +203,11 @@ def main() -> int:
         "-m",
         "tse.train",
         "--config",
-        "poc_16k",
+        poc_config,
         "--data-dir",
         str(data_root),
+        "--data-source",
+        data_source,
         "--embeddings-npz",
         str(emb_out),
         "--n-pairs",
@@ -186,6 +230,8 @@ def main() -> int:
         ema_decay,
         "--amp",
         amp,
+        "--clip-grad-norm",
+        clip_grad_norm,
         "--device",
         poc_device,
         "--num-workers",

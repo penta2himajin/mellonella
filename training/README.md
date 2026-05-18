@@ -91,6 +91,13 @@ python -m tse.train --epochs 100 --data-dir data/ --out build/tse
 It writes per-epoch checkpoints (`ckpt_epoch*.pt`) and a `metrics.json`,
 and supports `--resume`.
 
+For the 48 kHz production model, pass `--config prod_48k` and point
+`--data-dir` at a VCTK + DEMAND root (`--data-source vctk-demand`). The
+`--clip-grad-norm` flag (default `5.0`, tighter values `1.0`/`0.5`) is
+the recommended fp16-AMP stability mitigation — it prevents the
+underflow-driven NaN cascade observed in PoC v3 at low LR while keeping
+AMP on for the speed win.
+
 ### How this maps to Kaggle (Phase 3)
 
 1. **Enrollment embeddings** — `prepare_enrollment_embeddings.py`
@@ -98,17 +105,25 @@ and supports `--resume`.
    the existing ECAPA ONNX (`$MELLONELLA_ECAPA_ONNX`). The ECAPA model is
    never in the training loop.
 2. **Data** — `data.py::librispeech_musan_sources` builds `TSESourceItem`
-   bundles from local LibriSpeech + MUSAN. Audio is **not** loaded eagerly
-   (sources hold `Path`\ s); `TSEMixtureDataset` decodes lazily per access
-   so a 6 GB train-clean-100 never has to live in RAM. The same dataset
-   then does on-the-fly target+interferer(+noise) mixing.
+   bundles from local LibriSpeech + MUSAN (the 16 kHz PoC path), and
+   `data.py::vctk_demand_sources` does the same for VCTK + DEMAND (the
+   48 kHz production path: VCTK speakers grouped by the leading `pXXX`
+   prefix of the filename; DEMAND noise canonicalised on `ch01.wav` per
+   category so the 16-channel arrays aren't duplicated). Audio is **not**
+   loaded eagerly (sources hold `Path`\ s); `TSEMixtureDataset` decodes
+   lazily per access (and resamples VCTK 44.1 → 48 kHz on the fly via
+   librosa) so a 6 GB train-clean-100 never has to live in RAM. The same
+   dataset then does on-the-fly target+interferer(+noise) mixing.
 3. **Train** — `tse.kaggle_train` is a self-contained kernel entrypoint
    (`python -m tse.kaggle_train` on Kaggle): clones the repo, installs
    `training[onnx]` + SpeechBrain, stitches `/kaggle/input/` datasets into
    the layout the loader expects, runs `prepare_enrollment_embeddings`,
-   and then `train.py` on GPU. Knobs via env vars: `POC_EPOCHS`,
-   `POC_BATCH`, `POC_N_PAIRS`, `POC_LR`, `ENROLL_LIMIT`,
-   `LIBRISPEECH_DATA` / `MUSAN_DATA` / `ECAPA_ONNX` (path overrides).
+   and then `train.py` on GPU. Knobs via env vars: `POC_CONFIG` (`poc_16k`
+   default or `prod_48k` for the VCTK + DEMAND path), `POC_EPOCHS`,
+   `POC_BATCH`, `POC_N_PAIRS`, `POC_LR`, `POC_CLIP_GRAD_NORM` (max global
+   gradient norm — set to `1.0` or `0.5` for tighter fp16-AMP stability),
+   `ENROLL_LIMIT`, `LIBRISPEECH_DATA` / `MUSAN_DATA` / `VCTK_DATA` /
+   `DEMAND_DATA` / `ECAPA_ONNX` (path overrides).
 4. **Export** — `scripts/export_tse_onnx.py export-and-verify
    --checkpoint <ckpt>` produces the streaming ONNX for the Rust core.
 
@@ -119,7 +134,9 @@ and supports `--resume`.
   cumulative LN, causal TCN blocks, param-count helper.
 - `data.py` — `TSEMixtureDataset` (lazy `Path` decoding) +
   `synthetic_fixture_dataset` (in-memory, no downloads) +
-  `librispeech_musan_sources` (real LibriSpeech + MUSAN loader).
+  `librispeech_musan_sources` (real LibriSpeech + MUSAN loader, 16 kHz
+  PoC path) + `vctk_demand_sources` (VCTK + DEMAND loader, 48 kHz
+  production path).
 - `kaggle_train.py` — Kaggle kernel entrypoint (env-var knobs, idempotent
   re-runs).
 - `loss.py` — negative SI-SDR loss, consistent with `bench`'s `si_sdr`.
