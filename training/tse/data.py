@@ -531,3 +531,199 @@ def librispeech_musan_sources(
     # downstream TSEMixtureDataset (which does the actual resampling).
     _ = sample_rate
     return items
+
+
+# ---------------------------------------------------------------------------
+# Real-data loading path — VCTK + DEMAND (48 kHz production target)
+# ---------------------------------------------------------------------------
+
+
+def _scan_vctk_speakers(vctk_dir: Path) -> dict[str, list[Path]]:
+    """Group VCTK utterances by speaker id (``pXXX``).
+
+    VCTK filenames are always ``<speaker>_<utt>.{wav,flac}`` (e.g.
+    ``p225_001.wav``). On Kaggle the on-disk layout varies between dataset
+    versions: some hosts uncompress to ``wav48_silence_trimmed/pXXX/...``,
+    others to ``wav48/pXXX/...``, others to a flat ``pXXX/...``. Rather
+    than codifying one layout, we walk the tree once and key on the
+    leading ``pXXX`` token of each filename — that is the reliable
+    invariant across every layout we have seen. The parent directory name
+    is used as a fallback if the filename does not start with ``p`` (e.g.
+    re-encoded variants like ``utt_001.wav`` saved under ``pXXX/``).
+    """
+    by_speaker: dict[str, list[Path]] = {}
+    for ext in ("*.wav", "*.flac"):
+        for f in vctk_dir.rglob(ext):
+            stem = f.stem
+            speaker_id: str | None = None
+            if stem.startswith("p") and "_" in stem:
+                head = stem.split("_", 1)[0]
+                # Match the canonical pXXX form (p + 3+ digits).
+                if head[1:].isdigit() and len(head) >= 2:
+                    speaker_id = head
+            if speaker_id is None:
+                parent = f.parent.name
+                if parent.startswith("p") and parent[1:].isdigit():
+                    speaker_id = parent
+            if speaker_id is None:
+                continue
+            by_speaker.setdefault(speaker_id, []).append(f)
+    return by_speaker
+
+
+def _scan_demand_noise(data_dir: Path, demand_root: str) -> list[Path]:
+    """Find DEMAND noise ``ch01.wav`` files under common Kaggle layouts.
+
+    DEMAND publishes each noise category (e.g. ``TBUS``, ``TCAR``,
+    ``PCAFETER``) as a 16-channel recording, split into 16 separate
+    single-channel files named ``ch01.wav`` … ``ch16.wav``. We canonicalise
+    on channel 1 so each category contributes exactly one noise clip — the
+    rest are sibling microphones in the same array and would be redundant
+    for training.
+
+    Kaggle hosts the dataset under several path variants; we probe a few
+    common ones in order, mirroring :func:`_scan_musan_noise`'s
+    candidate-fallback shape.
+    """
+    candidates = [
+        data_dir / demand_root,
+        data_dir / demand_root / "DEMAND",
+        data_dir / demand_root / "demand",
+        data_dir / demand_root / "extracted",
+        data_dir / demand_root / "extracted" / "demand",
+    ]
+    for c in candidates:
+        if not c.is_dir():
+            continue
+        files = sorted(p for p in c.rglob("ch01.wav") if p.is_file())
+        if files:
+            return files
+    return []
+
+
+def vctk_demand_sources(
+    data_dir: Path | None = None,
+    *,
+    vctk_root: str = "VCTK-Corpus",
+    demand_root: str = "demand",
+    n_pairs: int | None = None,
+    sample_rate: int = 48_000,
+    embeddings_npz: Path | None = None,
+    cond_dim: int = 192,
+    seed: int = 0,
+) -> list[TSESourceItem]:
+    """Build :class:`TSESourceItem` bundles from local VCTK + DEMAND.
+
+    This is the 48 kHz production-target counterpart to
+    :func:`librispeech_musan_sources`. The only structural differences are
+    the speaker-id parsing (VCTK encodes the speaker as the ``pXXX`` prefix
+    of the filename, e.g. ``p225_001.wav``, not as the LibriSpeech
+    ``<speaker>-<chapter>-<utt>`` triple) and the noise canonicalisation
+    (DEMAND ships 16-channel arrays split into ``ch01.wav`` … ``ch16.wav``
+    per category directory; we keep ``ch01.wav`` only).
+
+    Layout expected under ``data_dir`` (defaults to ``$MELLONELLA_DATA_DIR``
+    or ``./data``):
+
+    ::
+
+        <data_dir>/<vctk_root>/.../<pXXX>_<utt>.{wav,flac}
+        <data_dir>/<demand_root>/<CATEGORY>/ch01.wav
+
+    VCTK is natively 44.1 kHz so :func:`_load_audio_field` resamples to
+    ``sample_rate`` (default 48 kHz) on access; DEMAND is already 48 kHz.
+
+    ``embeddings_npz`` works the same way as in
+    :func:`librispeech_musan_sources` — keys are utterance ids (the
+    relative path under ``vctk_root`` without the audio suffix). When
+    omitted, a deterministic per-speaker placeholder cond vector is used
+    (plumbing-only — a model trained against it cannot generalise; a
+    :class:`UserWarning` is emitted).
+    """
+    data_dir = data_dir if data_dir is not None else _default_data_dir()
+    vctk_dir = data_dir / vctk_root
+    if not vctk_dir.is_dir():
+        raise FileNotFoundError(f"VCTK directory not found: {vctk_dir}")
+
+    by_speaker = _scan_vctk_speakers(vctk_dir)
+    if len(by_speaker) < 2:
+        raise RuntimeError(f"need >= 2 speakers under {vctk_dir}, found {len(by_speaker)}")
+
+    embeddings: dict[str, np.ndarray] | None = None
+    if embeddings_npz is not None:
+        loaded = np.load(embeddings_npz)
+        embeddings = {k: loaded[k].astype(np.float32) for k in loaded.files}
+        print(
+            f"[data] loaded {len(embeddings)} enrollment embeddings from {embeddings_npz}",
+            file=sys.stderr,
+        )
+    else:
+        warnings.warn(
+            "vctk_demand_sources called without embeddings_npz — using a "
+            "deterministic per-speaker placeholder vector. This is for plumbing "
+            "tests only; a model trained against it cannot condition on the "
+            "target. Pass embeddings_npz= for real training.",
+            stacklevel=2,
+        )
+
+    noise_files = _scan_demand_noise(data_dir, demand_root)
+    if not noise_files:
+        warnings.warn(
+            f"no DEMAND ch01.wav files found under {data_dir / demand_root!s}; "
+            f"training without noise augmentation.",
+            stacklevel=2,
+        )
+
+    rng = np.random.default_rng(seed)
+    speakers = sorted(by_speaker.keys())
+    for s in speakers:
+        by_speaker[s].sort()
+
+    all_utts: list[tuple[str, Path]] = [(s, p) for s in speakers for p in by_speaker[s]]
+    rng.shuffle(all_utts)
+
+    items: list[TSESourceItem] = []
+    for target_speaker, target_path in all_utts:
+        # Utterance id is the relative path under vctk_root with the suffix
+        # stripped — keeps embeddings_npz keys layout-stable across the
+        # several on-disk VCTK variants we accept.
+        utt_id = target_path.relative_to(vctk_dir).with_suffix("").as_posix()
+        if embeddings is not None:
+            if utt_id not in embeddings:
+                continue
+            cond = embeddings[utt_id]
+        else:
+            cond = _deterministic_cond(target_speaker, cond_dim)
+
+        other_speaker = target_speaker
+        while other_speaker == target_speaker:
+            other_speaker = speakers[int(rng.integers(0, len(speakers)))]
+        interferer_choices = by_speaker[other_speaker]
+        interferer_path = interferer_choices[int(rng.integers(0, len(interferer_choices)))]
+
+        noise_path: Path | None = None
+        if noise_files:
+            noise_path = noise_files[int(rng.integers(0, len(noise_files)))]
+
+        items.append(
+            TSESourceItem(
+                target=target_path,
+                interferer=interferer_path,
+                cond_embedding=cond,
+                noise=noise_path,
+                sample_id=utt_id,
+            )
+        )
+        if n_pairs is not None and len(items) >= n_pairs:
+            break
+
+    if not items:
+        msg = f"no source items built from {vctk_dir}"
+        if embeddings is not None:
+            msg += " (utterance ids in embeddings_npz did not match any audio file)"
+        raise RuntimeError(msg)
+    # sample_rate is plumbed through for documentation and is consumed by the
+    # downstream TSEMixtureDataset (which does the actual resampling — VCTK
+    # is natively 44.1 kHz, DEMAND is 48 kHz).
+    _ = sample_rate
+    return items

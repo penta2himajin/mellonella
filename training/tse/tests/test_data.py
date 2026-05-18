@@ -23,6 +23,7 @@ from tse.data import (
     TSESourceItem,
     _load_audio_field,
     librispeech_musan_sources,
+    vctk_demand_sources,
 )
 
 SR = 16_000
@@ -239,3 +240,148 @@ def test_precache_invalid_dtype_raises(tmp_path: Path) -> None:
     ds = TSEMixtureDataset(sources, sample_rate=SR, segment_samples=SR)
     with pytest.raises(ValueError, match="dtype"):
         ds.precache_audio(dtype="float64", verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# vctk_demand_sources — tiny on-disk fixture
+# ---------------------------------------------------------------------------
+
+
+def _build_vctk_fixture(
+    tmp_path: Path,
+    *,
+    speakers: list[str] | None = None,
+    utts_per_speaker: int = 2,
+) -> list[str]:
+    """Write a tiny VCTK-shaped tree under ``<tmp>/VCTK-Corpus/...``.
+
+    We use the ``wav48_silence_trimmed/<pXXX>/<pXXX>_<utt>.wav`` layout —
+    the default for recent VCTK Kaggle drops. The loader's filename-prefix
+    scan also works against the other variants (``wav48/...``, flat
+    ``pXXX/...``); this fixture validates that the prefix scan finds the
+    speakers regardless.
+
+    Returns the list of utterance ids (relative to ``VCTK-Corpus/``,
+    without the suffix), so the embeddings-npz test can build a matching
+    lookup table.
+    """
+    if speakers is None:
+        speakers = ["p225", "p226", "p227"]
+    root = tmp_path / "VCTK-Corpus" / "wav48_silence_trimmed"
+    utt_ids: list[str] = []
+    rng = np.random.default_rng(0)
+    for s in speakers:
+        spk_dir = root / s
+        spk_dir.mkdir(parents=True, exist_ok=True)
+        for k in range(utts_per_speaker):
+            f0 = 110.0 + rng.uniform(0, 200.0)
+            # We deliberately write 16 kHz wav files for the fixture
+            # (cheap to generate); the dataset resamples to its
+            # sample_rate on access.
+            wav = _sine(SR, SR, f0, seed=hash((s, k)) & 0xFFFF)
+            fname = f"{s}_{k:03d}.wav"
+            sf.write(spk_dir / fname, wav, SR)
+            utt_ids.append(f"wav48_silence_trimmed/{s}/{Path(fname).stem}")
+    return utt_ids
+
+
+def _write_demand_noise(
+    tmp_path: Path,
+    *,
+    categories: list[str] | None = None,
+) -> None:
+    """Write a tiny DEMAND-shaped tree under ``<tmp>/demand/<CATEGORY>/chNN.wav``.
+
+    Includes decoy ``ch02.wav`` and ``ch03.wav`` per category to verify the
+    loader keeps only ``ch01.wav``.
+    """
+    if categories is None:
+        categories = ["TBUS", "TCAR"]
+    root = tmp_path / "demand"
+    rng = np.random.default_rng(42)
+    for cat in categories:
+        cat_dir = root / cat
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        for ch in (1, 2, 3):
+            wav = (rng.standard_normal(SR) * 0.05).astype(np.float32)
+            sf.write(cat_dir / f"ch{ch:02d}.wav", wav, SR)
+
+
+def test_vctk_demand_sources_without_embeddings(tmp_path: Path) -> None:
+    """Plumbing path: builds source items, uses deterministic cond fallback."""
+    _build_vctk_fixture(tmp_path, speakers=["p225", "p226", "p227"], utts_per_speaker=2)
+    _write_demand_noise(tmp_path, categories=["TBUS", "TCAR"])
+
+    with pytest.warns(UserWarning, match="placeholder"):
+        sources = vctk_demand_sources(tmp_path, n_pairs=4, seed=0)
+
+    assert len(sources) == 4
+    for s in sources:
+        assert isinstance(s.target, Path)
+        assert isinstance(s.interferer, Path)
+        assert s.noise is None or isinstance(s.noise, Path)
+        assert s.cond_embedding.shape == (192,)
+        # Speaker id is the pXXX prefix of the filename.
+        target_speaker = Path(s.target).stem.split("_", 1)[0]
+        interferer_speaker = Path(s.interferer).stem.split("_", 1)[0]
+        assert target_speaker != interferer_speaker
+        # DEMAND noise canonicalisation: only ch01.wav is used.
+        if s.noise is not None:
+            assert Path(s.noise).name == "ch01.wav"
+
+
+def test_vctk_demand_sources_with_embeddings(tmp_path: Path) -> None:
+    """When embeddings_npz is given, only matching utterance ids are kept."""
+    utt_ids = _build_vctk_fixture(tmp_path, speakers=["p225", "p226"], utts_per_speaker=2)
+    # No DEMAND noise — exercise the no-noise path too.
+
+    keep_ids = utt_ids[:2]
+    embeds = {
+        uid: np.random.default_rng(i).standard_normal(192).astype(np.float32)
+        for i, uid in enumerate(keep_ids)
+    }
+    npz_path = tmp_path / "embeddings.npz"
+    np.savez(npz_path, **embeds)  # type: ignore[arg-type]
+
+    sources = vctk_demand_sources(
+        tmp_path,
+        embeddings_npz=npz_path,
+        n_pairs=None,
+        seed=0,
+    )
+    assert len(sources) == len(keep_ids)
+    seen_ids = {s.sample_id for s in sources}
+    assert seen_ids == set(keep_ids)
+    for s in sources:
+        np.testing.assert_array_equal(s.cond_embedding, embeds[s.sample_id])
+
+
+def test_vctk_demand_sources_missing_dir_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        vctk_demand_sources(tmp_path, embeddings_npz=None)
+
+
+def test_vctk_demand_dataset_end_to_end_48k(tmp_path: Path) -> None:
+    """vctk_demand_sources → TSEMixtureDataset at 48 kHz resamples on access.
+
+    Fixture wavs are written at 16 kHz for cheapness; the dataset is built
+    at ``sample_rate=48_000``, so ``_load_audio_field`` must resample 3×
+    on access. We assert the returned tensors are at the 48 kHz length.
+    """
+    pytest.importorskip("librosa")  # resampling backend
+    _build_vctk_fixture(tmp_path, speakers=["p225", "p226"], utts_per_speaker=2)
+    _write_demand_noise(tmp_path, categories=["TBUS"])
+    with pytest.warns(UserWarning):
+        sources = vctk_demand_sources(tmp_path, n_pairs=2, sample_rate=48_000, seed=0)
+    target_sr = 48_000
+    ds = TSEMixtureDataset(
+        sources, sample_rate=target_sr, segment_samples=target_sr, random_crop=False
+    )
+    mix, cond, target = ds[0]
+    # The dataset resampled the 1-second 16 kHz wav up to 48 kHz before
+    # cropping to ``segment_samples``, so the output is exactly
+    # ``target_sr`` samples long.
+    assert mix.shape == (target_sr,)
+    assert target.shape == (target_sr,)
+    assert cond.shape == (192,)
+    assert torch.isfinite(mix).all() and torch.isfinite(target).all()
