@@ -179,6 +179,64 @@ class TSEMixtureDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sources)
 
+    def precache_audio(self, *, dtype: str = "float32", verbose: bool = True) -> dict[str, int]:
+        """Decode every unique audio path in ``sources`` into memory.
+
+        Replaces ``Path``-typed audio fields with pre-loaded ``np.ndarray``\\ s
+        so ``__getitem__`` does a memory read instead of a per-access FLAC
+        decode + disk seek. Same audio file referenced by multiple sources is
+        deduplicated by path.
+
+        ``dtype``:
+
+        * ``"float32"`` (default) — no downstream conversion cost. For
+          LibriSpeech train-clean-100 (~20000 utts × 10s × 16k) this is
+          ~12 GB resident; tight against Kaggle's 13 GB RAM limit.
+        * ``"float16"`` halves storage at the cost of one ``astype(fp32)``
+          copy per ``__getitem__``. Use when memory is the constraint.
+
+        DataLoader workers spawned by fork inherit this cache via copy-on-
+        write — they share the same arrays without copy as long as no one
+        mutates them (we don't).
+
+        Returns ``{"n_unique": int, "bytes": int}``.
+        """
+        if dtype not in ("float32", "float16"):
+            raise ValueError(f"dtype must be 'float32' or 'float16', got {dtype!r}")
+        np_dtype = np.float32 if dtype == "float32" else np.float16
+        seen: dict[str, np.ndarray] = {}
+        decoded = 0
+
+        def _maybe_cache(field: np.ndarray | Path | None) -> np.ndarray | None:
+            nonlocal decoded
+            if field is None or isinstance(field, np.ndarray):
+                return field
+            key = str(field)
+            if key not in seen:
+                arr = _load_audio_field(field, self.sample_rate)
+                if arr.dtype != np_dtype:
+                    arr = arr.astype(np_dtype)
+                seen[key] = arr
+                decoded += 1
+                if verbose and decoded % 500 == 0:
+                    sys.stderr.write(f"\r[cache] decoded {decoded} files...")
+                    sys.stderr.flush()
+            return seen[key]
+
+        for src in self.sources:
+            src.target = _maybe_cache(src.target)  # type: ignore[assignment]
+            src.interferer = _maybe_cache(src.interferer)  # type: ignore[assignment]
+            src.noise = _maybe_cache(src.noise)
+
+        total_bytes = sum(a.nbytes for a in seen.values())
+        if verbose:
+            sys.stderr.write(
+                f"\r[cache] decoded {len(seen)} unique audio files "
+                f"({total_bytes / 1024**3:.2f} GB resident, dtype={dtype})\n"
+            )
+            sys.stderr.flush()
+        return {"n_unique": len(seen), "bytes": total_bytes}
+
     def _rng(self, index: int) -> np.random.Generator:
         if self.random_crop:
             # Fresh entropy per access so epochs see different crops/ratios.

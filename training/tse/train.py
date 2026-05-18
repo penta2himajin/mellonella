@@ -747,6 +747,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="cap the number of (target, interferer) source items built from --data-dir",
     )
+    parser.add_argument(
+        "--cache-audio",
+        action="store_true",
+        help=(
+            "pre-decode every unique audio file referenced by the dataset into RAM "
+            "before training starts. Eliminates per-access FLAC decode + disk seek; "
+            "huge per-epoch speedup when training is data-loader bound. "
+            "DataLoader workers see the cache via fork copy-on-write."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dtype",
+        choices=("float32", "float16"),
+        default="float32",
+        help="audio cache dtype; float16 halves RAM but adds a per-access astype copy",
+    )
     parser.add_argument("--out", type=Path, default=Path("build/tse"), help="output directory")
     parser.add_argument("--resume", action="store_true", help="resume from latest checkpoint")
     parser.add_argument("--device", default="cpu")
@@ -798,6 +814,8 @@ def main(argv: list[str] | None = None) -> int:
             random_crop=True,
             seed=args.seed,
         )
+        if args.cache_audio:
+            dataset.precache_audio(dtype=args.cache_dtype)
     else:
         print(
             "[train] no --data-dir given; training on the synthetic fixture set "

@@ -181,3 +181,61 @@ def test_dataset_end_to_end_real_data(tmp_path: Path) -> None:
     assert cond.shape == (192,)
     assert target.shape == (SR,)
     assert torch.isfinite(mix).all() and torch.isfinite(target).all()
+
+
+# ---------------------------------------------------------------------------
+# precache_audio
+# ---------------------------------------------------------------------------
+
+
+def test_precache_replaces_paths_with_arrays_and_dedupes(tmp_path: Path) -> None:
+    """precache_audio should decode each path once and replace fields in-place."""
+    _build_librispeech_fixture(tmp_path, speakers=["103", "204"], utts_per_speaker=2)
+    _write_musan_noise(tmp_path, n=2)
+    with pytest.warns(UserWarning):
+        sources = librispeech_musan_sources(tmp_path, n_pairs=3, seed=0)
+    # Before: all audio fields are Paths.
+    assert all(isinstance(s.target, Path) for s in sources)
+    ds = TSEMixtureDataset(sources, sample_rate=SR, segment_samples=SR, random_crop=False)
+
+    info = ds.precache_audio(verbose=False)
+    # Dedup: 4 LibriSpeech + 2 MUSAN noise = at most 6 unique files, but
+    # n_pairs=3 means we touched a subset. Whatever was touched is now an ndarray.
+    assert info["n_unique"] >= 1
+    assert info["bytes"] > 0
+    for s in sources:
+        assert isinstance(s.target, np.ndarray)
+        assert isinstance(s.interferer, np.ndarray)
+        if s.noise is not None:
+            assert isinstance(s.noise, np.ndarray)
+    # Dataset still produces correct shapes after caching.
+    mix, cond, target = ds[0]
+    assert mix.shape == (SR,) and target.shape == (SR,)
+    assert torch.isfinite(mix).all() and torch.isfinite(target).all()
+
+
+def test_precache_float16_smaller_storage(tmp_path: Path) -> None:
+    _build_librispeech_fixture(tmp_path, speakers=["103", "204"], utts_per_speaker=2)
+    with pytest.warns(UserWarning):
+        sources_fp32 = librispeech_musan_sources(tmp_path, n_pairs=2, seed=0, musan_subset=None)
+    with pytest.warns(UserWarning):
+        sources_fp16 = librispeech_musan_sources(tmp_path, n_pairs=2, seed=0, musan_subset=None)
+    ds32 = TSEMixtureDataset(sources_fp32, sample_rate=SR, segment_samples=SR)
+    ds16 = TSEMixtureDataset(sources_fp16, sample_rate=SR, segment_samples=SR)
+    info32 = ds32.precache_audio(dtype="float32", verbose=False)
+    info16 = ds16.precache_audio(dtype="float16", verbose=False)
+    # fp16 should use roughly half the bytes for the same audio.
+    assert info16["bytes"] == info32["bytes"] // 2
+    # Sources now hold fp16 arrays.
+    for s in sources_fp16:
+        if isinstance(s.target, np.ndarray):
+            assert s.target.dtype == np.float16
+
+
+def test_precache_invalid_dtype_raises(tmp_path: Path) -> None:
+    _build_librispeech_fixture(tmp_path, speakers=["103", "204"], utts_per_speaker=2)
+    with pytest.warns(UserWarning):
+        sources = librispeech_musan_sources(tmp_path, n_pairs=2, seed=0, musan_subset=None)
+    ds = TSEMixtureDataset(sources, sample_rate=SR, segment_samples=SR)
+    with pytest.raises(ValueError, match="dtype"):
+        ds.precache_audio(dtype="float64", verbose=False)
