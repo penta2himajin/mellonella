@@ -555,7 +555,7 @@ impl From<TseStageError> for PipelineError {
 /// # Errors
 /// Returns [`PipelineError::TseMissingEnrollment`] when the pool has
 /// no anchors yet (centroid is `None`).
-fn tse_cond_embedding(pool: &EmbeddingPool) -> Result<Vec<f32>, PipelineError> {
+pub(crate) fn tse_cond_embedding(pool: &EmbeddingPool) -> Result<Vec<f32>, PipelineError> {
     let centroid = pool
         .anchor_centroid()
         .ok_or(PipelineError::TseMissingEnrollment)?;
