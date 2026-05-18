@@ -16,4 +16,5 @@ pub mod ort_threads;
 pub mod pipeline;
 pub mod resample;
 pub mod streaming;
+pub mod tse;
 pub mod vad;

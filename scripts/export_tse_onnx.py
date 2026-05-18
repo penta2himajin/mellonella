@@ -291,6 +291,110 @@ def cmd_export_and_verify(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# dump-fixture
+# ---------------------------------------------------------------------------
+
+
+def cmd_dump_fixture(args: argparse.Namespace) -> int:
+    """Stream a caller-supplied clip through ONNX Runtime and dump the
+    extracted-audio output to a flat ``float32`` binary file.
+
+    Inputs (all little-endian ``float32`` binary, written by the caller —
+    typically a Rust parity test):
+
+    * ``--clip``  : ``chunk_len * n_chunks`` samples
+    * ``--cond``  : ``cond_dim`` (192 for ECAPA) cond embedding
+
+    Output: ``--output`` ``float32`` binary, same length as the clip
+    (per-chunk extracted audio concatenated).
+
+    This is the lower-friction path for the Rust ↔ ONNX parity test —
+    Rust writes its own deterministic clip + cond, calls this command,
+    reads back the ONNX-side expected output and compares.
+    """
+    import onnxruntime as ort
+
+    onnx_path = Path(args.onnx)
+    clip_path = Path(args.clip)
+    cond_path = Path(args.cond)
+    out_path = Path(args.output)
+    if not onnx_path.exists():
+        print(f"[dump-fixture] missing {onnx_path}", file=sys.stderr)
+        return 2
+    if not clip_path.exists():
+        print(f"[dump-fixture] missing {clip_path}", file=sys.stderr)
+        return 2
+    if not cond_path.exists():
+        print(f"[dump-fixture] missing {cond_path}", file=sys.stderr)
+        return 2
+
+    config = _load_config(args.config)
+    cond_dim = config.cond_dim
+
+    audio = np.fromfile(clip_path, dtype=np.float32)
+    cond = np.fromfile(cond_path, dtype=np.float32)
+    if cond.size != cond_dim:
+        print(
+            f"[dump-fixture] cond length {cond.size} != cond_dim {cond_dim}",
+            file=sys.stderr,
+        )
+        return 2
+    chunk_len = args.chunk
+    if audio.size == 0 or audio.size % chunk_len != 0:
+        print(
+            f"[dump-fixture] clip length {audio.size} is not a positive multiple "
+            f"of chunk {chunk_len}",
+            file=sys.stderr,
+        )
+        return 2
+    if chunk_len % config.enc_stride != 0:
+        print(
+            f"[dump-fixture] chunk {chunk_len} not a multiple of enc_stride "
+            f"{config.enc_stride}",
+            file=sys.stderr,
+        )
+        return 2
+    n_chunks = audio.size // chunk_len
+
+    # Build initial state from a zero-init model. We only need the
+    # *shapes* of make_initial_state — the values are zero — so we don't
+    # have to load the weights sidecar here.
+    from tse.model import CausalConvTasNetTSE  # local import keeps `torch`
+    # off the import path when `--onnx` is the only thing we touch.
+
+    model = CausalConvTasNetTSE(config)
+    state = [s.numpy() for s in model.make_initial_state(batch_size=1)]
+    in_names, out_names = _state_names(len(state))
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    cond_np = cond.reshape(1, cond_dim).astype(np.float32)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_chunks: list[np.ndarray] = []
+    for i in range(n_chunks):
+        ch = audio[i * chunk_len : (i + 1) * chunk_len][None, :].astype(np.float32)
+        feeds = {"audio_chunk": ch, "cond_embedding": cond_np}
+        for name, val in zip(in_names, state, strict=True):
+            feeds[name] = val.astype(np.float32)
+        results = session.run(["extracted_chunk", *out_names], feeds)
+        out_chunks.append(results[0].astype(np.float32))
+        state = list(results[1:])
+        if args.verbose:
+            print(
+                f"[dump-fixture] chunk {i:3d} max|x|={float(np.max(np.abs(results[0]))):.3e}",
+                file=sys.stderr,
+            )
+
+    concatenated = np.concatenate(out_chunks, axis=1).astype(np.float32).reshape(-1)
+    concatenated.tofile(out_path)
+    print(
+        f"[dump-fixture] wrote {out_path} ({concatenated.size} f32 samples)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -327,6 +431,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_both.add_argument("--n-chunks", type=int, default=DEFAULT_N_CHUNKS)
     p_both.add_argument("--tol", type=float, default=DEFAULT_TOL)
     p_both.set_defaults(func=cmd_export_and_verify)
+
+    # Stream a caller-supplied clip through ONNX Runtime and dump the
+    # output as a flat float32 binary. Used by the Rust parity test.
+    p_dump = sub.add_parser("dump-fixture", parents=[common])
+    p_dump.add_argument("--onnx", required=True)
+    p_dump.add_argument(
+        "--clip", required=True, help="float32 binary, length n_chunks * chunk"
+    )
+    p_dump.add_argument(
+        "--cond", required=True, help="float32 binary, length cond_dim (192)"
+    )
+    p_dump.add_argument(
+        "--output", required=True, help="destination float32 binary"
+    )
+    p_dump.add_argument("--verbose", action="store_true")
+    p_dump.set_defaults(func=cmd_dump_fixture)
 
     return parser
 
