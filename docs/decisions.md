@@ -1013,3 +1013,148 @@ The design, in three parts:
   reuses)
 - handoff issue #130 (speaker-verification-score-stabilisation
   workstream)
+
+## D-014: Stage C — causal Conv-TasNet TSE bolted onto the gating pipeline
+
+### Context
+
+D-001 chose hard-gating (VAD + SV + NS) over true TSE, because at the
+time real-time TSE meant either offline-chunked models (ConVoiFilter's
+5 s chunk constraint) or in-house training, both rejected. Hard-gating
+works for the common case but **cannot separate overlapping speakers** —
+when two voices co-occur, the gate either lets the mixture through
+(false accept on the interferer) or mutes it (false reject of the
+target).
+
+Stage C revisits the "no in-house training" constraint: train a small
+causal time-domain TSE network ourselves and bolt it onto the existing
+gating pipeline as an **optional, opt-in** step. The gate stays in
+charge of the gross on/off decisions; TSE attempts to extract the
+target's voice from the mixture inside the active windows. With a
+working TSE the gate operates on the *extracted* signal, not the
+mixture, recovering useful target audio during overlap that the hard
+gate would otherwise lose.
+
+### Alternatives considered
+
+A. **Stay with hard-gating only.** Status quo — accept the overlap
+   limitation as a known trade-off (D-001).
+
+B. **Off-the-shelf TSE (ConVoiFilter, SpeakerBeam, etc.).** Re-evaluate
+   the 2024-era off-the-shelf options. ConVoiFilter still has the 5 s
+   chunk constraint; SpeakerBeam variants without causal training don't
+   stream; Mamba-based TSE work is too new for stable artefacts.
+
+C. **Train a small causal Conv-TasNet TSE in-house.** SpeakerBeam-style
+   FiLM conditioning on a frozen 192-dim ECAPA embedding, ~1.4 M params,
+   causal everywhere (left-padding, cumulative LN, ring-buffer state),
+   exports cleanly to ONNX with a stateful per-chunk signature so the
+   Rust core can stream it.
+
+D. **A larger SOTA model (E3Net, X-TF-GridNet, etc.).** Higher quality
+   ceiling but 5–10× the params; the 4 vCPU runtime on the handset /
+   call client side is the binding constraint, not GPU training.
+
+### Chosen: C (causal Conv-TasNet TSE, 16 kHz PoC → 48 kHz prod)
+
+PoC config — 16 kHz, LibriSpeech `train-clean-100`, AdamW + cosine LR +
+3-epoch warmup + EMA(0.999), `--cache-audio` (audio pre-decoded into
+RAM, eliminates the per-access FLAC stall), `torch.compile` on the
+model, AMP off (fp16 caused 7 NaN epochs at low LR in v3; AMP off v4
+had 0 NaN and gained +0.57 dB). Trained on a single Kaggle T4 in
+~57 min including ~10 min CUDA-EP ECAPA enrollment precompute.
+
+Result: **peak SI-SDR +5.68 dB at epoch 55 / 60** (v4 run, no NaN).
+Earlier baselines: v1 GPU Adam-flat-LR = +2.46 dB at 25 epochs; v2
+Kaggle-CPU AdamW + cosine + EMA timed out at 17 epochs with +3.50 dB;
+v3 T4 AMP-on = +5.11 dB but with fp16 underflow noise. Causal TSE
+literature reports +8–12 dB on LibriMix; +5.68 dB at 8000 pairs /
+60 epochs / 16 kHz puts us inside the expected band for the data scale.
+
+Optimizer ablation: AdamW won. Lion converged ~3× slower at the
+documented `lr/5, wd×5` recipe; Muon (Newton-Schulz orthogonalisation
+on Linear / 1×1-conv weights + AdamW on depthwise / 1-D / biases) was
+competitive in the first ~5 epochs then plateaued at +1.7 dB while
+AdamW kept improving. The Newton-Schulz iteration's per-step cost on
+CPU is also ~5× AdamW (Bernstein–Newhouse's CPU FLOP overhead formula
+`T·m/B` predicts ~8% in our small-matrix regime; we measured close to
+that floor with `@torch.compile` on the NS function in fp32 — bf16 NS
+was 2.3× *slower* on the bench CPU due to missing AVX-512 BF16). Muon
+ships as an experimental option, not a default.
+
+Integration — Rust side:
+
+- **`mellonella-core::tse`** (Phase 5 part 1, #140). `TseSession`
+  wraps the streaming ONNX with a flat positional signature
+  (`audio_chunk, cond_embedding, state_0..state_88 →
+  extracted_chunk, new_state_0..new_state_88`), 89 explicit causal-
+  conv state tensors threaded across calls. Rust ↔ Python ONNX-runtime
+  parity: per-chunk `max|Δ| = 0.000` (bitwise-identical; both back to
+  the same ORT engine).
+- **`pipeline.rs::process_offline`** (Phase 5 part 2, #142).
+  `PipelineConfig.tse: Option<TseStageConfig>` — **default `None`**;
+  when `Some`, the offline path snapshots the cond embedding from
+  `EmbeddingPool::anchor_centroid()` once at start, runs the audio
+  through `TseStage`, then applies the existing envelope to the
+  *extracted* audio.
+- **`streaming.rs::StreamingPipeline`** (Phase 5 part 3, #143). Same
+  contract for the live path. `TseStage`'s up-to-(chunk − 1)-sample
+  buffering delay is absorbed by a per-sample gain queue; `flush()`
+  drains the tail at end-of-stream.
+
+The 16 kHz constraint is enforced at construction in both paths
+(`PipelineError::TseRateMismatch` with the explicit message
+"Stage C TSE requires 16 kHz audio and decision rates"). The 48 kHz
+prod TSE retrain lifts the check.
+
+### Trade-offs
+
+- **16 kHz PoC band-limits the audio path.** A 16 kHz TSE inserted as a
+  serial stage caps the listener's signal at 8 kHz Nyquist, which is
+  audibly worse than the existing 48 kHz DFN3 → gate path for the
+  common no-overlap case. This is acknowledged by the opt-in flag
+  (default OFF); production deployment requires the 48 kHz model
+  (deferred to Phase 4 with VCTK + DEMAND).
+- **Quality is mid for causal at 16 kHz.** +5.68 dB SI-SDR is a real
+  improvement over the gate's "let the mixture through" behaviour
+  under overlap, but it isn't transparent extraction. Long-tail failure
+  modes (extreme target/interferer ratio, similar voices, enrolled-
+  speaker drift over the call) need scenario-level validation; D-014
+  ships the integration scaffold, not a quality claim.
+- **`PipelineConfig` lost `Copy`.** `TseStageConfig` carries a
+  `PathBuf`; all struct-literal sites in the workspace were updated to
+  clone. Minor refactor, contained to the workspace.
+- **Async-refresh + TSE is rejected.** The async embedding-refresh path
+  (`async_refresh = true`) errors with `PipelineError::TseAsyncUnsupported`.
+  Wiring TSE through the `ScopedRefreshChannel` is a follow-up — none of
+  the current Rust consumers use async-refresh with TSE turned on.
+- **Cond embedding is snapshot-at-start.** Auto-learn anchor updates
+  during a streaming session do not refresh the TSE conditioning
+  vector. For the PoC this is correct enough (the centroid hardly
+  moves over a single call); the prod model retrain is the right point
+  to revisit.
+
+### Future revisit triggers
+
+- **48 kHz prod TSE lands.** Drop the 16 kHz hard-rate check; the band-
+  limit trade-off disappears; the gate's mixture-path fallback for
+  non-overlap windows can be replaced by always-on TSE.
+- **Scenario-level evaluation flags a quality regression vs the bare
+  gate.** Re-pin the default to OFF (already the default), raise the
+  SI-SDR target before any "default ON" decision.
+- **Mamba / SSM-based causal TSE matures.** A non-Conv-TasNet
+  architecture might give comparable causal latency with better quality;
+  the integration scaffold (`TseSession` + `TseStage` + the config flag)
+  is model-agnostic, so a swap is a checkpoint / retrain question, not
+  a re-architecture.
+
+### References
+
+- D-001 (hard-gating chosen over off-the-shelf TSE — re-examined here)
+- D-002 (48 kHz output / 16 kHz decision — the rate split TSE has to
+  live inside)
+- D-011 (Rust port — `PipelineConfig` / `StreamingState` surfaces this
+  builds on)
+- D-013 (Stage B opt-in pattern — same default-OFF + 16 kHz-decision
+  shape Stage C inherits)
+- PRs #137, #138, #139, #140, #142, #143 (the implementation chain)
