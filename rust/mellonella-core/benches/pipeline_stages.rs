@@ -208,6 +208,7 @@ fn bench_pipeline(c: &mut Criterion) {
         fbank,
         ecapa,
         cohort: Vec::new(),
+        tse: None,
     };
     let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
     pool.add_anchors([vec![0.1_f32; 192]]);

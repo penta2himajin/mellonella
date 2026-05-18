@@ -17,4 +17,5 @@ pub mod pipeline;
 pub mod resample;
 pub mod streaming;
 pub mod tse;
+pub mod tse_stage;
 pub mod vad;

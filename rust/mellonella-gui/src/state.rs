@@ -193,6 +193,7 @@ impl AppState {
             fbank,
             ecapa,
             cohort: Vec::new(),
+            tse: None,
         })
     }
 
