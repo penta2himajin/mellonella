@@ -247,7 +247,16 @@ class TSEMixtureDataset(Dataset):
         seg = self.segment_samples
         if x.size <= seg:
             return _fit_length(x, seg)
-        start = int(rng.integers(0, x.size - seg + 1)) if self.random_crop else 0
+        # Pick a random start regardless of `random_crop` — `random_crop`
+        # only controls whether the rng is seeded (reproducible eval /
+        # tests) or fresh (training-time per-epoch entropy). A previous
+        # version of this helper used `start = 0` when `random_crop=False`,
+        # which silently biased eval results downward because VCTK
+        # utterances start with brief silence / breath while the speaker
+        # collects themselves — the always-0 start ended up evaluating the
+        # model on quiet target signal where SI-SDR is dominated by the
+        # noise floor.
+        start = int(rng.integers(0, x.size - seg + 1))
         return x[start : start + seg].astype(np.float32, copy=False)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
