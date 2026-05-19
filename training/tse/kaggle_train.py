@@ -198,6 +198,9 @@ def main() -> int:
     clip_grad_norm = os.environ.get("POC_CLIP_GRAD_NORM", "5.0")
     poc_device = os.environ.get("POC_DEVICE", "cuda")
     num_workers = os.environ.get("POC_NUM_WORKERS", "2")
+    val_speakers = os.environ.get("POC_VAL_SPEAKERS", "0")
+    test_speakers = os.environ.get("POC_TEST_SPEAKERS", "0")
+    val_pairs = os.environ.get("POC_VAL_PAIRS", "500")
     cmd = [
         sys.executable,
         "-m",
@@ -236,6 +239,12 @@ def main() -> int:
         poc_device,
         "--num-workers",
         num_workers,
+        "--val-speakers",
+        val_speakers,
+        "--test-speakers",
+        test_speakers,
+        "--val-pairs",
+        val_pairs,
         "--out",
         str(out_dir),
     ]

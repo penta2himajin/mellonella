@@ -457,6 +457,17 @@ impl MellonellaApp {
                                 self.state.tse_onnx_path = Some(path);
                             }
                         }
+                        if ui
+                            .button("Download from HuggingFace")
+                            .on_hover_text(
+                                "Fetch penta2himajin/tse-conv-tasnet-48k from \
+                                 huggingface.co into the local cache and use it. \
+                                 Subsequent runs reuse the cached file.",
+                            )
+                            .clicked()
+                        {
+                            self.state.fetch_tse_from_hf();
+                        }
                         ui.label(label);
                         if self.state.tse_onnx_path.is_some() && ui.small_button("Clear").clicked()
                         {

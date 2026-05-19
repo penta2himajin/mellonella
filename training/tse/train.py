@@ -83,6 +83,28 @@ class ExponentialMovingAverage:
             if name in self.shadow:
                 self.shadow[name].copy_(t.to(self.shadow[name].device))
 
+    @torch.no_grad()
+    def swap_with(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Atomically swap the model's live params with the EMA shadow.
+
+        Returns the live weights that were swapped out so the caller
+        can restore them later via :meth:`swap_back`. Useful for
+        evaluating with EMA weights and resuming training with the
+        original live weights afterwards.
+        """
+        stash: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                stash[name] = p.detach().clone()
+                p.copy_(self.shadow[name])
+        return stash
+
+    @torch.no_grad()
+    def swap_back(self, model: nn.Module, stash: dict[str, torch.Tensor]) -> None:
+        for name, p in model.named_parameters():
+            if name in stash:
+                p.copy_(stash[name])
+
 
 # ---------------------------------------------------------------------------
 # Checkpointing
@@ -251,6 +273,46 @@ def train_epoch(
         total_loss = total_loss + loss.detach() * bs
         with torch.no_grad():
             total_sisdr = total_sisdr + si_sdr(target, est).sum()
+        n += bs
+    return {
+        "loss": float((total_loss / max(n, 1)).item()),
+        "si_sdr": float((total_sisdr / max(n, 1)).item()),
+    }
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    *,
+    amp_dtype: torch.dtype | None = None,
+) -> dict[str, float]:
+    """No-grad evaluation pass — mirrors `train_epoch`'s loss/SI-SDR
+    accumulation contract.
+
+    Run on a speaker-disjoint val/test loader to get a real
+    generalisation signal (in-distribution VCTK utterances from
+    speakers the model has never been trained on).
+    """
+    model.eval()
+    is_cuda = str(device).startswith("cuda")
+    autocast_device = "cuda" if is_cuda else "cpu"
+    total_loss = torch.zeros((), device=device)
+    total_sisdr = torch.zeros((), device=device)
+    n = 0
+    for mixture, cond, target in loader:
+        mixture = mixture.to(device, non_blocking=is_cuda)
+        cond = cond.to(device, non_blocking=is_cuda)
+        target = target.to(device, non_blocking=is_cuda)
+        bs = mixture.shape[0]
+        with torch.autocast(
+            device_type=autocast_device, dtype=amp_dtype, enabled=amp_dtype is not None
+        ):
+            est = model(mixture, cond)
+            loss = neg_si_sdr_loss(est, target)
+        total_loss = total_loss + loss.detach() * bs
+        total_sisdr = total_sisdr + si_sdr(target, est).sum()
         n += bs
     return {
         "loss": float((total_loss / max(n, 1)).item()),
@@ -549,6 +611,7 @@ def run_training(
     resume: bool = False,
     num_workers: int = 0,
     seed: int = 0,
+    val_dataset: TSEMixtureDataset | None = None,
 ) -> dict[str, object]:
     """Run the full training loop, writing checkpoints + ``metrics.json``."""
     torch.manual_seed(seed)
@@ -601,13 +664,26 @@ def run_training(
         persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
     )
+    val_loader: DataLoader | None = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            drop_last=False,
+            pin_memory=is_cuda,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
+        )
 
     print(
         f"[train] params={count_parameters(model):,}  epochs={epochs}  "
         f"batch={batch_size}  lr={lr}  schedule={lr_schedule}+warmup{warmup_epochs}  "
         f"opt={optimizer_name}(wd={weight_decay})  amp={amp}({amp_dtype})  "
         f"clip_grad_norm={clip_grad_norm}  "
-        f"ema={ema_decay if ema is not None else 'off'}  device={device}",
+        f"ema={ema_decay if ema is not None else 'off'}  device={device}  "
+        f"val={'on' if val_loader is not None else 'off'}",
         file=sys.stderr,
     )
     history: list[dict[str, float]] = []
@@ -628,12 +704,29 @@ def run_training(
         stats["epoch"] = float(epoch)
         stats["elapsed_sec"] = elapsed
         stats["lr"] = float(optimizer.param_groups[0]["lr"])
+
+        # Validation pass on speaker-disjoint held-out data. Run with
+        # EMA weights when EMA is on — that's what export uses, so
+        # the val metric reflects what the deployed model will hit.
+        if val_loader is not None:
+            ema_for_eval = ema  # rebind so mypy keeps the narrowing
+            stash = ema_for_eval.swap_with(model) if ema_for_eval is not None else None
+            try:
+                val_stats = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
+            finally:
+                if ema_for_eval is not None and stash is not None:
+                    ema_for_eval.swap_back(model, stash)
+            stats["val_loss"] = val_stats["loss"]
+            stats["val_si_sdr"] = val_stats["si_sdr"]
+
         history.append(stats)
-        print(
+        msg = (
             f"[train] epoch {epoch:3d}  loss {stats['loss']:+.4f}  "
-            f"si_sdr {stats['si_sdr']:+.4f} dB  lr={stats['lr']:.2e}  ({elapsed:.1f}s)",
-            file=sys.stderr,
+            f"si_sdr {stats['si_sdr']:+.4f} dB  lr={stats['lr']:.2e}  ({elapsed:.1f}s)"
         )
+        if "val_si_sdr" in stats:
+            msg += f"  val_si_sdr {stats['val_si_sdr']:+.4f} dB"
+        print(msg, file=sys.stderr)
         save_checkpoint(
             out_dir / f"ckpt_epoch{epoch:04d}.pt",
             model,
@@ -801,6 +894,34 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--val-speakers",
+        type=int,
+        default=0,
+        help=(
+            "Hold out N VCTK speakers from training and use them for a "
+            "speaker-disjoint validation pass each epoch. 0 disables the "
+            "val pass (default — pre-overfitting-fix behaviour). Only "
+            "honoured for --data-source vctk-demand."
+        ),
+    )
+    parser.add_argument(
+        "--test-speakers",
+        type=int,
+        default=0,
+        help=(
+            "Hold out N additional VCTK speakers from training (kept "
+            "separate from val) for a final held-out test evaluation. "
+            "Currently used only to ensure the train set excludes them; "
+            "a separate test run uses --speakers-subset test."
+        ),
+    )
+    parser.add_argument(
+        "--val-pairs",
+        type=int,
+        default=500,
+        help="Number of speaker-disjoint val pairs to evaluate per epoch.",
+    )
+    parser.add_argument(
         "--fixture-n",
         type=int,
         default=16,
@@ -828,9 +949,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    val_dataset: TSEMixtureDataset | None = None
     if args.data_dir is not None:
         if args.data_source == "vctk-demand":
-            from .data import vctk_demand_sources
+            from .data import _scan_vctk_speakers, vctk_demand_sources, vctk_speaker_split
+
+            train_subset: list[str] | None = None
+            val_subset: list[str] | None = None
+            if args.val_speakers > 0 or args.test_speakers > 0:
+                vctk_dir = args.data_dir / "VCTK-Corpus"
+                if not vctk_dir.is_dir():
+                    raise FileNotFoundError(
+                        f"VCTK directory not found for speaker split: {vctk_dir}"
+                    )
+                by_speaker = _scan_vctk_speakers(vctk_dir)
+                split = vctk_speaker_split(
+                    sorted(by_speaker.keys()),
+                    val_speakers=max(args.val_speakers, 0),
+                    test_speakers=max(args.test_speakers, 0),
+                )
+                train_subset = split["train"]
+                if args.val_speakers > 0:
+                    val_subset = split["val"]
+                print(
+                    f"[train] speaker split: {len(split['train'])} train / "
+                    f"{len(split['val'])} val / {len(split['test'])} test "
+                    f"(test ids: {','.join(split['test'])})",
+                    file=sys.stderr,
+                )
 
             sources = vctk_demand_sources(
                 args.data_dir,
@@ -838,7 +984,29 @@ def main(argv: list[str] | None = None) -> int:
                 embeddings_npz=args.embeddings_npz,
                 n_pairs=args.n_pairs,
                 seed=args.seed,
+                speakers_subset=train_subset,
             )
+            if val_subset is not None:
+                val_sources = vctk_demand_sources(
+                    args.data_dir,
+                    sample_rate=config.sample_rate,
+                    embeddings_npz=args.embeddings_npz,
+                    n_pairs=args.val_pairs,
+                    seed=args.seed + 1,
+                    speakers_subset=val_subset,
+                )
+                val_dataset = TSEMixtureDataset(
+                    val_sources,
+                    sample_rate=config.sample_rate,
+                    segment_samples=config.sample_rate,
+                    random_crop=False,
+                    seed=args.seed + 1,
+                )
+                print(
+                    f"[train] {len(val_sources)} val source items "
+                    f"({args.val_speakers} held-out speakers)",
+                    file=sys.stderr,
+                )
         else:
             from .data import librispeech_musan_sources
 
@@ -859,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.cache_audio:
             dataset.precache_audio(dtype=args.cache_dtype)
+            if val_dataset is not None:
+                val_dataset.precache_audio(dtype=args.cache_dtype)
     else:
         print(
             "[train] no --data-dir given; training on the synthetic fixture set "
@@ -888,6 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=args.resume,
         num_workers=args.num_workers,
         seed=args.seed,
+        val_dataset=val_dataset,
     )
     return 0
 
