@@ -357,6 +357,13 @@ pub enum AutoLearnKind {
     /// Candidate cleared rule-based gates but the pool refused it via
     /// `can_auto_learn`.
     RejectAnchorDistance,
+    /// Pool was empty + `allow_bootstrap_from_runtime` was on +
+    /// VAD-positive speech ran long enough — the first anchor was
+    /// seeded from this candidate via
+    /// [`crate::enrollment::EmbeddingPool::bootstrap_seed`]. Subsequent
+    /// refreshes flow back through the normal `Admit` /
+    /// `RejectAnchorDistance` path.
+    BootstrapSeed,
 }
 
 /// Bundle of the three per-frame scoring scalars carried between
@@ -1085,6 +1092,15 @@ pub(crate) fn fbank_ecapa_one(
     ecapa.embed_features(&feats, n_frames, N_MELS)
 }
 
+/// f0 sigma fallback used when bootstrap installs the first anchor
+/// from a single refresh window. Empirical spread of intra-speaker f0
+/// over short utterances; the value isn't critical because subsequent
+/// admissions through `adapt` don't touch the F0 metadata — the
+/// streaming pipeline's `f0_match` gate just stops being a hard
+/// rejector. ~40 Hz is wide enough to keep the bootstrapped speaker
+/// admissible.
+pub(crate) const BOOTSTRAP_F0_SIGMA_FALLBACK: f32 = 40.0;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_refresh_result(
     embedding: Vec<f32>,
@@ -1110,9 +1126,33 @@ pub(crate) fn apply_refresh_result(
     };
     score.last_score = smooth_score(score.last_score, new_score, score_ema_alpha);
 
-    if enable_auto_learn
-        && should_admit_auto_learn(score.last_score, fm, consecutive_speech_ms, gate_cfg)
-    {
+    if !enable_auto_learn {
+        return;
+    }
+
+    // Bootstrap path — when the pool is still empty and the
+    // bootstrap flag is on, the score / f0 admission guards don't
+    // make sense (there's no anchor to score against, and the F0
+    // metadata is zeroed). Fall back to "we've heard at least
+    // `min_continuous_speech_sec` of voiced speech" as the only
+    // condition and seed the first anchor from this refresh.
+    if pool.is_empty() && pool.config().allow_bootstrap_from_runtime {
+        let min_run_ms = gate_cfg.min_continuous_speech_sec * 1000.0;
+        if consecutive_speech_ms >= min_run_ms && f0_mu.is_finite() && f0_mu > 0.0 {
+            let seeded = pool.bootstrap_seed(embedding, f0_mu, BOOTSTRAP_F0_SIGMA_FALLBACK);
+            if seeded {
+                auto_learn_events.push(AutoLearnEvent {
+                    frame_idx: trigger_frame,
+                    kind: AutoLearnKind::BootstrapSeed,
+                    score: score.last_score,
+                    f0_match: fm,
+                });
+            }
+        }
+        return;
+    }
+
+    if should_admit_auto_learn(score.last_score, fm, consecutive_speech_ms, gate_cfg) {
         let admitted = pool.adapt(embedding);
         let kind = if admitted {
             AutoLearnKind::Admit
@@ -1327,5 +1367,128 @@ mod tests {
             (got - expected).abs() <= slack,
             "expected ≈ {expected} samples (±{slack}), got {got}"
         );
+    }
+
+    fn unit_vec(v: &[f32]) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    }
+
+    #[test]
+    fn apply_refresh_result_bootstrap_seeds_first_anchor() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            ..EmbeddingPoolConfig::default()
+        });
+        let gate_cfg = GateConfig::default();
+        let mut score = ScoreState::new();
+        let mut events: Vec<AutoLearnEvent> = Vec::new();
+        let consecutive_speech_ms = gate_cfg.min_continuous_speech_sec * 1000.0;
+
+        apply_refresh_result(
+            unit_vec(&[1.0, 0.0, 0.0]),
+            150.0, // f0_mu — non-zero so the voiced guard passes
+            42,
+            consecutive_speech_ms,
+            &mut pool,
+            &[],
+            &gate_cfg,
+            true,
+            1.0,
+            &mut score,
+            &mut events,
+        );
+
+        assert_eq!(pool.anchors().len(), 1);
+        assert!((pool.metadata().f0_mu - 150.0).abs() < 1e-5);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].kind, AutoLearnKind::BootstrapSeed));
+    }
+
+    #[test]
+    fn apply_refresh_result_bootstrap_disabled_by_default() {
+        // Without the opt-in flag, an empty pool emits no events and
+        // adds no anchors regardless of how good the input looks.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let gate_cfg = GateConfig::default();
+        let mut score = ScoreState::new();
+        let mut events: Vec<AutoLearnEvent> = Vec::new();
+
+        apply_refresh_result(
+            unit_vec(&[1.0, 0.0, 0.0]),
+            150.0,
+            0,
+            10_000.0,
+            &mut pool,
+            &[],
+            &gate_cfg,
+            true,
+            1.0,
+            &mut score,
+            &mut events,
+        );
+
+        assert!(pool.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn apply_refresh_result_bootstrap_requires_voiced_frame() {
+        // Bootstrap mustn't seed off an unvoiced refresh (f0_mu == 0
+        // or NaN), otherwise breath / background noise during a long
+        // VAD-positive stretch would set the wrong anchor.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            ..EmbeddingPoolConfig::default()
+        });
+        let gate_cfg = GateConfig::default();
+        let mut score = ScoreState::new();
+        let mut events: Vec<AutoLearnEvent> = Vec::new();
+
+        apply_refresh_result(
+            unit_vec(&[1.0, 0.0, 0.0]),
+            0.0,
+            0,
+            10_000.0,
+            &mut pool,
+            &[],
+            &gate_cfg,
+            true,
+            1.0,
+            &mut score,
+            &mut events,
+        );
+
+        assert!(pool.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn apply_refresh_result_bootstrap_requires_min_speech_run() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            ..EmbeddingPoolConfig::default()
+        });
+        let gate_cfg = GateConfig::default();
+        let mut score = ScoreState::new();
+        let mut events: Vec<AutoLearnEvent> = Vec::new();
+        let too_short = gate_cfg.min_continuous_speech_sec * 1000.0 - 1.0;
+
+        apply_refresh_result(
+            unit_vec(&[1.0, 0.0, 0.0]),
+            150.0,
+            0,
+            too_short,
+            &mut pool,
+            &[],
+            &gate_cfg,
+            true,
+            1.0,
+            &mut score,
+            &mut events,
+        );
+
+        assert!(pool.is_empty());
+        assert!(events.is_empty());
     }
 }

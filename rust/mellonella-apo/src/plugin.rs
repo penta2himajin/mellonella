@@ -40,6 +40,12 @@ pub struct MellonellaApo {
     input_scratch: Vec<f32>,
     output_ring: VecDeque<f32>,
     locked: bool,
+    /// `true` when lock_for_process loaded an empty pool — i.e. this
+    /// session is in DFN3-only + bootstrap-auto-learn mode. Tells
+    /// unlock_for_process whether persisting the pool back to disk is
+    /// meaningful (we never overwrite an explicit enrollment).
+    started_empty: bool,
+    enrollment_path: Option<PathBuf>,
 }
 
 impl ProcessingObject for MellonellaApo {
@@ -61,6 +67,8 @@ impl ProcessingObject for MellonellaApo {
             input_scratch: Vec::with_capacity(8192),
             output_ring: VecDeque::with_capacity(8192),
             locked: false,
+            started_empty: false,
+            enrollment_path: None,
         }
     }
 
@@ -80,7 +88,10 @@ impl ProcessingObject for MellonellaApo {
             return Err(HResult::E_INVALIDARG);
         }
 
-        match build_pipeline(input.sample_rate()) {
+        let path = resolve_enrollment_path();
+        let result = build_pipeline(input.sample_rate(), path.as_deref());
+        self.enrollment_path = path;
+        match result {
             Ok((pipe, has_pool)) => {
                 eprintln!(
                     "mellonella-apo: locked at {} Hz (enrollment loaded: {has_pool})",
@@ -89,30 +100,61 @@ impl ProcessingObject for MellonellaApo {
                 if !has_pool {
                     eprintln!(
                         "mellonella-apo: no enrollment.json found — running in DFN3 \
-                         noise-suppression-only mode. Enroll via mellonella-gui to enable \
-                         target-speaker gating."
+                         noise-suppression-only mode with bootstrap auto-learn enabled. \
+                         The first anchor seeds itself from the first second of voiced \
+                         speech; the pool persists on unlock so the next session reuses \
+                         the learned profile."
                     );
                 }
                 self.pipeline = Some(pipe);
                 self.output_ring.clear();
                 self.locked = true;
+                self.started_empty = !has_pool;
                 Ok(())
             }
             Err(e) => {
                 eprintln!("mellonella-apo: lock_for_process failed: {e}");
+                self.started_empty = false;
                 Err(HResult::E_FAIL)
             }
         }
     }
 
     fn unlock_for_process(&mut self) {
-        // Drop the pipeline so the ONNX session + async worker
-        // thread are released. lock_for_process rebuilds them next
-        // time the engine wants the stream up.
+        // Persist the bootstrapped pool back to disk before dropping
+        // the pipeline. Only fires when this session started empty so
+        // an explicit enrollment is never overwritten, and only when
+        // the pool actually accumulated anchors.
+        if self.started_empty {
+            if let (Some(pipe), Some(path)) =
+                (self.pipeline.as_ref(), self.enrollment_path.as_ref())
+            {
+                let pool = pipe.pool();
+                if !pool.is_empty() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match pool.save(path) {
+                        Ok(()) => eprintln!(
+                            "mellonella-apo: persisted bootstrapped pool ({} anchors) to {}",
+                            pool.anchors().len(),
+                            path.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "mellonella-apo: failed to persist pool to {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+
         self.pipeline = None;
         self.input_scratch.clear();
         self.output_ring.clear();
         self.locked = false;
+        self.started_empty = false;
+        self.enrollment_path = None;
     }
 
     fn process(
@@ -177,7 +219,10 @@ fn accept_or_suggest(format: &Format) -> FormatNegotiation {
     }
 }
 
-fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String> {
+fn build_pipeline(
+    sample_rate: u32,
+    enrollment_path: Option<&std::path::Path>,
+) -> Result<(StreamingPipeline, bool), String> {
     let ecapa_path =
         hf_fetch::ensure_ecapa_onnx(noop_progress).map_err(|e| format!("ECAPA fetch: {e}"))?;
     let vad_path =
@@ -198,27 +243,38 @@ fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String>
         tse: None,
     };
 
-    let pool_cfg = EmbeddingPoolConfig::default();
-    let (pool, has_pool) = match resolve_enrollment_path() {
-        Some(path) if path.exists() => match EmbeddingPool::load(&path, pool_cfg) {
-            Ok(p) => {
-                let usable = !p.is_empty();
+    let loaded = enrollment_path.and_then(|p| {
+        if !p.exists() {
+            return None;
+        }
+        match EmbeddingPool::load(p, EmbeddingPoolConfig::default()) {
+            Ok(pool) => {
                 eprintln!(
                     "mellonella-apo: loaded enrollment from {} ({} anchors)",
-                    path.display(),
-                    p.anchors().len()
+                    p.display(),
+                    pool.anchors().len()
                 );
-                (p, usable)
+                Some(pool)
             }
             Err(e) => {
                 eprintln!(
                     "mellonella-apo: failed to parse {} ({e}); starting empty",
-                    path.display()
+                    p.display()
                 );
-                (EmbeddingPool::new(pool_cfg), false)
+                None
             }
-        },
-        _ => (EmbeddingPool::new(pool_cfg), false),
+        }
+    });
+
+    let (pool, has_pool) = match loaded {
+        Some(p) if !p.is_empty() => (p, true),
+        _ => {
+            let pool = EmbeddingPool::new(EmbeddingPoolConfig {
+                allow_bootstrap_from_runtime: true,
+                ..EmbeddingPoolConfig::default()
+            });
+            (pool, false)
+        }
     };
 
     let mut pipeline_cfg = PipelineConfig {
@@ -231,16 +287,18 @@ fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String>
     let mut gate_cfg = GateConfig::default();
 
     if !has_pool {
-        // NS-only fallback (matches mellonella-ladspa exactly): keep
-        // the speaker gate fully open + skip auto-learn so DFN3 still
-        // runs and audio passes through cleaned but ungated.
+        // NS-only fallback while the pool is empty: keep the score-side
+        // gate fully open so the user is heard from the start.
+        // `enable_auto_learn` stays on (default) so the bootstrap path
+        // can seed the first anchor; subsequent admissions accumulate
+        // and the next session loads the persisted profile to run the
+        // full gate.
         gate_cfg.theta_pass = f32::MIN;
         gate_cfg.theta_pass_as_norm = f32::MIN;
         gate_cfg.adaptive_theta = false;
         gate_cfg.hangover_ms = 10_000.0;
         pipeline_cfg.silence_force_off_ms = 0.0;
         pipeline_cfg.vad_threshold = -1.0;
-        pipeline_cfg.enable_auto_learn = false;
     }
 
     let config = StreamingConfig {

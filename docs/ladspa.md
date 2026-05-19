@@ -56,10 +56,22 @@ arrives out-of-band:
 | VAD ONNX | (cache only) | HuggingFace cache |
 | ECAPA ONNX | (cache only) | HuggingFace cache |
 
-If no enrollment is found, the plugin runs in **DFN3-only** mode —
-the speaker gate stays fully open, but noise suppression still runs.
-Enroll once through `mellonella-gui` and the LADSPA plugin will pick
-the profile up on the next `activate()`.
+If no enrollment is found, the plugin runs in **DFN3-only +
+bootstrap-auto-learn** mode: the speaker gate stays fully open, but
+the streaming engine still observes refreshes and seeds the first
+anchor from the first second of voiced speech it hears. Subsequent
+admissions accumulate into the adapted embedding, and on
+`deactivate()` the pool is persisted back to the enrollment path —
+so the next session loads the learned profile and runs the full
+gate. Existing enrollment files are never overwritten by this path
+(persistence only fires when the session started with an empty
+pool).
+
+This means the LADSPA plugin can be dropped in cold: the first call
+or two will pass through unfiltered (gate open, DFN3 cleaning), and
+within a few minutes of normal use the gate becomes effective on
+subsequent sessions. If you want immediate gating, enroll explicitly
+via `mellonella-gui` first.
 
 ### Control ports
 
