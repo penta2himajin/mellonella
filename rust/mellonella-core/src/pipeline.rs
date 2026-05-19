@@ -812,6 +812,9 @@ pub fn process_offline(
         gate: *gate_cfg,
         audio_sample_rate,
         diagnostics: true,
+        // Offline path doesn't drive DFN3 through the streaming engine —
+        // CLI / GUI run DFN3 as a one-shot pre-process step today.
+        dfn3_onnx_path: None,
     };
     let mut state = StreamingState::new(&cfg)?;
     let mut head = state.push_block(audio, pool, components, &cfg)?;
@@ -952,6 +955,8 @@ fn process_offline_async(
         // Identity rate: `audio_dec` is already at the decision rate.
         audio_sample_rate: sv_sr,
         diagnostics: true,
+        // Offline async path doesn't drive DFN3.
+        dfn3_onnx_path: None,
     };
     let mut state = StreamingState::new(&cfg)?;
 

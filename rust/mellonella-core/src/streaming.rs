@@ -90,6 +90,7 @@
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
@@ -97,6 +98,7 @@ use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
+use crate::dfn3::Dfn3Streamer;
 use crate::embedding::{EcapaTdnn, EmbeddingError};
 use crate::enrollment::EmbeddingPool;
 use crate::f0::{
@@ -148,6 +150,20 @@ pub struct StreamingConfig {
     /// `false` to avoid the per-call allocation in the live path —
     /// the GUI can opt in only while a "live status" panel is open.
     pub diagnostics: bool,
+    /// **Stage C, Phase 5** — opt-in DFN3 noise suppression on the
+    /// audio-rate output path. When `Some`, the streaming engine
+    /// loads the stateful DFN3 ONNX at the supplied path and routes
+    /// the audio chain as `mic → TSE? → DFN3 → envelope → out`.
+    /// Runs **after** TSE so DFN3 cleans up residual noise in the
+    /// extracted target voice (the empirical TSE→DFN3 ordering beats
+    /// DFN3→TSE by ~1-3 dB SI-SDR; see Phase 5 ordering experiment).
+    ///
+    /// Decision-rate features (VAD, ECAPA, F0 score, auto-learn) still
+    /// observe the raw input audio so the SV path remains unaffected.
+    ///
+    /// `audio_sample_rate` must equal the DFN3 model rate (48 kHz).
+    /// Default `None` — no NS, byte-identical to pre-Phase-5 behaviour.
+    pub dfn3_onnx_path: Option<PathBuf>,
 }
 
 impl Default for StreamingConfig {
@@ -157,6 +173,7 @@ impl Default for StreamingConfig {
             gate: GateConfig::default(),
             audio_sample_rate: 48_000,
             diagnostics: false,
+            dfn3_onnx_path: None,
         }
     }
 }
@@ -619,16 +636,22 @@ pub(crate) struct StreamingState {
     /// across `push_samples` calls — the same ownership pattern the
     /// async-refresh worker uses for `fbank` + `ecapa`.
     pub(crate) tse_stage: Option<TseStage>,
-    /// **Stage C, Phase 5 part 3** — gain values queued for emission
-    /// behind the TSE stage's accumulator. Pushed at the input-audio
-    /// rate (one per audio-rate sample handed to the TSE stage),
-    /// consumed at the same rate as TSE emits extracted samples. While
-    /// streaming, up to `tse_stage.chunk_samples() - 1` gains are
-    /// pending at any time; the [`Self::flush`] tail drains the
-    /// remainder.
+    /// **Stage C, Phase 5** — optional DFN3 noise-suppression stream.
+    /// Sits **after** [`Self::tse_stage`] in the audio-rate chain so
+    /// DFN3 cleans residual noise on the extracted target voice (the
+    /// empirical TSE→DFN3 ordering beats DFN3→TSE; see Phase 5).
+    /// Present when [`StreamingConfig::dfn3_onnx_path`] is `Some`.
+    pub(crate) dfn3_stream: Option<Dfn3Streamer>,
+    /// **Stage C, Phase 5** — gain values queued for emission behind
+    /// the TSE+DFN3 chain's combined buffering. Pushed at the input-
+    /// audio rate (one per audio-rate sample handed to the chain),
+    /// consumed at the same rate as the **last** active stage emits.
+    /// While streaming, up to `tse_chunk - 1 + dfn3_lookahead_samples`
+    /// gains may be pending; the [`Self::flush`] tail drains the rest.
     ///
-    /// Empty (and unused) when `tse_stage` is `None`.
-    tse_pending_gain: VecDeque<f32>,
+    /// Empty (and unused) when both `tse_stage` and `dfn3_stream` are
+    /// `None`.
+    chain_pending_gain: VecDeque<f32>,
 }
 
 /// Persistent worker thread for `async_refresh = true` streaming.
@@ -1180,7 +1203,8 @@ impl StreamingState {
             // Plain `StreamingState::new` callers (offline async path,
             // ad-hoc tests) keep the TSE-off byte-equal contract.
             tse_stage: None,
-            tse_pending_gain: VecDeque::new(),
+            dfn3_stream: None,
+            chain_pending_gain: VecDeque::new(),
         })
     }
 
@@ -1239,13 +1263,16 @@ impl StreamingState {
         self.audio_samples_emitted = 0;
         self.fast_f0_cue.reset();
         self.turn.reset(config.pipeline.sv_window_samples);
-        // Stage C, Phase 5 part 3: drain the TSE accumulator and the
-        // pending-gain queue so a `reset()` is a clean restart even
-        // when TSE is active.
+        // Stage C, Phase 5: drain the TSE/DFN3 chain accumulators and
+        // the pending-gain queue so a `reset()` is a clean restart
+        // even when neural processing is active.
         if let Some(stage) = self.tse_stage.as_mut() {
             stage.reset();
         }
-        self.tse_pending_gain.clear();
+        if let Some(stream) = self.dfn3_stream.as_mut() {
+            stream.reset();
+        }
+        self.chain_pending_gain.clear();
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -1585,26 +1612,36 @@ impl StreamingState {
         // span. `EnvelopeState::advance` returns one gain per
         // sample.
         let gain = self.envelope_state.advance(is_on, audio_chunk.len());
-        if let Some(stage) = self.tse_stage.as_mut() {
-            // Stage C, Phase 5 part 3: TSE-extract this frame's audio
-            // first, then apply the envelope to whatever extracted
-            // samples are available. The stage's accumulator can buffer
-            // up to `chunk_samples - 1` samples between emits, so we
-            // queue the matching gains and pair them up one-for-one as
-            // TSE produces output. `audio_samples_emitted` continues to
-            // track the **input** audio timeline (matching the gate
-            // decisions); `out.audio` lags by the buffered residue until
-            // [`Self::flush`] drains the tail.
-            let extracted = stage.process(audio_chunk).map_err(PipelineError::from)?;
-            self.tse_pending_gain.extend(gain.iter().copied());
-            for &x in &extracted {
+        if self.tse_stage.is_some() || self.dfn3_stream.is_some() {
+            // Stage C, Phase 5: route this frame's audio through the
+            // optional TSE→DFN3 chain, then apply the envelope to
+            // whatever the chain emits. Each stage buffers samples
+            // internally (TSE up to `chunk_samples - 1`; DFN3 holds a
+            // 2-frame conv lookahead), so we queue per-sample gains
+            // and pop them as the chain's **last active stage**
+            // produces output. `audio_samples_emitted` keeps tracking
+            // the **input** audio timeline (matching gate decisions);
+            // `out.audio` lags by the chain's accumulated buffering
+            // until [`Self::flush`] drains the tail.
+            self.chain_pending_gain.extend(gain.iter().copied());
+            let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
+                stage.process(audio_chunk).map_err(PipelineError::from)?
+            } else {
+                audio_chunk.to_vec()
+            };
+            let after_dfn3: Vec<f32> = if let Some(stream) = self.dfn3_stream.as_mut() {
+                stream.push_samples(&after_tse)?
+            } else {
+                after_tse
+            };
+            for &x in &after_dfn3 {
                 let g = self
-                    .tse_pending_gain
+                    .chain_pending_gain
                     .pop_front()
-                    .expect("pending_gain length matches TSE input cumulative length");
+                    .expect("chain_pending_gain length matches chain input cumulative length");
                 out.audio.push(x * g);
             }
-            out.tse_applied = true;
+            out.tse_applied = self.tse_stage.is_some();
         } else {
             for (k, &g) in gain.iter().enumerate() {
                 out.audio.push(audio_chunk[k] * g);
@@ -1807,46 +1844,58 @@ impl StreamingState {
                 )?;
             }
         }
-        // Stage C, Phase 5 part 3: drain the TSE accumulator tail so
-        // the final samples emerge. `TseStage::flush` zero-pads the
-        // partial chunk to `chunk_samples` and runs one last inference;
-        // we apply pending gains to as many of those samples as we have
-        // unconsumed gains and drop the rest (they correspond to the
-        // zero-pad).
-        self.drain_tse_tail(&mut out)?;
+        // Stage C, Phase 5: drain the TSE→DFN3 chain tail so the final
+        // samples emerge. TSE.flush zero-pads its partial chunk and
+        // runs one last inference; DFN3.push consumes that tail and
+        // DFN3.flush drains its conv-lookahead frames. Pending gains
+        // are applied to as many emitted samples as we have queued;
+        // the rest correspond to zero-padded fillers and are dropped.
+        self.drain_chain_tail(&mut out)?;
         Ok(out)
     }
 
-    /// Drain any partial chunk left in the TSE accumulator into
-    /// `out.audio` by running `TseStage::flush()` and applying the
-    /// queued gains to its output. No-op when TSE is disabled or the
-    /// pending-gain queue is empty.
-    fn drain_tse_tail(&mut self, out: &mut StreamingOutput) -> Result<(), PipelineError> {
-        let Some(stage) = self.tse_stage.as_mut() else {
-            return Ok(());
-        };
-        if self.tse_pending_gain.is_empty() {
+    /// Drain any partial chunk left in the TSE accumulator and the
+    /// DFN3 lookahead buffer into `out.audio`, applying queued gains
+    /// 1-to-1 with the chain's final emit. No-op when neither stage is
+    /// configured or the pending-gain queue is empty.
+    fn drain_chain_tail(&mut self, out: &mut StreamingOutput) -> Result<(), PipelineError> {
+        if self.tse_stage.is_none() && self.dfn3_stream.is_none() {
             return Ok(());
         }
-        let extracted = stage.flush().map_err(PipelineError::from)?;
-        // `flush()` either returns a full chunk (the zero-padded tail
-        // inference) or an empty vector when the accumulator was
-        // already empty. We only emit as many of those samples as we
-        // have pending gains for — the rest correspond to the
-        // zero-pad and are discarded.
-        let n_take = extracted.len().min(self.tse_pending_gain.len());
-        for &x in &extracted[..n_take] {
+        if self.chain_pending_gain.is_empty() {
+            return Ok(());
+        }
+        // Flush TSE first; if no TSE, the tail is empty.
+        let tse_tail = if let Some(stage) = self.tse_stage.as_mut() {
+            stage.flush().map_err(PipelineError::from)?
+        } else {
+            Vec::new()
+        };
+        // Pass the TSE tail through DFN3 (if active) and then flush
+        // DFN3's lookahead so the very last hop emerges.
+        let chain_tail = if let Some(stream) = self.dfn3_stream.as_mut() {
+            let mut tail = if tse_tail.is_empty() {
+                Vec::new()
+            } else {
+                stream.push_samples(&tse_tail)?
+            };
+            tail.extend(stream.flush()?);
+            tail
+        } else {
+            tse_tail
+        };
+        // Emit as many samples as we have pending gains for; any
+        // surplus came from TSE's zero-pad and is discarded.
+        let n_take = chain_tail.len().min(self.chain_pending_gain.len());
+        for &x in &chain_tail[..n_take] {
             let g = self
-                .tse_pending_gain
+                .chain_pending_gain
                 .pop_front()
-                .expect("n_take <= pending_gain.len()");
+                .expect("n_take <= chain_pending_gain.len()");
             out.audio.push(x * g);
         }
-        // Any residual pending gains beyond what `flush()` returned
-        // are dropped — they referenced samples the TSE stage never
-        // saw a complete chunk for.
-        self.tse_pending_gain.clear();
-        out.tse_applied = true;
+        self.chain_pending_gain.clear();
+        out.tse_applied = self.tse_stage.is_some();
         Ok(())
     }
 
@@ -1887,6 +1936,11 @@ impl StreamingState {
             self.drain_trailing_refreshes(&mut worker, pool, cohort, config, &mut out)?;
             self.async_worker = Some(worker);
         }
+        // Stage C, Phase 5: drain the TSE→DFN3 chain tail. Mirrors the
+        // sync flush so DFN3's lookahead buffer flushes deterministically
+        // even in async-refresh mode. (TSE is rejected in async mode at
+        // construction time, so only the DFN3-only branch can fire here.)
+        self.drain_chain_tail(&mut out)?;
         Ok(out)
     }
 
@@ -2001,6 +2055,23 @@ impl StreamingPipeline {
             None
         };
 
+        // Stage C, Phase 5: optional DFN3 noise-suppression stream.
+        // Sits after TSE in the audio chain. The DFN3 model is 48 kHz
+        // only; reject any audio_sample_rate mismatch up-front so the
+        // engine doesn't quietly produce garbage at the wrong rate.
+        let dfn3_stream = if let Some(path) = config.dfn3_onnx_path.as_deref() {
+            let expected_sr = u32::try_from(crate::dfn3::DFN3_SR).expect("DFN3_SR fits in u32");
+            if config.audio_sample_rate != expected_sr {
+                return Err(PipelineError::TseRateMismatch {
+                    audio_sr: config.audio_sample_rate,
+                    expected_sr,
+                });
+            }
+            Some(Dfn3Streamer::from_onnx_path(path)?)
+        } else {
+            None
+        };
+
         if config.pipeline.async_refresh {
             let PipelineComponents {
                 vad,
@@ -2013,6 +2084,7 @@ impl StreamingPipeline {
             } = components;
             let mut state = StreamingState::new_async(&config, fbank, ecapa)?;
             state.tse_stage = live_stage;
+            state.dfn3_stream = dfn3_stream;
             Ok(Self {
                 state,
                 config,
@@ -2022,6 +2094,7 @@ impl StreamingPipeline {
         } else {
             let mut state = StreamingState::new(&config)?;
             state.tse_stage = live_stage;
+            state.dfn3_stream = dfn3_stream;
             Ok(Self {
                 state,
                 config,

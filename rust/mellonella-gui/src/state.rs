@@ -457,6 +457,10 @@ impl AppState {
                 gate: self.gate_cfg,
                 audio_sample_rate: OUTPUT_SAMPLE_RATE,
                 diagnostics: false,
+                // `LiveSession::new` overwrites this from `dfn3_onnx_path`
+                // on `SessionConfig` below — keep `None` here as the
+                // construction-time default.
+                dfn3_onnx_path: None,
             },
             ring_capacity_samples: 0,
             dfn3_onnx_path,

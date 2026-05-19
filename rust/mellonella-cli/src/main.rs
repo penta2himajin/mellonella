@@ -631,6 +631,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
             gate: GateConfig::default(),
             audio_sample_rate: OUTPUT_SAMPLE_RATE,
             diagnostics: false,
+            dfn3_onnx_path: None,
         },
         ring_capacity_samples: 0, // accept the audio-io default
         dfn3_onnx_path,
