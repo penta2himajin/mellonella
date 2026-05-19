@@ -106,9 +106,7 @@ class TseSession:
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
         opts.inter_op_num_threads = 1
-        self.sess = ort.InferenceSession(
-            str(onnx_path), opts, providers=["CPUExecutionProvider"]
-        )
+        self.sess = ort.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
         self.state_in_shapes = {
@@ -162,12 +160,8 @@ class DnsmosSession:
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
-        self.sbo = ort.InferenceSession(
-            str(sbo_path), opts, providers=["CPUExecutionProvider"]
-        )
-        self.p808 = ort.InferenceSession(
-            str(p808_path), opts, providers=["CPUExecutionProvider"]
-        )
+        self.sbo = ort.InferenceSession(str(sbo_path), opts, providers=["CPUExecutionProvider"])
+        self.p808 = ort.InferenceSession(str(p808_path), opts, providers=["CPUExecutionProvider"])
 
     @staticmethod
     def _melspec(audio: np.ndarray) -> np.ndarray:
@@ -240,7 +234,9 @@ def _mix_at_db(s1: np.ndarray, s2: np.ndarray, db: float) -> np.ndarray:
     return (s2f * ((e1 / e2) * (10 ** (-db / 20.0)))).astype(np.float32)
 
 
-def _build_scenarios(target: np.ndarray, interferer: np.ndarray, noise: np.ndarray) -> list[Scenario]:
+def _build_scenarios(
+    target: np.ndarray, interferer: np.ndarray, noise: np.ndarray
+) -> list[Scenario]:
     n = min(len(target), len(interferer), len(noise))
     n = (n // CHUNK) * CHUNK
     t = target[:n].astype(np.float32)
@@ -283,8 +279,7 @@ def evaluate(
     n_utts: int = 4,
 ) -> dict:
     targets = [
-        sf.read(str(audio_dir / f"target_{i}.wav"))[0].astype(np.float32)
-        for i in range(n_utts)
+        sf.read(str(audio_dir / f"target_{i}.wav"))[0].astype(np.float32) for i in range(n_utts)
     ]
     inters = [
         sf.read(str(audio_dir / f"inter_{i}.wav"))[0].astype(np.float32) for i in range(n_utts)
@@ -325,7 +320,9 @@ def evaluate(
 
     return {
         "per_utt": [asdict(r) for r in results],
-        "summary": {sc: _agg(sc) for sc in ("A_clean", "B_t_noise_10dB", "C_t_inter_0dB", "D_t_inter_n_5dB")},
+        "summary": {
+            sc: _agg(sc) for sc in ("A_clean", "B_t_noise_10dB", "C_t_inter_0dB", "D_t_inter_n_5dB")
+        },
     }
 
 
@@ -333,7 +330,9 @@ def evaluate(
 # CLI
 # ---------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--tse-onnx", required=True, type=Path)
     p.add_argument("--dnsmos-sbo", required=True, type=Path)
     p.add_argument("--dnsmos-p808", required=True, type=Path)
