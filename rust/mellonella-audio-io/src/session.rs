@@ -341,7 +341,16 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name("mellonella-audio-io-worker".into())
         .spawn(move || {
+            let mut first_input_logged = false;
+            let mut first_nonempty_output_logged = false;
             while let Ok(chunk) = input_rx.recv() {
+                if !first_input_logged && !chunk.is_empty() {
+                    eprintln!(
+                        "[audio-io] worker: first input chunk received ({} samples)",
+                        chunk.len()
+                    );
+                    first_input_logged = true;
+                }
                 if !chunk.is_empty() {
                     input_rms_bits.store(rms(&chunk).to_bits(), Ordering::Relaxed);
                 }
@@ -352,6 +361,15 @@ fn spawn_worker(
                         }
                         if !out.audio.is_empty() {
                             output_rms_bits.store(rms(&out.audio).to_bits(), Ordering::Relaxed);
+                            if !first_nonempty_output_logged {
+                                eprintln!(
+                                    "[audio-io] worker: first non-empty pipeline output \
+                                     ({} samples, RMS {:.4})",
+                                    out.audio.len(),
+                                    f32::from_bits(output_rms_bits.load(Ordering::Relaxed)),
+                                );
+                                first_nonempty_output_logged = true;
+                            }
                         }
                         let n = out.audio.len() as u64;
                         if n > 0 && output_tx.send(out.audio).is_err() {
@@ -440,11 +458,22 @@ fn build_input_stream(
 ) -> Result<Stream, AudioIoError> {
     let mut resampler = build_resampler(device_sr, INTERNAL_SAMPLE_RATE)?;
     let channels_usize = channels as usize;
+    let mut first_call = true;
     let err_fn = |e: cpal::StreamError| eprintln!("[audio-io] input stream error: {e}");
     device
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if first_call {
+                    eprintln!(
+                        "[audio-io] input: first cpal callback fired ({} samples × {} ch \
+                         @ {} Hz)",
+                        data.len() / channels_usize,
+                        channels_usize,
+                        device_sr,
+                    );
+                    first_call = false;
+                }
                 let mono = channel_strategy.downmix(data, channels_usize);
                 let processed = match &mut resampler {
                     Some(r) => resample_one(r, &mono),
@@ -483,18 +512,40 @@ fn build_output_stream(
     // fixed-size scratch slice each time; remaining samples wait
     // for the next call.
     let mut carry: Vec<f32> = Vec::new();
+    // Diagnostics: print the first callback so users can confirm cpal
+    // is actually calling us, and the first underrun so silent output
+    // bugs surface in the console. Heavy logging in the steady state
+    // would flood at audio-callback frequency (~100 Hz), so these are
+    // one-shot flags.
+    let mut first_call = true;
+    let mut first_underrun_logged = false;
+    let mut first_ring_chunk_logged = false;
     let err_fn = |e: cpal::StreamError| eprintln!("[audio-io] output stream error: {e}");
     device
         .build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let frames_needed = data.len() / channels_usize;
+                if first_call {
+                    eprintln!(
+                        "[audio-io] output: first cpal callback fired ({frames_needed} frames × {channels_usize} ch)"
+                    );
+                    first_call = false;
+                }
                 // Top up the carry buffer until it has enough mono
                 // samples to fill `data`, draining the output ring.
                 while carry.len() < frames_needed {
                     let Ok(chunk) = output_rx.try_recv() else {
                         break;
                     };
+                    if !first_ring_chunk_logged && !chunk.is_empty() {
+                        eprintln!(
+                            "[audio-io] output: first ring chunk received ({} samples @ {} Hz)",
+                            chunk.len(),
+                            INTERNAL_SAMPLE_RATE
+                        );
+                        first_ring_chunk_logged = true;
+                    }
                     let resampled = match &mut resampler {
                         Some(r) => resample_one(r, &chunk).unwrap_or_default(),
                         None => chunk,
@@ -503,6 +554,17 @@ fn build_output_stream(
                 }
                 if carry.len() < frames_needed {
                     underruns.fetch_add(1, Ordering::Relaxed);
+                    if !first_underrun_logged {
+                        eprintln!(
+                            "[audio-io] output: first underrun — wanted {} frames, ring \
+                             produced {} (worker behind or output device draining faster \
+                             than the pipeline runs). If this keeps logging, check that \
+                             the input mic is also producing samples.",
+                            frames_needed,
+                            carry.len()
+                        );
+                        first_underrun_logged = true;
+                    }
                 }
                 // Broadcast mono → all output channels. Silence on
                 // underrun.
