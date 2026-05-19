@@ -220,7 +220,7 @@ pub fn dfn3_path_from_env() -> Option<PathBuf> {
         }
     }
     let cached = mellonella_core::hf_fetch::cached_path(
-        mellonella_core::hf_fetch::MELLONELLA_MODELS_REPO,
+        mellonella_core::hf_fetch::DFN3_REPO,
         mellonella_core::hf_fetch::DFN3_FILE,
     )
     .ok()?;
