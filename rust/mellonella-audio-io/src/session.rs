@@ -224,6 +224,8 @@ impl LiveSession {
             input_rms_bits.clone(),
             output_rms_bits.clone(),
             gate_on.clone(),
+            input_overruns.clone(),
+            output_underruns.clone(),
         )?;
 
         input_stream
@@ -337,12 +339,22 @@ fn spawn_worker(
     input_rms_bits: Arc<AtomicU32>,
     output_rms_bits: Arc<AtomicU32>,
     gate_on: Arc<AtomicBool>,
+    input_overruns: Arc<AtomicU64>,
+    output_underruns: Arc<AtomicU64>,
 ) -> Result<JoinHandle<()>, AudioIoError> {
     std::thread::Builder::new()
         .name("mellonella-audio-io-worker".into())
         .spawn(move || {
             let mut first_input_logged = false;
             let mut first_nonempty_output_logged = false;
+            // Periodic stats: every ~1 s of wall clock, log delta
+            // counters so the user can see if underruns / overruns
+            // continue past startup (= persistent CPU shortfall) or
+            // were a one-shot stream-startup artifact.
+            let mut last_stats_at = std::time::Instant::now();
+            let mut last_underruns = 0_u64;
+            let mut last_overruns = 0_u64;
+            let mut last_processed = 0_u64;
             while let Ok(chunk) = input_rx.recv() {
                 if !first_input_logged && !chunk.is_empty() {
                     let r = rms(&chunk);
@@ -385,6 +397,26 @@ fn spawn_worker(
                         let _ = events_tx.send(SessionEvent::Error(e.to_string()));
                         return;
                     }
+                }
+                // Once every ~1 s of wall clock, dump rolling stats so
+                // post-startup behaviour (persistent underruns vs.
+                // clean steady state) is visible without a debugger.
+                if last_stats_at.elapsed() >= std::time::Duration::from_secs(1) {
+                    let u = output_underruns.load(Ordering::Relaxed);
+                    let o = input_overruns.load(Ordering::Relaxed);
+                    let p = samples_processed.load(Ordering::Relaxed);
+                    eprintln!(
+                        "[audio-io] stats: +{du} underruns, +{do_} overruns, +{dp} samples in last \
+                         {ms} ms (totals: underruns={u}, overruns={o}, samples={p})",
+                        du = u.saturating_sub(last_underruns),
+                        do_ = o.saturating_sub(last_overruns),
+                        dp = p.saturating_sub(last_processed),
+                        ms = last_stats_at.elapsed().as_millis(),
+                    );
+                    last_underruns = u;
+                    last_overruns = o;
+                    last_processed = p;
+                    last_stats_at = std::time::Instant::now();
                 }
             }
             if let Ok(tail) = pipeline.flush() {
