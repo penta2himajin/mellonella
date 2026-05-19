@@ -594,4 +594,421 @@ mod tests {
             p.display()
         );
     }
+
+    // ----------------------------------------------------------------
+    // ONNX-backed end-to-end checks. Gated on the same env vars as the
+    // mellonella-core integration tests (`MELLONELLA_ECAPA_ONNX`,
+    // `MELLONELLA_VAD_ONNX`, `ORT_DYLIB_PATH`) so a contributor without
+    // the model artefacts still gets a green `cargo test`. The
+    // persistence helpers below stash and restore any pre-existing
+    // `default_enrollment_path()` file so they don't clobber a real
+    // profile.
+    // ----------------------------------------------------------------
+
+    fn skip_if_no_onnx() -> Option<(String, String)> {
+        let Ok(ecapa) = std::env::var("MELLONELLA_ECAPA_ONNX") else {
+            eprintln!("[skip] MELLONELLA_ECAPA_ONNX not set");
+            return None;
+        };
+        let Ok(vad) = std::env::var("MELLONELLA_VAD_ONNX") else {
+            eprintln!("[skip] MELLONELLA_VAD_ONNX not set");
+            return None;
+        };
+        if std::env::var("ORT_DYLIB_PATH").is_err() {
+            eprintln!("[skip] ORT_DYLIB_PATH not set");
+            return None;
+        }
+        Some((ecapa, vad))
+    }
+
+    fn enroll_pool_from_fixture(ecapa: &str, vad: &str) -> EmbeddingPool {
+        use mellonella_core::embedding::EcapaTdnn;
+        use mellonella_core::features::Fbank;
+        use mellonella_core::vad::SileroVad;
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("mellonella-core")
+            .join("tests")
+            .join("fixtures")
+            .join("pipeline_input.bin");
+        let bytes = std::fs::read(&fixture).expect("read pipeline_input.bin");
+        assert!(bytes.len().is_multiple_of(4));
+        let audio_16k: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut components = PipelineComponents {
+            vad: SileroVad::from_onnx_path(vad, 16_000).expect("load VAD"),
+            fbank: Fbank::with_speechbrain_filterbank().expect("Fbank from speechbrain filterbank"),
+            ecapa: EcapaTdnn::from_onnx_path(ecapa).expect("load ECAPA"),
+            cohort: Vec::new(),
+            tse: None,
+        };
+        enroll_from_recording(&audio_16k, &mut components, EmbeddingPoolConfig::default())
+            .expect("enroll_from_recording")
+    }
+
+    /// Swap the on-disk `default_enrollment_path()` with `pool` for
+    /// the duration of `body`, restoring whatever was there.
+    fn with_test_enrollment(pool: &EmbeddingPool, body: impl FnOnce()) {
+        let path = default_enrollment_path().expect("config dir available");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create config dir");
+        }
+        let backup = path.with_extension("json.testbackup");
+        let had_backup = path.exists();
+        if had_backup {
+            std::fs::rename(&path, &backup).expect("backup existing enrollment");
+        }
+        pool.save(&path).expect("save test pool");
+        body();
+        let _ = std::fs::remove_file(&path);
+        if had_backup {
+            std::fs::rename(&backup, &path).expect("restore existing enrollment");
+        }
+    }
+
+    #[test]
+    fn default_app_state_auto_loads_persisted_enrollment() {
+        let Some((ecapa, vad)) = skip_if_no_onnx() else {
+            return;
+        };
+        let pool = enroll_pool_from_fixture(&ecapa, &vad);
+        let expected_dim = pool.anchor_centroid().expect("anchor dim").len();
+        with_test_enrollment(&pool, || {
+            let state = AppState::default();
+            assert!(state.pool.is_some(), "should auto-load enrollment.json");
+            assert!(
+                matches!(state.origin, EnrollmentOrigin::AutoLoaded(_)),
+                "expected AutoLoaded origin, got {:?}",
+                state.origin
+            );
+            assert!(state.pool_anchors >= 1);
+            let loaded_dim = state
+                .pool
+                .as_ref()
+                .unwrap()
+                .anchor_centroid()
+                .unwrap()
+                .len();
+            assert_eq!(loaded_dim, expected_dim);
+        });
+    }
+
+    /// Drive the GUI's exact pipeline configuration end-to-end on an
+    /// offline buffer, no cpal involved. This is the headless analog
+    /// of the user pressing Live monitor — it exercises the same TSE
+    /// → DFN3 → gate → envelope chain that the worker runs.
+    ///
+    /// Gated on `MELLONELLA_TSE_PROD_48K_ONNX` and
+    /// `MELLONELLA_DFN3_ONNX` *in addition* to the ECAPA / VAD pair —
+    /// the GUI auto-enables both stages when the models are present,
+    /// so the test follows the same rule.
+    ///
+    /// When `MELLONELLA_DUMP_OFFLINE_WAV` is set, the input (resampled)
+    /// and chain output are also written to `/tmp/mellonella_offline_*.wav`
+    /// so a developer reproducing a "weird audio output" complaint
+    /// can listen to what the pipeline actually produced.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn streaming_pipeline_runs_clean_on_offline_speech() {
+        use mellonella_core::resample::resample_to;
+        use mellonella_core::streaming::{StreamingConfig, StreamingPipeline};
+        use mellonella_core::tse_stage::TseStageConfig;
+
+        let Some((ecapa, vad)) = skip_if_no_onnx() else {
+            return;
+        };
+        let Ok(tse_path) = std::env::var("MELLONELLA_TSE_PROD_48K_ONNX") else {
+            eprintln!("[skip] MELLONELLA_TSE_PROD_48K_ONNX not set");
+            return;
+        };
+        let Ok(dfn3_path) = std::env::var("MELLONELLA_DFN3_ONNX") else {
+            eprintln!("[skip] MELLONELLA_DFN3_ONNX not set");
+            return;
+        };
+
+        // 1) Enroll a pool on the canonical 16 kHz fixture and grab
+        //    the pipeline components.
+        let pool = enroll_pool_from_fixture(&ecapa, &vad);
+        let components = PipelineComponents {
+            vad: mellonella_core::vad::SileroVad::from_onnx_path(&vad, 16_000).unwrap(),
+            fbank: mellonella_core::features::Fbank::with_speechbrain_filterbank().unwrap(),
+            ecapa: mellonella_core::embedding::EcapaTdnn::from_onnx_path(&ecapa).unwrap(),
+            cohort: Vec::new(),
+            tse: None,
+        };
+
+        // 2) Load the audio path. By default uses the 2 s 16 kHz
+        //    `pipeline_input.bin` fixture and upsamples to 48 kHz.
+        //    Set `MELLONELLA_OFFLINE_INPUT_WAV=<path.wav>` to point
+        //    the test at a longer, real-world recording for
+        //    repro-grade ear-checks; the test reads it as 16-bit
+        //    signed mono and resamples to 48 kHz internally.
+        let audio_48k: Vec<f32> = if let Ok(p) = std::env::var("MELLONELLA_OFFLINE_INPUT_WAV") {
+            let (samples_native, native_sr) = read_pcm16_mono_wav(&p);
+            if native_sr == OUTPUT_SAMPLE_RATE {
+                samples_native
+            } else {
+                resample_to(&samples_native, native_sr, OUTPUT_SAMPLE_RATE)
+                    .expect("input WAV → 48 kHz resample")
+            }
+        } else {
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("mellonella-core")
+                .join("tests")
+                .join("fixtures")
+                .join("pipeline_input.bin");
+            let bytes = std::fs::read(&fixture).unwrap();
+            let audio_16k: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            resample_to(&audio_16k, 16_000, OUTPUT_SAMPLE_RATE)
+                .expect("16k → 48k resample for offline streaming run")
+        };
+
+        // 3) Build a StreamingConfig that mirrors the GUI's
+        //    `AppState::start()` exactly — same gate, same pipeline
+        //    cadence, TSE Prod48k enabled, DFN3 enabled.
+        let mut pipeline_cfg = default_live_pipeline_cfg();
+        pipeline_cfg.tse = Some(TseStageConfig::new_prod_48k(PathBuf::from(&tse_path)));
+        let cfg = StreamingConfig {
+            pipeline: pipeline_cfg,
+            gate: GateConfig::default(),
+            audio_sample_rate: OUTPUT_SAMPLE_RATE,
+            diagnostics: false,
+            dfn3_onnx_path: Some(PathBuf::from(&dfn3_path)),
+        };
+
+        let mut pipeline = StreamingPipeline::new(pool, cfg, components)
+            .expect("StreamingPipeline accepts the GUI config");
+
+        // 4) Push the audio in 480-sample (10 ms) chunks, mirroring
+        //    the worker's actual cadence. Track diagnostics that
+        //    the user can use to decide whether the chain is doing
+        //    something pathological on real speech.
+        let chunk_size: usize = 480;
+        let mut all_output: Vec<f32> = Vec::with_capacity(audio_48k.len() + chunk_size);
+        let mut nan_count = 0_usize;
+        let mut inf_count = 0_usize;
+        let mut gate_transitions = 0_usize;
+        let mut last_gate_state: Option<bool> = None;
+        let mut gate_on_samples = 0_u64;
+        let mut chunks_pushed = 0_u64;
+        let mut zero_output_chunks = 0_u64;
+        let t0 = std::time::Instant::now();
+        for chunk in audio_48k.chunks(chunk_size) {
+            let out = pipeline
+                .push_samples(chunk)
+                .expect("push_samples in offline streaming run");
+            chunks_pushed += 1;
+            if out.audio.is_empty() {
+                zero_output_chunks += 1;
+            }
+            for &s in &out.audio {
+                if s.is_nan() {
+                    nan_count += 1;
+                } else if !s.is_finite() {
+                    inf_count += 1;
+                }
+            }
+            for &(_, is_on) in &out.gate_decisions {
+                if Some(is_on) != last_gate_state {
+                    gate_transitions += 1;
+                    last_gate_state = Some(is_on);
+                }
+            }
+            if let Some(true) = last_gate_state {
+                gate_on_samples += out.audio.len() as u64;
+            }
+            all_output.extend_from_slice(&out.audio);
+        }
+        let tail = pipeline.flush().expect("flush");
+        for &s in &tail.audio {
+            if s.is_nan() {
+                nan_count += 1;
+            } else if !s.is_finite() {
+                inf_count += 1;
+            }
+        }
+        all_output.extend_from_slice(&tail.audio);
+        let wall_ms = t0.elapsed().as_millis();
+        let audio_ms = audio_48k.len() as f64 / f64::from(OUTPUT_SAMPLE_RATE) * 1000.0;
+        let realtime_factor = audio_ms / wall_ms.max(1) as f64;
+
+        let rms_in = (audio_48k.iter().map(|s| s * s).sum::<f32>() / audio_48k.len() as f32).sqrt();
+        let rms_out =
+            (all_output.iter().map(|s| s * s).sum::<f32>() / all_output.len().max(1) as f32).sqrt();
+        let peak_in = audio_48k.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        let peak_out = all_output.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        let total_out = all_output.len();
+        let rms_db = 20.0 * (rms_out.max(1e-12) / rms_in.max(1e-12)).log10();
+        let peak_db = 20.0 * (peak_out.max(1e-12) / peak_in.max(1e-12)).log10();
+
+        eprintln!(
+            "[offline] {chunks_pushed} chunks pushed, {zero_output_chunks} produced no output, \
+             {wall_ms} ms wall ({realtime_factor:.2}× realtime)"
+        );
+        eprintln!(
+            "[offline] gate transitions: {gate_transitions}, samples gate-on / total: \
+             {gate_on_samples} / {total_out}"
+        );
+        eprintln!("[offline] RMS  in={rms_in:.4}  out={rms_out:.4}  ({rms_db:+.1} dB)");
+        eprintln!("[offline] PEAK in={peak_in:.4}  out={peak_out:.4}  ({peak_db:+.1} dB)");
+
+        // 5) Assertions: the chain must produce finite samples and a
+        //    length within shouting distance of the input (chain
+        //    buffering can trim or pad by a few frames; we allow
+        //    ±200 ms = ±9600 samples of slack at 48 kHz).
+        assert_eq!(
+            nan_count, 0,
+            "pipeline emitted {nan_count} NaN samples — TSE / DFN3 state is going non-finite"
+        );
+        assert_eq!(
+            inf_count, 0,
+            "pipeline emitted {inf_count} Inf samples — clipping or division-by-zero somewhere"
+        );
+        let slack = OUTPUT_SAMPLE_RATE as usize / 5;
+        let len_delta = all_output.len().abs_diff(audio_48k.len());
+        let total_in = audio_48k.len();
+        assert!(
+            len_delta <= slack,
+            "output length {total_out} too far from input {total_in} \
+             (delta {len_delta}, slack {slack})"
+        );
+
+        // 6) Optional artefact dump for ear-checking the chain.
+        if std::env::var_os("MELLONELLA_DUMP_OFFLINE_WAV").is_some() {
+            let in_path = "/tmp/mellonella_offline_input_48k.wav";
+            let out_path = "/tmp/mellonella_offline_output_48k.wav";
+            write_f32_wav(in_path, &audio_48k, hound_lite_spec());
+            write_f32_wav(out_path, &all_output, hound_lite_spec());
+            eprintln!(
+                "[offline] wrote {} ({} samples) and {} ({} samples)",
+                in_path,
+                audio_48k.len(),
+                out_path,
+                all_output.len()
+            );
+        }
+    }
+
+    /// Minimal 16-bit / signed / mono WAV reader. Returns
+    /// `(samples in [-1, 1], native sample rate)`. Panics on
+    /// malformed input — fine for a developer harness.
+    fn read_pcm16_mono_wav(path: &str) -> (Vec<f32>, u32) {
+        let bytes = std::fs::read(path).expect("read input WAV");
+        assert!(bytes.len() > 44, "WAV too short: {}", bytes.len());
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // Find the `fmt ` and `data` chunks (the standard offsets
+        // are only valid when there are no extension chunks before
+        // `data`, which is overwhelmingly common but not guaranteed).
+        let mut i = 12_usize;
+        let mut fmt_off: Option<usize> = None;
+        let mut data_off: Option<(usize, usize)> = None;
+        while i + 8 <= bytes.len() {
+            let id = &bytes[i..i + 4];
+            let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                as usize;
+            match id {
+                b"fmt " => fmt_off = Some(i + 8),
+                b"data" => data_off = Some((i + 8, sz)),
+                _ => {}
+            }
+            i += 8 + sz;
+        }
+        let fmt = fmt_off.expect("WAV has no fmt chunk");
+        let (data, data_len) = data_off.expect("WAV has no data chunk");
+        let audio_format = u16::from_le_bytes([bytes[fmt], bytes[fmt + 1]]);
+        let channels = u16::from_le_bytes([bytes[fmt + 2], bytes[fmt + 3]]);
+        let sample_rate = u32::from_le_bytes([
+            bytes[fmt + 4],
+            bytes[fmt + 5],
+            bytes[fmt + 6],
+            bytes[fmt + 7],
+        ]);
+        let bits = u16::from_le_bytes([bytes[fmt + 14], bytes[fmt + 15]]);
+        assert_eq!(audio_format, 1, "expected PCM (1), got {audio_format}");
+        assert_eq!(channels, 1, "expected mono, got {channels} channels");
+        assert_eq!(bits, 16, "expected 16-bit, got {bits}-bit");
+        let scale = 1.0_f32 / f32::from(i16::MAX);
+        let samples: Vec<f32> = bytes[data..data + data_len]
+            .chunks_exact(2)
+            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) * scale)
+            .collect();
+        (samples, sample_rate)
+    }
+
+    /// Minimal 16-bit / 48 kHz / mono WAV writer config. Inlined so
+    /// the test stays dependency-free (the GUI crate no longer pulls
+    /// `hound` after the latest cleanup).
+    #[derive(Clone, Copy)]
+    struct WavSpec {
+        channels: u16,
+        sample_rate: u32,
+    }
+    fn hound_lite_spec() -> WavSpec {
+        WavSpec {
+            channels: 1,
+            sample_rate: OUTPUT_SAMPLE_RATE,
+        }
+    }
+    fn write_f32_wav(path: &str, samples: &[f32], spec: WavSpec) {
+        use std::io::Write;
+        let bits_per_sample = 16_u16;
+        let byte_rate =
+            spec.sample_rate * u32::from(spec.channels) * u32::from(bits_per_sample / 8);
+        let block_align = spec.channels * (bits_per_sample / 8);
+        let data_bytes: u32 = samples.len() as u32 * u32::from(bits_per_sample / 8);
+        let mut f = std::fs::File::create(path).expect("create wav");
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36 + data_bytes).to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16_u32.to_le_bytes()).unwrap();
+        f.write_all(&1_u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&spec.channels.to_le_bytes()).unwrap();
+        f.write_all(&spec.sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_bytes.to_le_bytes()).unwrap();
+        for &s in samples {
+            let q = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            f.write_all(&q.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn start_records_an_error_when_no_audio_device_is_available() {
+        let Some((ecapa, vad)) = skip_if_no_onnx() else {
+            return;
+        };
+        let pool = enroll_pool_from_fixture(&ecapa, &vad);
+        with_test_enrollment(&pool, || {
+            let mut state = AppState::default();
+            assert!(state.pool.is_some(), "precondition: pool auto-loaded");
+            state.start();
+            // Headless container has no cpal device → start() must
+            // surface an error and leave no half-constructed session.
+            // (If audio is somehow available, the session is fine —
+            // stop it to keep the test hermetic.)
+            let has_err = state.last_error.is_some();
+            let has_session = state.session.is_some();
+            assert!(
+                has_err ^ has_session,
+                "expected exactly one of last_error / session after start(); \
+                 err={:?}, has_session={has_session}",
+                state.last_error
+            );
+            if has_session {
+                state.stop();
+                assert!(state.session.is_none());
+            }
+        });
+    }
 }
