@@ -306,6 +306,16 @@ pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral:
     last_score + weight * (fm_fast - neutral)
 }
 
+/// Threshold below which a chain-input chunk is treated as
+/// "essentially silent" and gets sub-LSB dither injected to keep the
+/// TSE model away from zero-variance NaN territory. 1e-9 is well
+/// below any real f32 ADC noise floor.
+const CHAIN_SILENCE_EPS: f32 = 1e-9;
+
+/// Sub-LSB dither amplitude. ±1e-7 ≈ -140 dBFS, below 24-bit
+/// quantisation noise and inaudible, but non-zero variance.
+const CHAIN_DITHER: f32 = 1e-7;
+
 /// One-shot NaN diagnostic — logs the first time `samples` contains a
 /// NaN under the given label, then suppresses further reports. The
 /// suppression is per `(label, kind)` pair (kind ∈ {NaN, Inf}) so each
@@ -1672,10 +1682,37 @@ impl StreamingState {
             if let Some(stage) = self.tse_stage.as_ref() {
                 log_first_nan("chain input cond_embedding", stage.cond_embedding());
             }
-            let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
-                stage.process(audio_chunk).map_err(PipelineError::from)?
+            // WASAPI / cpal commonly delivers one or more zero-filled
+            // primer chunks at stream startup before the real mic
+            // audio lands. TSE's normalisation layers divide by /
+            // take `log` of per-frame energy, so a zero-variance
+            // chunk produces NaN that poisons the GRU hidden state
+            // for the rest of the run. Inject sub-LSB dither
+            // (±1e-7 ≈ -140 dBFS, well below the 24-bit noise floor
+            // and inaudible) whenever the chunk is essentially
+            // silent, so the model never sees an exactly-zero
+            // variance. Real audio is left untouched.
+            let dithered_chunk: Vec<f32>;
+            let chain_audio: &[f32] = if audio_chunk.iter().all(|s| s.abs() < CHAIN_SILENCE_EPS) {
+                dithered_chunk = audio_chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        if i % 2 == 0 {
+                            CHAIN_DITHER
+                        } else {
+                            -CHAIN_DITHER
+                        }
+                    })
+                    .collect();
+                &dithered_chunk
             } else {
-                audio_chunk.to_vec()
+                audio_chunk
+            };
+            let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
+                stage.process(chain_audio).map_err(PipelineError::from)?
+            } else {
+                chain_audio.to_vec()
             };
             log_first_nan("after TSE", &after_tse);
             let after_dfn3: Vec<f32> = if let Some(stream) = self.dfn3_stream.as_mut() {
@@ -1689,7 +1726,12 @@ impl StreamingState {
                     .chain_pending_gain
                     .pop_front()
                     .expect("chain_pending_gain length matches chain input cumulative length");
-                out.audio.push(x * g);
+                // Belt-and-braces: replace any non-finite value with
+                // 0 so a poisoned model state can't push NaN / Inf
+                // to the DAC even if the dither above didn't help.
+                let sample = x * g;
+                out.audio
+                    .push(if sample.is_finite() { sample } else { 0.0 });
             }
             out.tse_applied = self.tse_stage.is_some();
         } else {
