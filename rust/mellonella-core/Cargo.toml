@@ -16,6 +16,8 @@ rustfft = { workspace = true }
 realfft = { workspace = true }
 rubato = { workspace = true }
 deep_filter = { workspace = true }
+ureq = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

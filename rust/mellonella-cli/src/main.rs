@@ -54,6 +54,7 @@ use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
 use mellonella_core::gating::GateConfig;
+use mellonella_core::hf_fetch::{fetch_tse_prod_48k, FetchError, TSE_PROD_48K_REPO};
 use mellonella_core::pipeline::{
     enroll_from_recording, process_offline, PipelineComponents, PipelineConfig,
 };
@@ -220,6 +221,13 @@ struct ProcessArgs {
     /// 16 kHz PoC.
     #[arg(long, value_enum, default_value_t = TseVariant::Prod48k)]
     tse_config: TseVariant,
+    /// Download the canonical Stage C TSE model from HuggingFace
+    /// (penta2himajin/tse-conv-tasnet-48k) into the local cache and
+    /// use it. Mutually exclusive with `--tse-onnx`; implies
+    /// `--tse-config prod_48k`. The cached file is reused on
+    /// subsequent runs.
+    #[arg(long, conflicts_with = "tse_onnx")]
+    tse_from_hf: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -450,6 +458,37 @@ fn apply_low_latency_profile(cfg: &mut PipelineConfig, enabled: bool) {
     cfg.offset_fail_closed = true;
 }
 
+/// Download the canonical Stage C prod_48k ONNX (and its `.data`
+/// sidecar) from HuggingFace into the local cache and return the
+/// `.onnx` path. Reuses a cached copy when present.
+fn fetch_tse_from_hf() -> Result<PathBuf, CliError> {
+    eprintln!(
+        "[info] fetching {} from HuggingFace (cached on subsequent runs)…",
+        TSE_PROD_48K_REPO
+    );
+    let onnx = fetch_tse_prod_48k(|file, so_far, total| {
+        let mb = so_far as f32 / 1.0e6;
+        if let Some(t) = total {
+            let pct = (so_far as f32 / t as f32) * 100.0;
+            eprint!(
+                "\r  {file}: {mb:>6.2} / {:>6.2} MB ({pct:5.1}%)",
+                t as f32 / 1.0e6
+            );
+        } else {
+            eprint!("\r  {file}: {mb:>6.2} MB");
+        }
+        if total.is_some_and(|t| so_far >= t) {
+            eprintln!();
+        }
+    })
+    .map_err(|e| match e {
+        FetchError::Cache(io) | FetchError::Io(io) => CliError::Io(io),
+        other => CliError::Pipeline(format!("HuggingFace fetch: {other}")),
+    })?;
+    eprintln!("[info] TSE model ready at {}", onnx.display());
+    Ok(onnx)
+}
+
 fn build_tse_stage_config(onnx: &Path, variant: TseVariant) -> Result<TseStageConfig, CliError> {
     if !onnx.exists() {
         return Err(CliError::Pipeline(format!(
@@ -476,6 +515,13 @@ fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
             "[info] Stage C TSE enabled: variant={:?}, onnx={}",
             args.tse_config,
             tse_onnx.display()
+        );
+    } else if args.tse_from_hf {
+        let onnx = fetch_tse_from_hf()?;
+        cfg.tse = Some(TseStageConfig::new_prod_48k(onnx.clone()));
+        eprintln!(
+            "[info] Stage C TSE enabled: variant=Prod48k, onnx={} (from HuggingFace)",
+            onnx.display()
         );
     }
     let gate = GateConfig::default();

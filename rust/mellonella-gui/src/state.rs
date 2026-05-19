@@ -539,6 +539,27 @@ impl AppState {
         self.tse_onnx_path.as_deref().is_some_and(Path::exists)
     }
 
+    /// Download the canonical Stage C TSE prod_48k model from
+    /// HuggingFace into the local cache (synchronous; the UI freezes
+    /// briefly during the ~10 MB download) and update
+    /// [`Self::tse_onnx_path`] to point at the cached file. Reuses an
+    /// already-cached copy on subsequent calls.
+    ///
+    /// Surfaces failures via [`Self::last_error`] rather than
+    /// `Result` so the egui call site stays click-handler-shaped.
+    pub fn fetch_tse_from_hf(&mut self) {
+        match mellonella_core::hf_fetch::fetch_tse_prod_48k(|_, _, _| {}) {
+            Ok(path) => {
+                self.tse_onnx_path = Some(path);
+                self.tse_variant = TseVariant::Prod48k;
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.last_error = Some(format!("HuggingFace fetch failed: {e}"));
+            }
+        }
+    }
+
     /// Latest input RMS from the worker (0.0 when no session is
     /// running). Used by the GUI's level meter.
     #[must_use]

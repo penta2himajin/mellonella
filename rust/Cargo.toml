@@ -32,6 +32,8 @@ eframe = { version = "0.32", default-features = false, features = ["default_font
 egui = "0.32"
 tray-icon = "0.22"
 rfd = "0.15"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+dirs = "5"
 
 [profile.release]
 lto = "fat"
