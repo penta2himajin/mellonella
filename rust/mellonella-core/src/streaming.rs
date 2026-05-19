@@ -813,6 +813,15 @@ pub(crate) trait RefreshStrategy {
     /// Stage B per-frame fast F0 cue, which lives in the core but
     /// only the strategy holds the `EmbeddingPool`.
     fn enrolled_f0(&self) -> (f32, f32);
+
+    /// Borrow the strategy's underlying [`EmbeddingPool`] read-only.
+    ///
+    /// Stage C Step 5 (TSE cond refresh) uses this from
+    /// [`StreamingState::step_one_frame_core`] to recompute the TSE
+    /// conditioning vector after a successful auto-learn admit — the
+    /// strategy owns the `&mut EmbeddingPool`, so the core's only
+    /// path to the post-admit pool state is through the strategy.
+    fn pool_ref(&self) -> &EmbeddingPool;
 }
 
 /// Submit / poll abstraction over an async ECAPA worker, so the same
@@ -931,6 +940,10 @@ impl RefreshStrategy for SyncRefresh<'_> {
     fn enrolled_f0(&self) -> (f32, f32) {
         let m = self.pool.metadata();
         (m.f0_mu, m.f0_sigma)
+    }
+
+    fn pool_ref(&self) -> &EmbeddingPool {
+        self.pool
     }
 }
 
@@ -1074,6 +1087,10 @@ impl RefreshStrategy for AsyncRefresh<'_> {
     fn enrolled_f0(&self) -> (f32, f32) {
         let m = self.pool.metadata();
         (m.f0_mu, m.f0_sigma)
+    }
+
+    fn pool_ref(&self) -> &EmbeddingPool {
+        self.pool
     }
 }
 
@@ -1326,6 +1343,33 @@ impl StreamingState {
     /// refresh-trigger decision (`due_normal` / `due_early`), the
     /// gate update + `silence_force_off` AND-term, diagnostics
     /// pushes, the decision-boundary emit, the envelope advance, and
+    /// Stage C Step 5 helper: after a strategy call that *may have*
+    /// admitted a new embedding into the pool, scan `out.events` for
+    /// `AutoLearnKind::Admit` entries past `events_before` and — if any
+    /// — recompute the TSE cond embedding from the strategy's pool
+    /// view and push it into [`Self::tse_stage`].
+    ///
+    /// No-ops when TSE isn't enabled or auto-learn didn't admit.
+    fn refresh_tse_cond_if_admitted(
+        &mut self,
+        strategy: &mut dyn RefreshStrategy,
+        out: &StreamingOutput,
+        events_before: usize,
+    ) -> Result<(), PipelineError> {
+        let Some(stage) = self.tse_stage.as_mut() else {
+            return Ok(());
+        };
+        let admitted = out
+            .events
+            .get(events_before..)
+            .is_some_and(|tail| tail.iter().any(|e| matches!(e.kind, AutoLearnKind::Admit)));
+        if !admitted {
+            return Ok(());
+        }
+        let cond = tse_cond_embedding(strategy.pool_ref())?;
+        stage.set_cond_embedding(&cond).map_err(PipelineError::from)
+    }
+
     /// the counter bumps.
     ///
     /// The *only* thing that varies between sync and async is **how**
@@ -1459,6 +1503,7 @@ impl StreamingState {
             self.sv_window_scratch.clear();
             self.sv_window_scratch
                 .extend(self.speech_buffer.iter().copied());
+            let events_before = out.events.len();
             strategy.on_refresh_due(
                 &self.sv_window_scratch,
                 self.frame_idx,
@@ -1466,6 +1511,13 @@ impl StreamingState {
                 &mut self.score,
                 out,
             )?;
+            // Stage C Step 5: when auto-learn admitted a new embedding
+            // on this refresh, recompute the TSE cond from the
+            // updated pool and push it into the live stage. The pool
+            // is only reachable through the strategy (it owns the
+            // `&mut EmbeddingPool`); the strategy exposes a read-only
+            // borrow via `pool_ref` after the admit.
+            self.refresh_tse_cond_if_admitted(strategy, out, events_before)?;
             // A refresh on the shrunk window has now been issued. For
             // the sync strategy this completes inline; for the async
             // strategy the result trails by one inference (the async
@@ -1479,12 +1531,16 @@ impl StreamingState {
 
         // Every frame: sync is a no-op, async polls the worker and
         // applies any ready result before the gate update.
+        let events_before_poll = out.events.len();
         strategy.poll(
             self.consecutive_speech_ms,
             self.frame_idx,
             &mut self.score,
             out,
         )?;
+        // Async refresh path can deliver an Admit on `poll` too — same
+        // recompute as the on_refresh_due branch above.
+        self.refresh_tse_cond_if_admitted(strategy, out, events_before_poll)?;
 
         // Stage B, Part 1: the gate sees the *fused* score when the
         // fast cue is enabled, the bare `last_score` otherwise.
@@ -1893,21 +1949,19 @@ impl StreamingPipeline {
         config: StreamingConfig,
         mut components: PipelineComponents,
     ) -> Result<Self, PipelineError> {
-        // Stage C, Phase 5 part 3: TSE wiring for streaming. The rate
-        // check + async rejection match the offline `process_offline`
-        // contract exactly. The cond embedding is snapshotted **once**
-        // here (mirroring offline's "frozen for the run" semantics);
-        // the embedding pool may evolve via auto-learn during streaming
-        // but the TSE stage keeps the construction-time anchor centroid
-        // as its conditioning.
+        // Stage C, Phase 5 part 3 + Step 4: TSE wiring for streaming.
+        // Both sync (`async_refresh=false`) and async
+        // (`async_refresh=true`) paths now support TSE. The cond
+        // embedding is snapshotted **once** here (mirroring offline's
+        // "frozen for the run" semantics); the embedding pool may
+        // evolve via auto-learn during streaming but the TSE stage
+        // keeps the construction-time anchor centroid as its
+        // conditioning until [`Self::refresh_tse_cond_from_pool`] is
+        // called.
         //
-        // TODO(phase-5-followup): refresh the cond embedding on each
-        // auto-learn anchor update. Right now the snapshot is taken
-        // exactly once at stream start.
+        // TODO(phase-5-step5): refresh the cond embedding on each
+        // auto-learn anchor update.
         let tse_enabled = config.pipeline.tse.is_some();
-        if tse_enabled && config.pipeline.async_refresh {
-            return Err(PipelineError::TseAsyncUnsupported);
-        }
         if tse_enabled {
             let stage_cfg = config
                 .pipeline
@@ -1923,19 +1977,42 @@ impl StreamingPipeline {
             }
         }
 
+        // Pre-build the TseStage (shared between sync and async
+        // branches) before destructuring `components` for the async
+        // path. Mirrors `ensure_tse_stage` in `pipeline.rs`.
+        let live_stage = if tse_enabled {
+            let stage_cfg = config
+                .pipeline
+                .tse
+                .as_ref()
+                .expect("tse_enabled implies Some");
+            let cond = tse_cond_embedding(&pool)?;
+            let stage = if let Some(mut existing) = components.tse.take() {
+                existing.reset();
+                existing
+                    .set_cond_embedding(&cond)
+                    .map_err(PipelineError::from)?;
+                existing
+            } else {
+                TseStage::from_config(stage_cfg, &cond).map_err(PipelineError::from)?
+            };
+            Some(stage)
+        } else {
+            None
+        };
+
         if config.pipeline.async_refresh {
             let PipelineComponents {
                 vad,
                 fbank,
                 ecapa,
                 cohort,
-                // The async-refresh rejection above ensures
-                // `tse.is_none()` here when the rejection didn't
-                // already early-return; the destructure is just to
-                // keep the pattern exhaustive.
+                // `tse` was already consumed by the shared `live_stage`
+                // builder above; this destructure exhausts the struct.
                 tse: _,
             } = components;
-            let state = StreamingState::new_async(&config, fbank, ecapa)?;
+            let mut state = StreamingState::new_async(&config, fbank, ecapa)?;
+            state.tse_stage = live_stage;
             Ok(Self {
                 state,
                 config,
@@ -1944,29 +2021,7 @@ impl StreamingPipeline {
             })
         } else {
             let mut state = StreamingState::new(&config)?;
-            if tse_enabled {
-                let stage_cfg = config
-                    .pipeline
-                    .tse
-                    .as_ref()
-                    .expect("tse_enabled implies Some");
-                let cond = tse_cond_embedding(&pool)?;
-                // Reuse a pre-built `components.tse` (reset + new cond)
-                // when the caller pre-loaded the ONNX; otherwise build
-                // a fresh stage from the config. Mirrors
-                // `ensure_tse_stage` in `pipeline.rs` so both wirings
-                // share the same caching contract.
-                let live_stage = if let Some(mut existing) = components.tse.take() {
-                    existing.reset();
-                    existing
-                        .set_cond_embedding(&cond)
-                        .map_err(PipelineError::from)?;
-                    existing
-                } else {
-                    TseStage::from_config(stage_cfg, &cond).map_err(PipelineError::from)?
-                };
-                state.tse_stage = Some(live_stage);
-            }
+            state.tse_stage = live_stage;
             Ok(Self {
                 state,
                 config,

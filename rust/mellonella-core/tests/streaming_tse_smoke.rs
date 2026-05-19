@@ -417,8 +417,13 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
         }
     }
 
-    // Case 2: async refresh + TSE must reject with
-    // `TseAsyncUnsupported` — same contract as offline.
+    // Case 2: async refresh + TSE is NOW SUPPORTED (Step 4 of the
+    // Stage C 実適用 series). The early-return that used to fire here
+    // was removed in PR #154; the path now attaches a TseStage to the
+    // async-mode StreamingState just like it does for sync mode. The
+    // `/dev/null` ONNX still can't load, so the call surfaces a
+    // `TseStage` error rather than `TseAsyncUnsupported` — that's the
+    // bit we assert here.
     {
         let mut p_cfg = pipeline_cfg.clone();
         p_cfg.async_refresh = true;
@@ -430,9 +435,15 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
         };
         let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
         match StreamingPipeline::new(pool, cfg, components) {
-            Err(PipelineError::TseAsyncUnsupported) => {}
-            Err(other) => panic!("expected TseAsyncUnsupported, got {other:?}"),
-            Ok(_) => panic!("expected TseAsyncUnsupported, got Ok"),
+            Err(PipelineError::TseAsyncUnsupported) => {
+                panic!("Step 4 lifted the async+TSE rejection — this branch must not fire")
+            }
+            Err(PipelineError::TseStage(_)) => {
+                // Expected — /dev/null isn't a valid ONNX, and we
+                // reached the stage-building step.
+            }
+            Err(other) => panic!("expected TseStage(...) error from /dev/null, got {other:?}"),
+            Ok(_) => panic!("expected TseStage error from /dev/null, got Ok"),
         }
     }
 }

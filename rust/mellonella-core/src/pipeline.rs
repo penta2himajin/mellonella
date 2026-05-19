@@ -540,35 +540,40 @@ impl From<TseStageError> for PipelineError {
 /// Picks the **anchor centroid** (`E_enroll`, the element-wise mean of
 /// the enrollment anchors — what
 /// [`crate::enrollment::EmbeddingPool::anchor_centroid`] returns) as
-/// the single 192-dim vector representing the enrolled target speaker:
+/// Compute the 192-dim TSE conditioning vector from `pool`.
 ///
-/// * It's the longest-lived, drift-free identity reference in the
-///   pool — anchors are written once at enrollment and never
-///   modified. The λ-residual `adapted` embedding moves with runtime
-///   evidence, so using it here would let TSE conditioning drift with
-///   the pool; the centroid is what `match_score` always keeps in
-///   play (see `enrollment.rs` docstring).
-/// * For a single-anchor pool the centroid is that anchor verbatim
-///   (each `f32 * 1.0` is exact), so the chosen accessor reduces to
+/// Returns the λ-residual **adapted** embedding when available,
+/// falling back to the **anchor centroid** before the first
+/// auto-learn admit (when `adapted` is still `None`):
+///
+/// * The adapted embedding is `λ·centroid + (1-λ)·evidence`; it
+///   tracks runtime acoustic conditions (microphone, environment,
+///   speaker state) once auto-learn has admitted at least one
+///   high-confidence runtime embedding. Stage C Step 5 refreshes the
+///   TSE stage's cond on every successful admit, so a long session
+///   sees the model condition on the most current view of the target
+///   speaker rather than the frozen enrollment.
+/// * Before the first admit, `adapted` is `None`; in that window the
+///   anchor centroid is the only signal we have and TSE conditions on
+///   it. For a single-anchor pool the centroid is that anchor
+///   verbatim (each `f32 * 1.0` is exact), so the accessor reduces to
 ///   "the enrolled embedding" on the simplest path.
-/// * The 48 kHz prod path may want to compare against `adapted` as
-///   well; for the PoC, sticking to the centroid keeps the run
-///   deterministic.
 ///
 /// # Errors
 /// Returns [`PipelineError::TseMissingEnrollment`] when the pool has
-/// no anchors yet (centroid is `None`).
+/// no anchors yet (both `adapted` and `anchor_centroid` are `None`).
 pub(crate) fn tse_cond_embedding(pool: &EmbeddingPool) -> Result<Vec<f32>, PipelineError> {
-    let centroid = pool
-        .anchor_centroid()
+    let vec = pool
+        .adapted()
+        .or_else(|| pool.anchor_centroid())
         .ok_or(PipelineError::TseMissingEnrollment)?;
-    if centroid.len() != TSE_COND_DIM {
+    if vec.len() != TSE_COND_DIM {
         return Err(PipelineError::TseStage(TseStageError::InvalidCondLength {
-            got: centroid.len(),
+            got: vec.len(),
             expected: TSE_COND_DIM,
         }));
     }
-    Ok(centroid.to_vec())
+    Ok(vec.to_vec())
 }
 
 /// Ensure `components.tse` holds a TSE stage compatible with the
@@ -760,21 +765,35 @@ pub fn process_offline(
     }
 
     if pipeline_cfg.async_refresh {
-        // Async path: TSE wiring through the scoped worker is a
-        // follow-up. The rate/cond-availability checks above still
-        // ran so a misconfigured `Some(_)` is rejected before any
-        // audio enters the pipeline.
-        if tse_enabled {
-            return Err(PipelineError::TseAsyncUnsupported);
-        }
-        return process_offline_async(
+        // Async path (Step 4 of Stage C 実適用): same wiring as sync
+        // — the streaming-engine pass runs WITHOUT the TSE
+        // post-processing inline (mirroring the sync path's
+        // `tse: None` strip below), then `run_tse_offline` +
+        // `apply_envelope_dual_rate` re-apply TSE + the gate envelope
+        // on top of the async-mode result.
+        let mut result = process_offline_async(
             audio,
             audio_sample_rate,
             pool,
-            pipeline_cfg,
+            &PipelineConfig {
+                tse: None,
+                ..pipeline_cfg.clone()
+            },
             gate_cfg,
             components,
-        );
+        )?;
+        if let Some(stage) = components.tse.as_mut().filter(|_| tse_enabled) {
+            let extracted = run_tse_offline(stage, audio)?;
+            result.audio = apply_envelope_dual_rate(
+                &extracted,
+                &result.gate_decisions,
+                audio_sample_rate,
+                pipeline_cfg.sample_rate,
+                *gate_cfg,
+            )?;
+            result.tse_applied = true;
+        }
+        return Ok(result);
     }
     // Sync offline = streaming engine called once with the whole
     // buffer, then flushed. Per-frame outputs match the previous
