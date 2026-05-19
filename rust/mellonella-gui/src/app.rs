@@ -78,82 +78,110 @@ impl MellonellaApp {
         });
     }
 
+    /// Top-of-window enrollment summary:
+    /// - During an active recording: progress bar
+    /// - No pool loaded: big "welcome" wizard panel asking the user
+    ///   to record their voice (first-run experience)
+    /// - Pool loaded: compact "● Profile" pill + Re-enroll button
     fn render_enrollment_section(&mut self, ui: &mut egui::Ui) {
-        ui.label("Enrollment:");
-        // Top row: actions.
         if self.state.is_recording() {
+            ui.label("Enrollment:");
             self.render_recording_progress(ui);
-        } else {
-            self.render_enrollment_actions(ui);
+            return;
         }
-        // Bottom row: current pool status.
-        ui.add_space(2.0);
-        self.render_enrollment_status(ui);
+        if self.state.pool.is_some() {
+            self.render_profile_pill(ui);
+        } else {
+            self.render_first_run_wizard(ui);
+        }
     }
 
-    fn render_enrollment_actions(&mut self, ui: &mut egui::Ui) {
-        let busy = self.state.is_running();
+    /// Compact "● Profile loaded" indicator + Re-enroll button. The
+    /// power-user "From WAV / Load / Save JSON" buttons live in the
+    /// Settings panel; the main UI exposes only the action the user
+    /// would actually want from here.
+    fn render_profile_pill(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!busy, egui::Button::new("From WAV…"))
-                .on_hover_text("Pick a clean voice WAV (16-bit signed mono, any rate).")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("WAV audio", &["wav"])
-                    .pick_file()
+            let origin_short = match &self.state.origin {
+                EnrollmentOrigin::None => "voice".to_string(),
+                EnrollmentOrigin::Wav(_) => "voice (from WAV)".to_string(),
+                EnrollmentOrigin::Mic { secs } => format!("voice ({secs}s recording)"),
+                EnrollmentOrigin::Json(_) => "voice (from JSON)".to_string(),
+            };
+            ui.label(
+                egui::RichText::new(format!("● Profile: {origin_short}"))
+                    .color(egui::Color32::from_rgb(80, 200, 120)),
+            );
+            ui.label(format!("· {} anchors", self.state.pool_anchors));
+            if self.state.pool_f0_mu > 0.0 {
+                ui.weak(format!(
+                    "· F0 μ={:.0} Hz σ={:.0} Hz",
+                    self.state.pool_f0_mu, self.state.pool_f0_sigma
+                ));
+            }
+            // Re-enroll button lives at the right-hand edge of the row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let busy = self.state.is_running();
+                let record_secs = self.state.record_duration_secs;
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Re-enroll"))
+                    .on_hover_text("Replace the saved profile with a new mic recording.")
+                    .clicked()
                 {
-                    self.state.enroll_from_wav(&path);
+                    self.state.start_recording(record_secs);
                 }
-            }
-            let record_secs = self.state.record_duration_secs;
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(format!("Record ({record_secs:.0}s)")),
-                )
-                .on_hover_text("Record from the selected input device.")
-                .clicked()
-            {
-                self.state.start_recording(record_secs);
-            }
-            ui.add_enabled(
-                !busy,
-                egui::DragValue::new(&mut self.state.record_duration_secs)
-                    .speed(0.5)
-                    .range(1.0..=30.0)
-                    .suffix(" s")
-                    .fixed_decimals(0),
-            )
-            .on_hover_text("Recording duration (1 – 30 s)");
-            ui.separator();
-            if ui
-                .add_enabled(!busy, egui::Button::new("Load JSON…"))
-                .on_hover_text("Load a pre-computed enrollment.json from the CLI.")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Enrollment JSON", &["json"])
-                    .pick_file()
-                {
-                    self.state.load_enrollment_json(&path);
-                }
-            }
-            let has_pool = self.state.pool.is_some();
-            if ui
-                .add_enabled(!busy && has_pool, egui::Button::new("Save JSON…"))
-                .on_hover_text("Save the current enrolment to JSON for re-use.")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Enrollment JSON", &["json"])
-                    .set_file_name("enrollment.json")
-                    .save_file()
-                {
-                    self.state.save_enrollment_json(&path);
-                }
-            }
+            });
         });
+    }
+
+    /// First-run welcome / set-up-your-voice panel. Shown when no pool
+    /// has been loaded yet (either because the user just installed the
+    /// app, or they cleared `~/.config/mellonella/enrollment.json`).
+    fn render_first_run_wizard(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(16))
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Welcome to Mellonella").heading());
+                ui.add_space(4.0);
+                ui.label(
+                    "Mellonella filters live audio so only the enrolled speaker's voice \
+                     passes through. Record a short sample of your own voice to begin — \
+                     the rest is automatic.",
+                );
+                ui.add_space(12.0);
+                let record_secs = self.state.record_duration_secs;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "🎙  Record my voice ({record_secs:.0} s)"
+                                ))
+                                .strong(),
+                            )
+                            .min_size(egui::vec2(220.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.state.start_recording(record_secs);
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.state.record_duration_secs)
+                            .speed(0.5)
+                            .range(1.0..=30.0)
+                            .suffix(" s")
+                            .fixed_decimals(0),
+                    )
+                    .on_hover_text("Recording duration (1 – 30 s)");
+                });
+                ui.add_space(4.0);
+                ui.weak(
+                    "Tip: speak naturally for the duration. The file is saved to \
+                     ~/.config/mellonella/enrollment.json and reused on every launch.",
+                );
+            });
     }
 
     fn render_recording_progress(&mut self, ui: &mut egui::Ui) {
@@ -177,33 +205,52 @@ impl MellonellaApp {
         });
     }
 
-    fn render_enrollment_status(&self, ui: &mut egui::Ui) {
-        let origin_label = match &self.state.origin {
-            EnrollmentOrigin::None => "(no enrolment yet)".to_string(),
-            EnrollmentOrigin::Wav(p) => {
-                let name = p.file_name().map_or_else(
-                    || p.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
-                format!("WAV: {name}")
+    /// Power-user enrollment IO buttons — From WAV, Load JSON, Save
+    /// JSON. Hidden from the main page (those buttons are noise for
+    /// the common case where the user just records once via the
+    /// first-run wizard) and surfaced here for CLI interop.
+    fn render_enrollment_power_user_actions(&mut self, ui: &mut egui::Ui) {
+        let busy = self.state.is_running() || self.state.is_recording();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Enroll from WAV…"))
+                .on_hover_text("Pick a clean voice WAV (16-bit signed mono, any rate).")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("WAV audio", &["wav"])
+                    .pick_file()
+                {
+                    self.state.enroll_from_wav(&path);
+                }
             }
-            EnrollmentOrigin::Mic { secs } => format!("Mic recording ({secs} s)"),
-            EnrollmentOrigin::Json(p) => {
-                let name = p.file_name().map_or_else(
-                    || p.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
-                format!("JSON: {name}")
+            if ui
+                .add_enabled(!busy, egui::Button::new("Load JSON…"))
+                .on_hover_text("Load a pre-computed enrollment.json from the CLI.")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Enrollment JSON", &["json"])
+                    .pick_file()
+                {
+                    self.state.load_enrollment_json(&path);
+                }
             }
-        };
-        if self.state.pool_anchors > 0 {
-            ui.label(format!(
-                "  {origin_label} · {} anchors · F0 μ={:.1} Hz σ={:.1} Hz",
-                self.state.pool_anchors, self.state.pool_f0_mu, self.state.pool_f0_sigma,
-            ));
-        } else {
-            ui.label(format!("  {origin_label}"));
-        }
+            let has_pool = self.state.pool.is_some();
+            if ui
+                .add_enabled(!busy && has_pool, egui::Button::new("Save JSON…"))
+                .on_hover_text("Export the current profile (in addition to the auto-save).")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Enrollment JSON", &["json"])
+                    .set_file_name("enrollment.json")
+                    .save_file()
+                {
+                    self.state.save_enrollment_json(&path);
+                }
+            }
+        });
     }
 
     fn render_device_row(&mut self, ui: &mut egui::Ui) {
@@ -447,6 +494,15 @@ impl MellonellaApp {
                         self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
                         self.state.pipeline_cfg = crate::state::default_live_pipeline_cfg();
                     }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Enrollment IO").strong());
+                    ui.weak(
+                        "Mellonella auto-saves the profile to ~/.config/mellonella/enrollment.json. \
+                         These buttons exist for CLI interop / advanced flows.",
+                    );
+                });
+                self.render_enrollment_power_user_actions(ui);
+                ui.add_enabled_ui(!running, |ui| {
                     ui.separator();
                     ui.label(egui::RichText::new("Stage C — Target Speaker Extraction").strong());
                     ui.horizontal(|ui| {
