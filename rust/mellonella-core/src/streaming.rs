@@ -272,6 +272,28 @@ pub struct StreamingConfig {
     /// Default `0.9` — overwhelmingly clean, just enough raw to
     /// fill in the spectral cracks. Set `1.0` to disable.
     pub overlap_wet_dry_alpha: f32,
+    /// **Phase 3.** Crossfade duration (audio-rate samples) over
+    /// which the Solo ↔ Overlap mode transition smoothly blends
+    /// the two paths' makeup envelopes. Without this, swapping
+    /// between Solo's static dB gain and Overlap's RMS-matched
+    /// gain produces an audible **level jump** at the transition
+    /// boundary — typically a few dB, briefly louder or quieter
+    /// depending on which way the swap goes.
+    ///
+    /// The crossfade only smooths the **makeup multiplier** and
+    /// the **wet/dry α**, not the underlying chain content
+    /// (TSE → DFN3 is a hard switch — both stages are reset on
+    /// the boundary so each starts cold). The level smoothing is
+    /// what the user actually hears, though; spectral discontinuity
+    /// at the chain boundary is masked perceptually by the gain
+    /// ramp.
+    ///
+    /// Default `9 600` samples (200 ms @ 48 kHz). Industry survey
+    /// puts the typical fade between 150-300 ms, with consumer
+    /// products like Krisp landing near 200 ms. Set `0` to
+    /// disable the crossfade and revert to the Phase 2 hard
+    /// transition.
+    pub mode_transition_crossfade_samples: u32,
 }
 
 impl Default for StreamingConfig {
@@ -292,6 +314,7 @@ impl Default for StreamingConfig {
             overlap_rms_match: true,
             overlap_rms_match_max_gain_db: 20.0,
             overlap_wet_dry_alpha: 0.9,
+            mode_transition_crossfade_samples: 9_600,
         }
     }
 }
@@ -422,6 +445,17 @@ impl FastF0Cue {
 #[must_use]
 pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral: f32) -> f32 {
     last_score + weight * (fm_fast - neutral)
+}
+
+/// dB → linear conversion shared by the makeup-gain plumbing.
+/// `db == 0.0` short-circuits to `1.0` to avoid a `powf` per chunk
+/// on the common no-op default.
+fn db_to_lin(db: f32) -> f32 {
+    if db == 0.0 {
+        1.0
+    } else {
+        10.0_f32.powf(db / 20.0)
+    }
 }
 
 /// Sub-LSB dither amplitude added unconditionally to the chain
@@ -828,6 +862,29 @@ pub(crate) struct StreamingState {
     /// mix can pull a time-aligned raw sample for each cleaned
     /// sample. Unused (always empty) in Solo mode.
     chain_pending_raw: VecDeque<f32>,
+    /// **Phase 3.** Mode-transition crossfade state. When a
+    /// `Solo ↔ Overlap` switch fires, the engine starts a linear
+    /// ramp from the **previous** mode's makeup multiplier to the
+    /// **new** mode's multiplier over
+    /// [`StreamingConfig::mode_transition_crossfade_samples`]
+    /// emitted samples. `chain_transition_remaining` counts down
+    /// per emitted sample; when it hits zero the chain has fully
+    /// settled into the new mode.
+    chain_transition_remaining: usize,
+    /// Total length of the active crossfade. Held alongside the
+    /// `remaining` counter so the per-sample weight reduces to
+    /// `1.0 − remaining / total`. Zero outside an active fade.
+    chain_transition_total: usize,
+    /// Frozen pre-transition makeup multiplier (linear), used as
+    /// the **from** value during the active crossfade. The
+    /// **to** value is recomputed each chunk from the new mode's
+    /// current makeup target (since the RMS-match factor is
+    /// chunk-by-chunk dynamic).
+    chain_transition_prev_makeup_lin: f32,
+    /// Frozen pre-transition wet / dry α, used as the **from**
+    /// value during the active crossfade. The **to** value is
+    /// the new mode's α (1.0 for Solo, configured for Overlap).
+    chain_transition_prev_alpha: f32,
     /// Optional pyannote-3.0 segmentation detector. Present when
     /// [`StreamingConfig::overlap_onnx_path`] resolves and both TSE
     /// and DFN3 are also configured (the toggle has no effect
@@ -1414,6 +1471,10 @@ impl StreamingState {
             dfn3_stream: None,
             chain_pending_gain: VecDeque::new(),
             chain_pending_raw: VecDeque::new(),
+            chain_transition_remaining: 0,
+            chain_transition_total: 0,
+            chain_transition_prev_makeup_lin: 1.0,
+            chain_transition_prev_alpha: 1.0,
             overlap_detector: None,
             chain_mode: ChainMode::Solo,
             overlap_above_ms: 0.0,
@@ -1922,32 +1983,30 @@ impl StreamingState {
             // small amount of raw audio to mask Conv-TasNet's
             // frame-to-frame mask artefacts.
             let soft_clip_enabled = config.chain_soft_clip;
-            let makeup_solo_lin = if config.makeup_gain_db_solo == 0.0 {
-                1.0
-            } else {
-                10.0_f32.powf(config.makeup_gain_db_solo / 20.0)
+            let target_makeup_lin = match self.chain_mode {
+                ChainMode::Solo => db_to_lin(config.makeup_gain_db_solo),
+                ChainMode::Overlap => {
+                    let static_lin = db_to_lin(config.makeup_gain_db_overlap);
+                    let rms_match_lin = if config.overlap_rms_match && !after_dfn3.is_empty() {
+                        let n = after_dfn3.len();
+                        let in_sum_sq: f32 =
+                            self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
+                        let in_rms = (in_sum_sq / n.max(1) as f32).sqrt();
+                        let out_sum_sq: f32 = after_dfn3.iter().map(|s| s * s).sum();
+                        let out_rms = (out_sum_sq / n.max(1) as f32).sqrt();
+                        let raw_ratio = in_rms.max(1e-9) / out_rms.max(1e-9);
+                        let max_lin = db_to_lin(config.overlap_rms_match_max_gain_db);
+                        raw_ratio.min(max_lin)
+                    } else {
+                        1.0
+                    };
+                    static_lin * rms_match_lin
+                }
             };
-            let makeup_overlap_static_lin = if config.makeup_gain_db_overlap == 0.0 {
-                1.0
-            } else {
-                10.0_f32.powf(config.makeup_gain_db_overlap / 20.0)
+            let target_alpha = match self.chain_mode {
+                ChainMode::Solo => 1.0,
+                ChainMode::Overlap => config.overlap_wet_dry_alpha.clamp(0.0, 1.0),
             };
-            let rms_match_lin = if self.chain_mode == ChainMode::Overlap
-                && config.overlap_rms_match
-                && !after_dfn3.is_empty()
-            {
-                let n = after_dfn3.len();
-                let in_sum_sq: f32 = self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
-                let in_rms = (in_sum_sq / n.max(1) as f32).sqrt();
-                let out_sum_sq: f32 = after_dfn3.iter().map(|s| s * s).sum();
-                let out_rms = (out_sum_sq / n.max(1) as f32).sqrt();
-                let raw_ratio = in_rms.max(1e-9) / out_rms.max(1e-9);
-                let max_lin = 10.0_f32.powf(config.overlap_rms_match_max_gain_db / 20.0);
-                raw_ratio.min(max_lin)
-            } else {
-                1.0
-            };
-            let alpha = config.overlap_wet_dry_alpha.clamp(0.0, 1.0);
 
             for &x in &after_dfn3 {
                 let g = self
@@ -1958,12 +2017,27 @@ impl StreamingState {
                     .chain_pending_raw
                     .pop_front()
                     .expect("chain_pending_raw length matches chain input cumulative length");
-                let chain_processed = match self.chain_mode {
-                    ChainMode::Solo => x * makeup_solo_lin,
-                    ChainMode::Overlap => x * rms_match_lin * makeup_overlap_static_lin,
-                };
-                // Wet / dry mix: identity in Solo (alpha is bypassed),
-                // configured value in Overlap.
+
+                // Phase 3: per-sample makeup + α crossfade across
+                // the active mode transition. `weight` ramps from
+                // 0.0 (just-switched, still mostly the old mode's
+                // makeup) to 1.0 (fully settled into the new mode).
+                let (makeup_lin, alpha) =
+                    if self.chain_transition_remaining > 0 && self.chain_transition_total > 0 {
+                        let rem = self.chain_transition_remaining as f32;
+                        let tot = self.chain_transition_total as f32;
+                        let weight = 1.0 - rem / tot;
+                        self.chain_transition_remaining -= 1;
+                        let blended_makeup = (1.0 - weight) * self.chain_transition_prev_makeup_lin
+                            + weight * target_makeup_lin;
+                        let blended_alpha = (1.0 - weight) * self.chain_transition_prev_alpha
+                            + weight * target_alpha;
+                        (blended_makeup, blended_alpha)
+                    } else {
+                        (target_makeup_lin, target_alpha)
+                    };
+
+                let chain_processed = x * makeup_lin;
                 let mixed = if self.chain_mode == ChainMode::Overlap && alpha < 1.0 {
                     alpha * chain_processed + (1.0 - alpha) * raw
                 } else {
@@ -2045,6 +2119,29 @@ impl StreamingState {
                     "[streaming] chain mode {:?} → {:?} (overlap_prob mean {:.3})",
                     self.chain_mode, new_mode, decision.mean_overlap_prob
                 );
+                // Phase 3: snapshot the **outgoing** mode's makeup
+                // settings BEFORE flipping `chain_mode`, so the
+                // emit-loop crossfade can ramp from these values to
+                // whatever the new mode is producing now. For the
+                // Overlap → Solo direction the previous makeup is
+                // the last RMS-matched factor seen; we approximate
+                // that with the static Overlap dB knob — RMS-match
+                // is chunk-dynamic and capturing the most recent
+                // factor would tie this snapshot to the emit loop.
+                // The fade target is recomputed each chunk so the
+                // approximation only matters at the very start of
+                // the ramp.
+                self.chain_transition_prev_makeup_lin = match self.chain_mode {
+                    ChainMode::Solo => db_to_lin(config.makeup_gain_db_solo),
+                    ChainMode::Overlap => db_to_lin(config.makeup_gain_db_overlap),
+                };
+                self.chain_transition_prev_alpha = match self.chain_mode {
+                    ChainMode::Solo => 1.0,
+                    ChainMode::Overlap => config.overlap_wet_dry_alpha.clamp(0.0, 1.0),
+                };
+                self.chain_transition_total = config.mode_transition_crossfade_samples as usize;
+                self.chain_transition_remaining = self.chain_transition_total;
+
                 self.chain_mode = new_mode;
                 // Reset the chain whose state was idle so the newly-
                 // active path starts fresh; drop pending gains held
