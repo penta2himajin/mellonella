@@ -43,6 +43,25 @@ pub const TSE_PROD_48K_REPO: &str = "penta2himajin/tse-conv-tasnet-48k";
 /// side in the cache directory.
 pub const TSE_PROD_48K_FILES: &[&str] = &["tse_prod_48k.onnx", "tse_prod_48k.onnx.data"];
 
+/// HuggingFace mirror of the Silero VAD ONNX. `onnx-community/silero-vad`
+/// is a community-maintained mirror of the model snakers4 ships with the
+/// `silero-vad` Python package; the ONNX file is byte-equal to what
+/// `scripts/download_models.sh` would copy out of the Python package.
+pub const VAD_REPO: &str = "onnx-community/silero-vad";
+pub const VAD_FILE: &str = "onnx/model.onnx";
+
+/// HuggingFace repo hosting the mellonella-side ONNX exports for DFN3
+/// and ECAPA-TDNN. These models aren't natively distributed as ONNX
+/// — DFN3 ships as a torch checkpoint via `df.enhance`, and ECAPA-TDNN
+/// ships as a SpeechBrain checkpoint — so the user has to convert
+/// once via `scripts/export_dfn3_onnx.py` / `scripts/export_ecapa_onnx.py`
+/// and upload the result. The repo path here is the canonical home;
+/// `ensure_dfn3_onnx` / `ensure_ecapa_onnx` fall back to env vars when
+/// the HF copy isn't reachable yet.
+pub const MELLONELLA_MODELS_REPO: &str = "penta2himajin/mellonella-models";
+pub const DFN3_FILE: &str = "dfn3.onnx";
+pub const ECAPA_FILE: &str = "ecapa_tdnn.onnx";
+
 /// Errors produced by [`fetch_file`] / [`fetch_tse_prod_48k`].
 #[derive(Debug)]
 pub enum FetchError {
@@ -202,6 +221,122 @@ pub fn fetch_tse_prod_48k(
     })
 }
 
+/// Identifies one of the four ONNX models the live engine needs. Used
+/// by [`EnsureProgress`] callbacks so a single UI progress bar can
+/// label which model is currently being fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    Tse,
+    Vad,
+    Dfn3,
+    Ecapa,
+}
+
+impl ModelKind {
+    /// Human-readable label for status displays.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tse => "TSE (target-speaker extraction)",
+            Self::Vad => "Silero VAD",
+            Self::Dfn3 => "DeepFilterNet 3",
+            Self::Ecapa => "ECAPA-TDNN",
+        }
+    }
+}
+
+/// Resolve a model ONNX path with the fallback chain:
+///   1. `env_var` (when set and the file exists) — current dev / CI flow
+///   2. Local cache (when previously downloaded) — second-and-later launches
+///   3. HuggingFace fetch (when a canonical `(repo, file)` is known) —
+///      first-launch auto-setup
+///
+/// Returns the first hit. `progress` is invoked during step 3 only.
+/// Pass `|_, _| {}` if progress isn't needed.
+///
+/// # Errors
+/// * Forwards any [`FetchError`] from a failed HF download.
+/// * Returns `FetchError::Cache` with a descriptive message when the
+///   env var is unset **and** no HF canonical URL is configured (i.e.
+///   the model can't be auto-fetched yet).
+fn resolve_model_path(
+    env_var: &str,
+    canonical: Option<(&str, &str)>,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, FetchError> {
+    if let Some(raw) = std::env::var_os(env_var) {
+        let p = PathBuf::from(raw);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    if let Some((repo, file)) = canonical {
+        let cached = cached_path(repo, file)?;
+        if cached.exists() {
+            return Ok(cached);
+        }
+        return fetch_file(repo, file, progress);
+    }
+    Err(FetchError::Cache(io::Error::other(format!(
+        "{env_var} not set and no HuggingFace mirror is configured for this model — \
+         run scripts/export_*.py to generate the ONNX and point {env_var} at it"
+    ))))
+}
+
+/// Ensure the Silero VAD ONNX is available locally and return its path.
+/// Falls back to `MELLONELLA_VAD_ONNX` when set.
+///
+/// # Errors
+/// As for [`fetch_file`].
+pub fn ensure_vad_onnx(progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf, FetchError> {
+    resolve_model_path("MELLONELLA_VAD_ONNX", Some((VAD_REPO, VAD_FILE)), progress)
+}
+
+/// Ensure the DFN3 ONNX is available locally and return its path.
+/// Falls back to `MELLONELLA_DFN3_ONNX` when set.
+///
+/// # Errors
+/// As for [`fetch_file`].
+pub fn ensure_dfn3_onnx(progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf, FetchError> {
+    resolve_model_path(
+        "MELLONELLA_DFN3_ONNX",
+        Some((MELLONELLA_MODELS_REPO, DFN3_FILE)),
+        progress,
+    )
+}
+
+/// Ensure the ECAPA-TDNN ONNX is available locally and return its path.
+/// Falls back to `MELLONELLA_ECAPA_ONNX` when set.
+///
+/// # Errors
+/// As for [`fetch_file`].
+pub fn ensure_ecapa_onnx(progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf, FetchError> {
+    resolve_model_path(
+        "MELLONELLA_ECAPA_ONNX",
+        Some((MELLONELLA_MODELS_REPO, ECAPA_FILE)),
+        progress,
+    )
+}
+
+/// Ensure the TSE prod_48k ONNX is available locally and return its path.
+/// Two-file bundle (`.onnx` + `.onnx.data`); both are pulled together when
+/// fetching. Falls back to the existing `MELLONELLA_TSE_PROD_48K_ONNX` env
+/// var when set.
+///
+/// # Errors
+/// As for [`fetch_file`].
+pub fn ensure_tse_prod_48k_onnx(
+    mut progress: impl FnMut(&str, u64, Option<u64>),
+) -> Result<PathBuf, FetchError> {
+    if let Some(raw) = std::env::var_os("MELLONELLA_TSE_PROD_48K_ONNX") {
+        let p = PathBuf::from(raw);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    fetch_tse_prod_48k(|file, so_far, total| progress(file, so_far, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +367,29 @@ mod tests {
     fn tse_prod_48k_constants_are_consistent() {
         assert!(TSE_PROD_48K_FILES.iter().any(|f| has_onnx_extension(f)));
         assert!(TSE_PROD_48K_FILES.iter().any(|f| f.ends_with(".onnx.data")));
+    }
+
+    #[test]
+    fn resolve_model_path_errors_when_nothing_configured() {
+        // Env var unset and no canonical URL → should return a
+        // descriptive cache error.
+        let err = resolve_model_path("MELLONELLA_NEVER_SET_VAR_XYZ", None, |_, _| {}).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("MELLONELLA_NEVER_SET_VAR_XYZ"),
+            "error should name the env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn model_kind_labels_are_non_empty() {
+        for k in [
+            ModelKind::Tse,
+            ModelKind::Vad,
+            ModelKind::Dfn3,
+            ModelKind::Ecapa,
+        ] {
+            assert!(!k.label().is_empty());
+        }
     }
 }
