@@ -83,4 +83,8 @@ Bug reports, feature requests, and PRs are welcome. See
 
 Distributed under the [Apache License 2.0](LICENSE). Bundled pretrained
 components (DeepFilterNet 3, silero-vad, ECAPA-TDNN, etc.) follow their own
-licenses, listed in [`docs/references.md`](docs/references.md).
+licenses, listed in [`docs/references.md`](docs/references.md). The GUI
+ships the M+ 1 Regular typeface
+([`assets/fonts/Mplus1-Regular.otf`](assets/fonts/Mplus1-Regular.otf))
+for Japanese fallback rendering under the
+[SIL Open Font License 1.1](assets/fonts/OFL.txt).
