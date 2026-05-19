@@ -179,8 +179,8 @@ fn tse_session_matches_python_onnxruntime_prod_48k() {
     let cfg = TseConfig::prod_48k();
     assert_eq!(cfg.n_state_tensors(), 89);
 
-    let mut session = TseSession::from_onnx_path_with_config(&onnx_path, cfg)
-        .expect("load prod_48k TSE ONNX");
+    let mut session =
+        TseSession::from_onnx_path_with_config(&onnx_path, cfg).expect("load prod_48k TSE ONNX");
     let mut cond_arr = [0.0_f32; TSE_COND_DIM];
     cond_arr.copy_from_slice(&cond);
 
