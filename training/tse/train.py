@@ -60,28 +60,48 @@ class ExponentialMovingAverage:
     ONNX export should load the EMA snapshot.
     """
 
+    # `torch.compile` wraps the user's module in an `OptimizedModule`
+    # whose `named_parameters()` keys are prefixed with `_orig_mod.`.
+    # We canonicalise on the un-prefixed names (the ones the original
+    # module — and `save_checkpoint` — use) so EMA works regardless of
+    # whether the caller passes the compiled wrapper or the underlying
+    # module. Without this, `update()` silently no-ops on the wrapper
+    # (the released v2-ampoff ckpt was bitten by exactly this bug:
+    # `ema.update(forward_model)` saw `_orig_mod.<...>` names that
+    # didn't match shadow, so EMA stayed at random init for the entire
+    # 50-epoch run).
+    _COMPILE_PREFIX = "_orig_mod."
+
+    @classmethod
+    def _strip(cls, name: str) -> str:
+        return name[len(cls._COMPILE_PREFIX) :] if name.startswith(cls._COMPILE_PREFIX) else name
+
     def __init__(self, model: nn.Module, decay: float) -> None:
         if not 0.0 <= decay < 1.0:
             raise ValueError(f"EMA decay must be in [0, 1), got {decay}")
         self.decay = decay
         self.shadow: dict[str, torch.Tensor] = {
-            name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad
+            self._strip(name): p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
         }
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         d = self.decay
         for name, p in model.named_parameters():
-            if name in self.shadow:
-                self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
+            key = self._strip(name)
+            if key in self.shadow:
+                self.shadow[key].mul_(d).add_(p.detach(), alpha=1.0 - d)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {name: t.detach().cpu() for name, t in self.shadow.items()}
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         for name, t in state.items():
-            if name in self.shadow:
-                self.shadow[name].copy_(t.to(self.shadow[name].device))
+            key = self._strip(name)
+            if key in self.shadow:
+                self.shadow[key].copy_(t.to(self.shadow[key].device))
 
     @torch.no_grad()
     def swap_with(self, model: nn.Module) -> dict[str, torch.Tensor]:
@@ -94,9 +114,10 @@ class ExponentialMovingAverage:
         """
         stash: dict[str, torch.Tensor] = {}
         for name, p in model.named_parameters():
-            if name in self.shadow:
+            key = self._strip(name)
+            if key in self.shadow:
                 stash[name] = p.detach().clone()
-                p.copy_(self.shadow[name])
+                p.copy_(self.shadow[key])
         return stash
 
     @torch.no_grad()
