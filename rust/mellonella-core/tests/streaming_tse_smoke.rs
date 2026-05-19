@@ -395,7 +395,7 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
             gate: gate_cfg,
             audio_sample_rate: 48_000,
             diagnostics: true,
-        dfn3_onnx_path: None,
+            dfn3_onnx_path: None,
         };
         let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
         match StreamingPipeline::new(pool, cfg, components) {
@@ -435,7 +435,7 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
             gate: gate_cfg,
             audio_sample_rate: 16_000,
             diagnostics: true,
-        dfn3_onnx_path: None,
+            dfn3_onnx_path: None,
         };
         let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
         match StreamingPipeline::new(pool, cfg, components) {

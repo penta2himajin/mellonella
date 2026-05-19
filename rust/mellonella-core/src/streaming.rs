@@ -2060,8 +2060,7 @@ impl StreamingPipeline {
         // only; reject any audio_sample_rate mismatch up-front so the
         // engine doesn't quietly produce garbage at the wrong rate.
         let dfn3_stream = if let Some(path) = config.dfn3_onnx_path.as_deref() {
-            let expected_sr =
-                u32::try_from(crate::dfn3::DFN3_SR).expect("DFN3_SR fits in u32");
+            let expected_sr = u32::try_from(crate::dfn3::DFN3_SR).expect("DFN3_SR fits in u32");
             if config.audio_sample_rate != expected_sr {
                 return Err(PipelineError::TseRateMismatch {
                     audio_sr: config.audio_sample_rate,
