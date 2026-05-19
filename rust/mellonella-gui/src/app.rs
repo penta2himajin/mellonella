@@ -438,63 +438,12 @@ impl MellonellaApp {
     /// streaming pipeline reads the config at `LiveSession::new`,
     /// not per-frame, so mid-stream changes wouldn't take effect
     /// until Stop / Start anyway.
-    #[allow(clippy::too_many_lines)]
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.state.is_running();
         egui::CollapsingHeader::new("Settings")
             .default_open(false)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!running, |ui| {
-                    ui.label(
-                        egui::RichText::new("Tunable parameters (applied on next Start)")
-                            .small()
-                            .color(egui::Color32::GRAY),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.state.gate_cfg.theta_pass, 0.0..=1.0)
-                            .text("theta_pass (gate threshold)")
-                            .fixed_decimals(2),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.state.gate_cfg.hangover_ms, 0.0..=1000.0)
-                            .text("hangover_ms")
-                            .fixed_decimals(0),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.state.gate_cfg.attack_ms, 0.0..=100.0)
-                            .text("attack_ms")
-                            .fixed_decimals(0),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.state.gate_cfg.release_ms, 0.0..=500.0)
-                            .text("release_ms")
-                            .fixed_decimals(0),
-                    );
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.state.pipeline_cfg.sv_update_samples,
-                            1_000..=32_000,
-                        )
-                        .text("sv_update_samples (ECAPA refresh cadence @ 16 kHz)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.state.pipeline_cfg.silence_force_off_ms,
-                            0.0..=3000.0,
-                        )
-                        .text("silence_force_off_ms (0 disables)")
-                        .fixed_decimals(0),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.state.pipeline_cfg.score_ema_alpha, 0.0..=1.0)
-                            .text("score_ema_alpha (1.0 disables smoothing)")
-                            .fixed_decimals(2),
-                    );
-                    if ui.button("Reset to defaults").clicked() {
-                        self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
-                        self.state.pipeline_cfg = crate::state::default_live_pipeline_cfg();
-                    }
-                    ui.separator();
                     ui.label(egui::RichText::new("Enrollment IO").strong());
                     ui.weak(
                         "Mellonella auto-saves the profile to ~/.config/mellonella/enrollment.json. \
