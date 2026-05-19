@@ -201,6 +201,42 @@ pub struct StreamingConfig {
     /// interlocutor pause doesn't flap the chain back through a
     /// reset cycle.
     pub overlap_hold_off_ms: f32,
+    /// Post-chain makeup gain (dB) applied while
+    /// [`crate::streaming::ChainMode::Solo`] is active. The DFN3-only
+    /// solo path attenuates real speech by ~4-6 dB RMS as a side
+    /// effect of denoising; recovering the level on the output side
+    /// is the standard "NS → AGC" pattern every consumer voice stack
+    /// (Krisp / Teams / Zoom) uses. Static gain — biased low so a
+    /// residual-noise burst during quiet sections doesn't get
+    /// audibly amplified the way an AGC would.
+    ///
+    /// Default `5.0 dB`. Set `0.0` to disable. Applied **before** the
+    /// envelope multiply, so gate-off frames stay silent regardless.
+    pub makeup_gain_db_solo: f32,
+    /// Post-chain makeup gain (dB) applied while
+    /// [`crate::streaming::ChainMode::Overlap`] is active. Conv-TasNet
+    /// style separators output a scale-arbitrary signal that's
+    /// typically ~10 dB below the input mixture's RMS; a future
+    /// phase will replace this static knob with input-RMS matching
+    /// (Asteroid's canonical fix). Until then, the static value
+    /// covers the typical case.
+    ///
+    /// Default `0.0 dB` — Overlap path stays unaltered in this
+    /// phase. Phase-2 work will wire RMS-matching here.
+    pub makeup_gain_db_overlap: f32,
+    /// Post-makeup soft-saturation curve enable. When `true`, output
+    /// samples are passed through `tanh` before the envelope
+    /// multiply, so a peak that exceeds full-scale (because the
+    /// makeup gain pushed it there) saturates smoothly instead of
+    /// being clipped at the DAC. tanh is monotonic and adds
+    /// 3rd-harmonic distortion only when the magnitude is already
+    /// past ~0.5, so quiet audio is effectively unchanged.
+    ///
+    /// Default `true`. The soft-clip is cheap (~5 ns / sample on
+    /// modern CPUs) and the audible artefact of a hard clip on a
+    /// real plosive is much worse than the soft-saturation it
+    /// replaces.
+    pub chain_soft_clip: bool,
 }
 
 impl Default for StreamingConfig {
@@ -215,6 +251,9 @@ impl Default for StreamingConfig {
             overlap_threshold: 0.10,
             overlap_hold_on_ms: 500.0,
             overlap_hold_off_ms: 2_000.0,
+            makeup_gain_db_solo: 5.0,
+            makeup_gain_db_overlap: 0.0,
+            chain_soft_clip: true,
         }
     }
 }
@@ -1810,15 +1849,46 @@ impl StreamingState {
                 after_tse
             };
             log_first_nan("after DFN3", &after_dfn3);
+            // Mode-aware static makeup gain. DFN3-only attenuates real
+            // speech by ~4-6 dB RMS and TSE-only by ~10 dB; gate-off
+            // frames stay silent regardless because the gain multiply
+            // below sets them to zero. This mirrors the universal
+            // "NS → AGC" pattern in Krisp / Teams / Zoom — static
+            // (not AGC) so a residual-noise burst during a quiet
+            // section doesn't get pumped up. Phase 2 will replace
+            // the Overlap static gain with input-RMS matching
+            // (Asteroid's canonical Conv-TasNet fix).
+            let makeup_db = match self.chain_mode {
+                ChainMode::Solo => config.makeup_gain_db_solo,
+                ChainMode::Overlap => config.makeup_gain_db_overlap,
+            };
+            let makeup_lin = if makeup_db == 0.0 {
+                1.0
+            } else {
+                10.0_f32.powf(makeup_db / 20.0)
+            };
+            let soft_clip_enabled = config.chain_soft_clip;
             for &x in &after_dfn3 {
                 let g = self
                     .chain_pending_gain
                     .pop_front()
                     .expect("chain_pending_gain length matches chain input cumulative length");
-                // Belt-and-braces: replace any non-finite value with
-                // 0 so a poisoned model state can't push NaN / Inf
-                // to the DAC even if the dither above didn't help.
-                let sample = x * g;
+                let amplified = x * makeup_lin;
+                // tanh soft-saturates peaks that the makeup gain
+                // pushed past full-scale, while leaving smaller
+                // values byte-identical. Cheaper than a true-peak
+                // limiter (Phase 3) and catches the same plosive
+                // clip case.
+                let limited = if soft_clip_enabled {
+                    amplified.tanh()
+                } else {
+                    amplified
+                };
+                let sample = limited * g;
+                // Belt-and-braces: replace any non-finite value
+                // with 0 so a poisoned model state can't push NaN /
+                // Inf to the DAC even if the dither earlier didn't
+                // help.
                 out.audio
                     .push(if sample.is_finite() { sample } else { 0.0 });
             }

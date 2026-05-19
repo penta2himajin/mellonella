@@ -180,6 +180,7 @@ fn adaptive_chain_swaps_solo_overlap_solo_on_three_segment_input() {
         overlap_threshold: 0.10,
         overlap_hold_on_ms: 500.0,
         overlap_hold_off_ms: 2_000.0,
+        ..StreamingConfig::default()
     };
     let mut pipeline = StreamingPipeline::new(pool, cfg, comp).expect("build");
 
