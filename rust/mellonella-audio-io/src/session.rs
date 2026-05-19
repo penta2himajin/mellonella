@@ -23,6 +23,13 @@ use rubato::{
 use crate::devices::DeviceKind;
 use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 
+/// Output-side latency cap, in queued chunks. The output callback
+/// discards the oldest chunks past this depth so output underruns
+/// don't permanently grow the producer-to-speaker gap. Roughly 2×
+/// a typical device-callback period at 48 kHz (~20 ms / chunk → ~80
+/// ms ceiling), trading audible drop-outs for bounded latency.
+const MAX_RING_CHUNKS: usize = 4;
+
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
 /// Most users want `SessionConfig::default()`; named device fields
@@ -556,6 +563,7 @@ fn build_output_stream(
     let mut first_call = true;
     let mut first_underrun_logged = false;
     let mut first_ring_chunk_logged = false;
+    let mut first_catchup_logged = false;
     let err_fn = |e: cpal::StreamError| eprintln!("[audio-io] output stream error: {e}");
     device
         .build_output_stream(
@@ -567,6 +575,34 @@ fn build_output_stream(
                         "[audio-io] output: first cpal callback fired ({frames_needed} frames × {channels_usize} ch)"
                     );
                     first_call = false;
+                }
+                // Bound buffered latency: every output underrun adds a
+                // permanent N-sample gap between producer wall-clock
+                // and what the speaker plays, because the worker keeps
+                // producing while output emits 0s. Over time those
+                // gaps stack and "talking longer increases latency".
+                // Cap the queue at ~`MAX_RING_CHUNKS` ≈ 2× a normal
+                // device-callback period; if it gets deeper, skip
+                // ahead by discarding the oldest chunks (= drop
+                // audio, keep latency bounded). The first time we
+                // skip, log it once so the user knows it happened.
+                let mut catchup_dropped = 0_usize;
+                while output_rx.len() > MAX_RING_CHUNKS {
+                    if output_rx.try_recv().is_ok() {
+                        catchup_dropped += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if catchup_dropped > 0 && !first_catchup_logged {
+                    eprintln!(
+                        "[audio-io] output: first ring catch-up — dropped {catchup_dropped} \
+                         queued chunks because the ring exceeded {MAX_RING_CHUNKS} chunks (the \
+                         worker had pulled ahead of the output device, usually after an \
+                         underrun spell). Further drops are silent; check the periodic stats \
+                         line for the running underrun count."
+                    );
+                    first_catchup_logged = true;
                 }
                 // Top up the carry buffer until it has enough mono
                 // samples to fill `data`, draining the output ring.
