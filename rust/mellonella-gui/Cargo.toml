@@ -19,6 +19,7 @@ egui = { workspace = true }
 tray-icon = { workspace = true }
 rfd = { workspace = true }
 hound = { workspace = true }
+dirs = "5"
 
 [lints]
 workspace = true

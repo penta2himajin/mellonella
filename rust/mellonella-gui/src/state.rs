@@ -135,7 +135,7 @@ impl Default for AppState {
     fn default() -> Self {
         let available_inputs = list_input_devices().unwrap_or_default();
         let available_outputs = list_output_devices().unwrap_or_default();
-        Self {
+        let mut state = Self {
             pool: None,
             origin: EnrollmentOrigin::None,
             pool_anchors: 0,
@@ -155,8 +155,26 @@ impl Default for AppState {
             recorder: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
+        };
+        // Auto-load the persistent enrollment if one exists. The user
+        // shouldn't have to re-enrol on every launch; the first-run
+        // wizard in `crate::app` keeps prompting only until this fires.
+        if let Some(path) = default_enrollment_path() {
+            if path.exists() {
+                state.load_enrollment_json(&path);
+            }
         }
+        state
     }
+}
+
+/// Default on-disk location for the auto-saved enrollment:
+/// `<dirs::config_dir>/mellonella/enrollment.json`. Returns `None` on
+/// platforms where `dirs::config_dir()` is unavailable (rare).
+#[must_use]
+pub fn default_enrollment_path() -> Option<PathBuf> {
+    let dir = dirs::config_dir()?.join("mellonella");
+    Some(dir.join("enrollment.json"))
 }
 
 /// Live-tuned `PipelineConfig` for GUI sessions: takes the library
@@ -388,8 +406,32 @@ impl AppState {
             }
         };
         match enroll_from_recording(&audio_16k, &mut components, EmbeddingPoolConfig::default()) {
-            Ok(pool) => self.store_pool(pool, origin),
+            Ok(pool) => {
+                self.store_pool(pool, origin);
+                self.persist_enrollment_to_default_path();
+            }
             Err(e) => self.last_error = Some(format!("enrol: {e}")),
+        }
+    }
+
+    /// Save the current enrollment pool to `default_enrollment_path()`
+    /// so the next launch auto-loads it. No-op when no pool is loaded
+    /// or no platform config dir is configured.
+    fn persist_enrollment_to_default_path(&mut self) {
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        let Some(path) = default_enrollment_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.last_error = Some(format!("create config dir: {e}"));
+                return;
+            }
+        }
+        if let Err(e) = pool.save(&path) {
+            self.last_error = Some(format!("auto-save enrollment: {e}"));
         }
     }
 
@@ -700,6 +742,20 @@ mod tests {
         assert!(
             !s.user_paused,
             "fresh state should auto-start once enrollment + models are ready"
+        );
+    }
+
+    #[test]
+    fn default_enrollment_path_lives_under_config_dir() {
+        let Some(p) = default_enrollment_path() else {
+            eprintln!("[skip] no config dir on this platform");
+            return;
+        };
+        assert!(
+            p.ends_with("mellonella/enrollment.json")
+                || p.ends_with("mellonella\\enrollment.json"),
+            "unexpected suffix: {}",
+            p.display()
         );
     }
 }
