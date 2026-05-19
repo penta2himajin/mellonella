@@ -164,6 +164,43 @@ pub struct StreamingConfig {
     /// `audio_sample_rate` must equal the DFN3 model rate (48 kHz).
     /// Default `None` — no NS, byte-identical to pre-Phase-5 behaviour.
     pub dfn3_onnx_path: Option<PathBuf>,
+    /// Optional pyannote-3.0 segmentation ONNX path. When set, the
+    /// streaming engine runs a per-second overlap detector alongside
+    /// the audio chain and **toggles TSE vs. DFN3 mutually exclusively**:
+    ///
+    /// * solo speaker detected (mean overlap probability below
+    ///   [`Self::overlap_threshold`] for [`Self::overlap_hold_off_ms`] ms):
+    ///   chain runs **DFN3 only**, TSE is bypassed. Empirically the
+    ///   solo-speaker DFN3-only path attenuates output by ≈ 8 dB,
+    ///   versus ≈ 28 dB for the TSE+DFN3 cascade.
+    /// * overlap detected (mean overlap probability above
+    ///   `overlap_threshold` for [`Self::overlap_hold_on_ms`] ms):
+    ///   chain runs **TSE only**, DFN3 is bypassed. Target-speaker
+    ///   extraction acts as its own (mask-based) noise / interference
+    ///   suppressor in this regime.
+    ///
+    /// Both `tse` (under `pipeline.tse`) and `dfn3_onnx_path` must
+    /// also be configured for the toggle to have anything to switch
+    /// between; with the overlap ONNX absent (or `tse` / `dfn3_onnx_path`
+    /// unset) the engine keeps its legacy cascade behaviour.
+    pub overlap_onnx_path: Option<PathBuf>,
+    /// Mean per-frame overlap probability above which the engine
+    /// considers two or more speakers active. Default `0.10` — sits
+    /// comfortably between empirical solo (≲ 0.03) and overlap
+    /// (≳ 0.30) cohorts on the pyannote-3.0 community ONNX.
+    pub overlap_threshold: f32,
+    /// Hysteresis ON: how long the mean overlap probability has to
+    /// stay above [`Self::overlap_threshold`] before the chain
+    /// transitions Solo → Overlap. Default `500 ms` — long enough to
+    /// ignore single-decision blips, short enough to react to a real
+    /// second voice within ~ a syllable.
+    pub overlap_hold_on_ms: f32,
+    /// Hysteresis OFF: how long the mean overlap probability has to
+    /// stay below [`Self::overlap_threshold`] before transitioning
+    /// Overlap → Solo. Default `2000 ms` — biased long so a brief
+    /// interlocutor pause doesn't flap the chain back through a
+    /// reset cycle.
+    pub overlap_hold_off_ms: f32,
 }
 
 impl Default for StreamingConfig {
@@ -174,6 +211,10 @@ impl Default for StreamingConfig {
             audio_sample_rate: 48_000,
             diagnostics: false,
             dfn3_onnx_path: None,
+            overlap_onnx_path: None,
+            overlap_threshold: 0.10,
+            overlap_hold_on_ms: 500.0,
+            overlap_hold_off_ms: 2_000.0,
         }
     }
 }
@@ -306,14 +347,13 @@ pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral:
     last_score + weight * (fm_fast - neutral)
 }
 
-/// Threshold below which a chain-input chunk is treated as
-/// "essentially silent" and gets sub-LSB dither injected to keep the
-/// TSE model away from zero-variance NaN territory. 1e-9 is well
-/// below any real f32 ADC noise floor.
-const CHAIN_SILENCE_EPS: f32 = 1e-9;
-
-/// Sub-LSB dither amplitude. ±1e-7 ≈ -140 dBFS, below 24-bit
-/// quantisation noise and inaudible, but non-zero variance.
+/// Sub-LSB dither amplitude added unconditionally to the chain
+/// input. ±1e-7 ≈ -140 dBFS, below the 24-bit noise floor (~-138
+/// dBFS) and inaudible. Applied to every sample so no STFT window
+/// inside the chain can be exactly zero-variance — a single
+/// all-zero window is enough to latch TSE's GRU hidden state into
+/// a NaN it never recovers from. Real audio is altered by an
+/// inaudible amount.
 const CHAIN_DITHER: f32 = 1e-7;
 
 /// One-shot NaN diagnostic — logs the first time `samples` contains a
@@ -705,6 +745,38 @@ pub(crate) struct StreamingState {
     /// Empty (and unused) when both `tse_stage` and `dfn3_stream` are
     /// `None`.
     chain_pending_gain: VecDeque<f32>,
+    /// Optional pyannote-3.0 segmentation detector. Present when
+    /// [`StreamingConfig::overlap_onnx_path`] resolves and both TSE
+    /// and DFN3 are also configured (the toggle has no effect
+    /// otherwise). Drives the [`Self::chain_mode`] state machine.
+    pub(crate) overlap_detector: Option<crate::overlap::OverlapDetector>,
+    /// Active audio-chain mode for adaptive routing. Defaults to
+    /// `Solo` (DFN3 only) — the empirically-best mode for the common
+    /// single-speaker live-monitor case. Flips to `Overlap` (TSE
+    /// only) once the detector reports sustained overlap.
+    chain_mode: ChainMode,
+    /// Hysteresis accumulator: ms spent above
+    /// `overlap_threshold` since the last `Solo → Overlap` flip.
+    overlap_above_ms: f32,
+    /// Hysteresis accumulator: ms spent below `overlap_threshold`
+    /// since the last `Overlap → Solo` flip.
+    overlap_below_ms: f32,
+}
+
+/// Adaptive chain routing mode, driven by the overlap detector when
+/// configured. See [`StreamingConfig::overlap_onnx_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainMode {
+    /// Single-speaker situation: route audio through DFN3 only.
+    /// Selected at session start and whenever the detector reports
+    /// sustained non-overlap.
+    Solo,
+    /// Multiple speakers present: route audio through TSE only
+    /// (target-speaker extraction). DFN3 stays bypassed because
+    /// cascading TSE → DFN3 attenuates output by ~28 dB; TSE's
+    /// mask-based suppression covers the noise case sufficiently
+    /// during overlap.
+    Overlap,
 }
 
 /// Persistent worker thread for `async_refresh = true` streaming.
@@ -1258,6 +1330,10 @@ impl StreamingState {
             tse_stage: None,
             dfn3_stream: None,
             chain_pending_gain: VecDeque::new(),
+            overlap_detector: None,
+            chain_mode: ChainMode::Solo,
+            overlap_above_ms: 0.0,
+            overlap_below_ms: 0.0,
         })
     }
 
@@ -1665,58 +1741,71 @@ impl StreamingState {
         // span. `EnvelopeState::advance` returns one gain per
         // sample.
         let gain = self.envelope_state.advance(is_on, audio_chunk.len());
+        // Run the overlap detector (when configured) and update the
+        // chain-routing state machine. Hysteresis lives here so a
+        // transient blip in the detector's output doesn't flap the
+        // chain.
+        let adaptive = self.overlap_detector.is_some()
+            && self.tse_stage.is_some()
+            && self.dfn3_stream.is_some();
+        if adaptive {
+            self.update_chain_mode(decision_frame, dt_ms, config)?;
+        }
+
         if self.tse_stage.is_some() || self.dfn3_stream.is_some() {
             // Stage C, Phase 5: route this frame's audio through the
-            // optional TSE→DFN3 chain, then apply the envelope to
-            // whatever the chain emits. Each stage buffers samples
-            // internally (TSE up to `chunk_samples - 1`; DFN3 holds a
-            // 2-frame conv lookahead), so we queue per-sample gains
-            // and pop them as the chain's **last active stage**
-            // produces output. `audio_samples_emitted` keeps tracking
-            // the **input** audio timeline (matching gate decisions);
-            // `out.audio` lags by the chain's accumulated buffering
-            // until [`Self::flush`] drains the tail.
+            // optional audio chain (TSE / DFN3, or both when
+            // adaptive=false). Each stage buffers samples internally
+            // (TSE up to `chunk_samples - 1`; DFN3 holds a 2-frame
+            // conv lookahead), so we queue per-sample gains and pop
+            // them as the chain's **last active stage** emits.
             self.chain_pending_gain.extend(gain.iter().copied());
             log_first_nan("chain input audio_chunk", audio_chunk);
             log_first_nan("chain input gain", &gain);
             if let Some(stage) = self.tse_stage.as_ref() {
                 log_first_nan("chain input cond_embedding", stage.cond_embedding());
             }
-            // WASAPI / cpal commonly delivers one or more zero-filled
-            // primer chunks at stream startup before the real mic
-            // audio lands. TSE's normalisation layers divide by /
-            // take `log` of per-frame energy, so a zero-variance
-            // chunk produces NaN that poisons the GRU hidden state
-            // for the rest of the run. Inject sub-LSB dither
-            // (±1e-7 ≈ -140 dBFS, well below the 24-bit noise floor
-            // and inaudible) whenever the chunk is essentially
-            // silent, so the model never sees an exactly-zero
-            // variance. Real audio is left untouched.
-            let dithered_chunk: Vec<f32>;
-            let chain_audio: &[f32] = if audio_chunk.iter().all(|s| s.abs() < CHAIN_SILENCE_EPS) {
-                dithered_chunk = audio_chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| {
-                        if i % 2 == 0 {
-                            CHAIN_DITHER
-                        } else {
-                            -CHAIN_DITHER
-                        }
-                    })
-                    .collect();
-                &dithered_chunk
-            } else {
-                audio_chunk
-            };
+            // Sub-LSB dither (±1e-7 ≈ -140 dBFS, below the 24-bit
+            // noise floor) applied **unconditionally** so no STFT
+            // window inside the chain can be exact-zero variance.
+            // The conditional "all samples below 1e-9" gate this
+            // replaced missed the leading-silence-then-speech case
+            // (the first STFT window saw pure zeros, latched NaN
+            // into the GRU state, contaminated the whole run).
+            let chain_audio_owned: Vec<f32> = audio_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    s + if i % 2 == 0 {
+                        CHAIN_DITHER
+                    } else {
+                        -CHAIN_DITHER
+                    }
+                })
+                .collect();
+            let chain_audio: &[f32] = &chain_audio_owned;
+
+            // Adaptive XOR routing. When the overlap detector is wired
+            // up, exactly one of TSE / DFN3 runs per chunk based on the
+            // current `chain_mode`. Otherwise (`adaptive == false`) the
+            // legacy cascade (TSE → DFN3, with either / both possibly
+            // absent) runs.
             let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
-                stage.process(chain_audio).map_err(PipelineError::from)?
+                if adaptive && self.chain_mode == ChainMode::Solo {
+                    chain_audio.to_vec()
+                } else {
+                    stage.process(chain_audio).map_err(PipelineError::from)?
+                }
             } else {
                 chain_audio.to_vec()
             };
             log_first_nan("after TSE", &after_tse);
             let after_dfn3: Vec<f32> = if let Some(stream) = self.dfn3_stream.as_mut() {
-                stream.push_samples(&after_tse)?
+                if adaptive && self.chain_mode == ChainMode::Overlap {
+                    after_tse
+                } else {
+                    stream.push_samples(&after_tse)?
+                }
             } else {
                 after_tse
             };
@@ -1741,6 +1830,76 @@ impl StreamingState {
         }
         self.audio_samples_emitted += audio_chunk.len();
         self.frame_idx += 1;
+        Ok(())
+    }
+
+    /// Feed one VAD-frame-worth of decision-rate audio to the overlap
+    /// detector (when present), then advance the hysteresis state
+    /// machine that decides which chain — TSE or DFN3 — handles the
+    /// next audio_chunk.
+    ///
+    /// On a `Solo ↔ Overlap` transition the stage being newly
+    /// activated has its state reset and `chain_pending_gain` is
+    /// cleared. Resetting the freshly-active stage avoids carrying
+    /// stale GRU / accumulator state from when it last ran; clearing
+    /// the gain queue drops the in-flight samples that the old stage
+    /// had buffered (a sub-chunk gap, typically < 30 ms).
+    fn update_chain_mode(
+        &mut self,
+        decision_frame: &[f32],
+        _dt_ms: f32,
+        config: &StreamingConfig,
+    ) -> Result<(), PipelineError> {
+        let Some(detector) = self.overlap_detector.as_mut() else {
+            return Ok(());
+        };
+        if let Some(decision) = detector
+            .push(decision_frame)
+            .map_err(PipelineError::Embedding)?
+        {
+            // Each detector firing represents `cadence_ms` of audio
+            // since the previous one — use that as the hysteresis
+            // increment rather than the per-VAD-frame dt_ms, which
+            // would undercount by ~8x at the default 250 ms cadence
+            // and leave the engine stuck in whichever mode it
+            // entered first.
+            let cadence_ms = detector.cadence_ms();
+            if decision.mean_overlap_prob >= config.overlap_threshold {
+                self.overlap_above_ms += cadence_ms;
+                self.overlap_below_ms = 0.0;
+            } else {
+                self.overlap_below_ms += cadence_ms;
+                self.overlap_above_ms = 0.0;
+            }
+            let new_mode = match self.chain_mode {
+                ChainMode::Solo if self.overlap_above_ms >= config.overlap_hold_on_ms => {
+                    ChainMode::Overlap
+                }
+                ChainMode::Overlap if self.overlap_below_ms >= config.overlap_hold_off_ms => {
+                    ChainMode::Solo
+                }
+                other => other,
+            };
+            if new_mode != self.chain_mode {
+                eprintln!(
+                    "[streaming] chain mode {:?} → {:?} (overlap_prob mean {:.3})",
+                    self.chain_mode, new_mode, decision.mean_overlap_prob
+                );
+                self.chain_mode = new_mode;
+                // Reset the chain whose state was idle so the newly-
+                // active path starts fresh; drop pending gains held
+                // behind the now-bypassed stage.
+                self.chain_pending_gain.clear();
+                if let Some(t) = self.tse_stage.as_mut() {
+                    t.reset();
+                }
+                if let Some(d) = self.dfn3_stream.as_mut() {
+                    d.reset();
+                }
+                self.overlap_above_ms = 0.0;
+                self.overlap_below_ms = 0.0;
+            }
+        }
         Ok(())
     }
 
@@ -2164,6 +2323,22 @@ impl StreamingPipeline {
             None
         };
 
+        // Adaptive-chain overlap detector. Only attached when **all
+        // three** of TSE, DFN3, and the overlap ONNX are configured —
+        // there's nothing to switch between otherwise.
+        let overlap_detector = if config.overlap_onnx_path.is_some()
+            && live_stage.is_some()
+            && dfn3_stream.is_some()
+        {
+            let path = config.overlap_onnx_path.as_deref().expect("Some");
+            Some(
+                crate::overlap::OverlapDetector::from_onnx_path(path)
+                    .map_err(PipelineError::Embedding)?,
+            )
+        } else {
+            None
+        };
+
         if config.pipeline.async_refresh {
             let PipelineComponents {
                 vad,
@@ -2177,6 +2352,7 @@ impl StreamingPipeline {
             let mut state = StreamingState::new_async(&config, fbank, ecapa)?;
             state.tse_stage = live_stage;
             state.dfn3_stream = dfn3_stream;
+            state.overlap_detector = overlap_detector;
             Ok(Self {
                 state,
                 config,
@@ -2187,6 +2363,7 @@ impl StreamingPipeline {
             let mut state = StreamingState::new(&config)?;
             state.tse_stage = live_stage;
             state.dfn3_stream = dfn3_stream;
+            state.overlap_detector = overlap_detector;
             Ok(Self {
                 state,
                 config,
@@ -2251,6 +2428,17 @@ impl StreamingPipeline {
     #[must_use]
     pub fn pool(&self) -> &EmbeddingPool {
         &self.pool
+    }
+
+    /// Current adaptive chain mode. `ChainMode::Solo` when DFN3 alone
+    /// is processing the audio; `ChainMode::Overlap` when TSE alone
+    /// is. Only meaningful when [`StreamingConfig::overlap_onnx_path`]
+    /// is `Some` (and TSE + DFN3 are also configured); otherwise the
+    /// value is the construction default (`Solo`) and not consulted
+    /// by the chain.
+    #[must_use]
+    pub fn chain_mode(&self) -> ChainMode {
+        self.state.chain_mode
     }
 
     /// Mutable access to the owned pool. Safe between

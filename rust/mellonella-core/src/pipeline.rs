@@ -822,6 +822,7 @@ pub fn process_offline(
         // Offline path doesn't drive DFN3 through the streaming engine —
         // CLI / GUI run DFN3 as a one-shot pre-process step today.
         dfn3_onnx_path: None,
+        ..StreamingConfig::default()
     };
     let mut state = StreamingState::new(&cfg)?;
     let mut head = state.push_block(audio, pool, components, &cfg)?;
@@ -964,6 +965,7 @@ fn process_offline_async(
         diagnostics: true,
         // Offline async path doesn't drive DFN3.
         dfn3_onnx_path: None,
+        ..StreamingConfig::default()
     };
     let mut state = StreamingState::new(&cfg)?;
 

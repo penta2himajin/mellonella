@@ -256,6 +256,7 @@ fn streaming_default_is_byte_identical_with_tse_off() {
         audio_sample_rate: 16_000,
         diagnostics: true,
         dfn3_onnx_path: None,
+        ..Default::default()
     };
 
     // Run 1: fresh components + pool.
@@ -315,6 +316,7 @@ fn streaming_with_tse_extracts_non_trivial_audio() {
         audio_sample_rate: 16_000,
         diagnostics: true,
         dfn3_onnx_path: None,
+        ..Default::default()
     };
     let result = run_streaming_once(cfg, &audio, components, pool);
 
@@ -396,6 +398,7 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
             audio_sample_rate: 48_000,
             diagnostics: true,
             dfn3_onnx_path: None,
+            ..Default::default()
         };
         let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
         match StreamingPipeline::new(pool, cfg, components) {
@@ -436,6 +439,7 @@ fn streaming_with_tse_rejects_audio_sr_mismatch() {
             audio_sample_rate: 16_000,
             diagnostics: true,
             dfn3_onnx_path: None,
+            ..Default::default()
         };
         let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
         match StreamingPipeline::new(pool, cfg, components) {
@@ -508,6 +512,7 @@ fn streaming_with_tse_matches_offline_within_tolerance() {
         audio_sample_rate: 16_000,
         diagnostics: true,
         dfn3_onnx_path: None,
+        ..Default::default()
     };
     let mut pipeline = StreamingPipeline::new(pool_b, cfg, components_b).expect("streaming new");
     let mut parts: Vec<StreamingOutput> = Vec::new();
