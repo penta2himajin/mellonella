@@ -22,13 +22,15 @@
 
 #![allow(clippy::needless_borrow)]
 
-use crate::tse::{TseError, TseSession, TSE_COND_DIM};
+use crate::tse::{TseConfig, TseError, TseSession, TSE_COND_DIM};
 
 /// Configuration for the offline TSE stage.
 ///
-/// Currently only carries the path to the streaming ONNX. Kept minimal;
-/// future knobs (cond-refresh policy, custom [`crate::tse::TseConfig`])
-/// can be added here without changing the offline-pipeline call sites.
+/// Carries the path to the streaming ONNX, the chunk length the ONNX
+/// was exported with, and the [`TseConfig`] used to size the model's
+/// state tensors. Two convenience constructors mirror the two shipped
+/// model variants ([`Self::new`] for the 16 kHz PoC, [`Self::new_prod_48k`]
+/// for the 48 kHz production model).
 #[derive(Debug, Clone)]
 pub struct TseStageConfig {
     /// Path to the streaming TSE ONNX exported by
@@ -38,19 +40,37 @@ pub struct TseStageConfig {
     pub onnx_path: std::path::PathBuf,
     /// Per-chunk sample count to feed the ONNX. **Must** match the
     /// chunk length baked into the export (the ONNX has a fixed time
-    /// axis). Defaults to 160 samples = 10 ms @ 16 kHz — the value the
-    /// PoC export script uses in `--chunk`. Callers that exported the
-    /// ONNX at a different chunk length must override this.
+    /// axis). 160 samples = 10 ms @ 16 kHz (poc_16k); 480 samples =
+    /// 10 ms @ 48 kHz (prod_48k).
     pub chunk_samples: usize,
+    /// Model variant. Determines the state-tensor shapes (the ONNX
+    /// itself carries the actual weights) and is read by the pipeline
+    /// to decide what audio sample rate the stage expects.
+    pub model: TseConfig,
 }
 
 impl TseStageConfig {
-    /// New PoC-default config (`chunk_samples = 160`).
+    /// New PoC config — 16 kHz model, `chunk_samples = 160`.
     #[must_use]
     pub fn new(onnx_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             onnx_path: onnx_path.into(),
             chunk_samples: 160,
+            model: TseConfig::poc_16k(),
+        }
+    }
+
+    /// New production config — 48 kHz model, `chunk_samples = 480`.
+    /// Matches the canonical export
+    /// (`scripts/export_tse_onnx.py export-and-verify --config prod_48k
+    /// --chunk 480`) and the model shipped at
+    /// <https://huggingface.co/penta2himajin/tse-conv-tasnet-48k>.
+    #[must_use]
+    pub fn new_prod_48k(onnx_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            onnx_path: onnx_path.into(),
+            chunk_samples: 480,
+            model: TseConfig::prod_48k(),
         }
     }
 }
@@ -129,7 +149,7 @@ impl TseStage {
         config: &TseStageConfig,
         cond_embedding: &[f32],
     ) -> Result<Self, TseStageError> {
-        let session = TseSession::from_onnx_path(&config.onnx_path)?;
+        let session = TseSession::from_onnx_path_with_config(&config.onnx_path, config.model)?;
         let enc_stride = session.config().enc_stride;
         if config.chunk_samples == 0 || config.chunk_samples % enc_stride != 0 {
             return Err(TseStageError::InvalidChunkSamples {

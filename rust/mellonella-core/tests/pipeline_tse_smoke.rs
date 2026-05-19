@@ -43,7 +43,7 @@ use mellonella_core::gating::GateConfig;
 use mellonella_core::pipeline::{
     process_offline, PipelineComponents, PipelineConfig, PipelineError,
 };
-use mellonella_core::tse::TSE_COND_DIM;
+use mellonella_core::tse::{TseConfig, TSE_COND_DIM};
 use mellonella_core::tse_stage::TseStageConfig;
 use mellonella_core::vad::SileroVad;
 
@@ -268,6 +268,7 @@ fn process_offline_with_tse_extracts_non_trivial_audio() {
         tse: Some(TseStageConfig {
             onnx_path: tse_onnx,
             chunk_samples: TSE_CHUNK,
+            model: TseConfig::poc_16k(),
         }),
         ..PipelineConfig::default()
     };
@@ -305,13 +306,13 @@ fn process_offline_with_tse_extracts_non_trivial_audio() {
     assert!(result_2.audio.iter().all(|v| v.is_finite()));
 }
 
-/// Rate-mismatch rejection: with `cfg.tse == Some(...)` and a
-/// non-16-kHz audio rate, `process_offline` must error out with
-/// `PipelineError::TseRateMismatch` whose `Display` mentions the
-/// 16 kHz constraint. The TSE ONNX itself isn't loaded on this path
-/// because the rate check fires before `ensure_tse_stage`.
+/// Rate-mismatch rejection: with a `poc_16k` `TseStageConfig` and a
+/// 48 kHz audio buffer, `process_offline` must error out with
+/// `PipelineError::TseRateMismatch` (the configured model's SR is
+/// 16 kHz, the audio is 48 kHz). The TSE ONNX itself isn't loaded on
+/// this path because the rate check fires before `ensure_tse_stage`.
 #[test]
-fn process_offline_with_tse_rejects_non_16k_audio_rate() {
+fn process_offline_with_tse_rejects_audio_sr_mismatch() {
     let Some((ecapa_path, vad_path)) = ecapa_vad_paths() else {
         return;
     };
@@ -323,32 +324,30 @@ fn process_offline_with_tse_rejects_non_16k_audio_rate() {
         tse: Some(TseStageConfig {
             onnx_path: std::path::PathBuf::from("/dev/null"),
             chunk_samples: TSE_CHUNK,
+            model: TseConfig::poc_16k(),
         }),
         ..PipelineConfig::default()
     };
     let gate_cfg = GateConfig::default();
 
-    // Use 48 kHz audio — the prod sample rate. The PoC TSE only
-    // supports 16 kHz, so this must be rejected with a clear error.
+    // 48 kHz audio against the 16 kHz poc model → must be rejected.
     let audio = synth_waveform(48_000, 0.5, 180.0);
 
     let (mut components, mut pool) = build_smoke_components(&ecapa_path, &vad_path);
     let err = process_offline(&audio, 48_000, &mut pool, &cfg, &gate_cfg, &mut components)
-        .expect_err("TSE at 48 kHz must be rejected");
+        .expect_err("TSE rate mismatch must be rejected");
 
     match err {
         PipelineError::TseRateMismatch {
             audio_sr,
-            decision_sr,
+            expected_sr,
         } => {
             assert_eq!(audio_sr, 48_000);
-            assert_eq!(decision_sr, 16_000);
-            // Message mentions the 16 kHz constraint so callers can
-            // diagnose without grepping the source.
+            assert_eq!(expected_sr, 16_000);
             let msg = format!("{err}");
             assert!(
-                msg.contains("16 kHz"),
-                "expected 16 kHz in error message, got {msg:?}"
+                msg.contains("16000") || msg.contains("16 kHz"),
+                "expected expected_sr in error message, got {msg:?}"
             );
         }
         other => panic!("expected TseRateMismatch, got {other:?}"),

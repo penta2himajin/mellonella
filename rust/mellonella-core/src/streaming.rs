@@ -1893,17 +1893,14 @@ impl StreamingPipeline {
         config: StreamingConfig,
         mut components: PipelineComponents,
     ) -> Result<Self, PipelineError> {
-        // Stage C, Phase 5 part 3: TSE wiring for streaming. The hard
-        // rate check + async rejection match the offline
-        // `process_offline` contract exactly. The cond embedding is
-        // snapshotted **once** here (mirroring offline's
-        // "frozen for the run" semantics); the embedding pool may
-        // evolve via auto-learn during streaming but the TSE stage
-        // keeps the construction-time anchor centroid as its conditioning.
+        // Stage C, Phase 5 part 3: TSE wiring for streaming. The rate
+        // check + async rejection match the offline `process_offline`
+        // contract exactly. The cond embedding is snapshotted **once**
+        // here (mirroring offline's "frozen for the run" semantics);
+        // the embedding pool may evolve via auto-learn during streaming
+        // but the TSE stage keeps the construction-time anchor centroid
+        // as its conditioning.
         //
-        // TODO(phase-4-48k-tse): drop the 16 kHz check below once the
-        // prod TSE export lands; the check becomes "model's expected
-        // SR == audio_sr == decision_sr".
         // TODO(phase-5-followup): refresh the cond embedding on each
         // auto-learn anchor update. Right now the snapshot is taken
         // exactly once at stream start.
@@ -1912,11 +1909,16 @@ impl StreamingPipeline {
             return Err(PipelineError::TseAsyncUnsupported);
         }
         if tse_enabled {
-            let decision_sr = config.pipeline.sample_rate;
-            if config.audio_sample_rate != 16_000 || decision_sr != 16_000 {
+            let stage_cfg = config
+                .pipeline
+                .tse
+                .as_ref()
+                .expect("tse_enabled implies Some");
+            let expected_sr = stage_cfg.model.sample_rate();
+            if config.audio_sample_rate != expected_sr {
                 return Err(PipelineError::TseRateMismatch {
                     audio_sr: config.audio_sample_rate,
-                    decision_sr,
+                    expected_sr,
                 });
             }
         }

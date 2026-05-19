@@ -16,9 +16,10 @@
 //!   (modulo the natural TSE-buffer delay drained by `flush()`), the
 //!   output is finite, and the output differs from the input.
 //! * **rate-mismatch rejection** — with `cfg.pipeline.tse == Some(...)`
-//!   and either `audio_sample_rate != 16_000` or `decision_sr !=
-//!   16_000`, `StreamingPipeline::new` returns
+//!   and `audio_sample_rate` ≠ the configured TSE model's expected
+//!   sample rate, `StreamingPipeline::new` returns
 //!   `PipelineError::TseRateMismatch` before any audio is pushed.
+//!   (The decision rate is independent and may legitimately differ.)
 //! * **streaming-vs-offline parity** — running the same audio through
 //!   `process_offline` (TSE-on) and through the streaming engine
 //!   (TSE-on, chunked) produces emitted-sample sequences that agree
@@ -52,7 +53,7 @@ use mellonella_core::pipeline::{
     process_offline, PipelineComponents, PipelineConfig, PipelineError,
 };
 use mellonella_core::streaming::{StreamingConfig, StreamingOutput, StreamingPipeline};
-use mellonella_core::tse::TSE_COND_DIM;
+use mellonella_core::tse::{TseConfig, TSE_COND_DIM};
 use mellonella_core::tse_stage::TseStageConfig;
 use mellonella_core::vad::SileroVad;
 
@@ -302,6 +303,7 @@ fn streaming_with_tse_extracts_non_trivial_audio() {
         tse: Some(TseStageConfig {
             onnx_path: tse_onnx,
             chunk_samples: TSE_CHUNK,
+            model: TseConfig::poc_16k(),
         }),
         ..PipelineConfig::default()
     };
@@ -352,12 +354,14 @@ fn streaming_with_tse_extracts_non_trivial_audio() {
     );
 }
 
-/// Rate-mismatch rejection: with `cfg.pipeline.tse == Some(...)` and
-/// either a non-16-kHz audio rate or a non-16-kHz decision rate,
-/// `StreamingPipeline::new` must error out with
-/// `PipelineError::TseRateMismatch` before any audio is pushed.
+/// Rate-mismatch rejection: with `cfg.pipeline.tse == Some(...)` and an
+/// audio rate that doesn't match the configured TSE model's expected
+/// sample rate, `StreamingPipeline::new` must error out with
+/// `PipelineError::TseRateMismatch` before any audio is pushed. The
+/// decision rate (`pipeline.sample_rate`) is independent and may
+/// legitimately differ from the audio rate.
 #[test]
-fn streaming_with_tse_rejects_non_16k_rates() {
+fn streaming_with_tse_rejects_audio_sr_mismatch() {
     let Some((ecapa_path, vad_path)) = ecapa_vad_paths() else {
         return;
     };
@@ -370,6 +374,7 @@ fn streaming_with_tse_rejects_non_16k_rates() {
             // swap the order.
             onnx_path: std::path::PathBuf::from("/dev/null"),
             chunk_samples: TSE_CHUNK,
+            model: TseConfig::poc_16k(),
         }),
         ..PipelineConfig::default()
     };
@@ -380,7 +385,8 @@ fn streaming_with_tse_rejects_non_16k_rates() {
     // tests below use `match` on `Result` directly rather than
     // `expect_err`.
 
-    // Case 1: audio rate mismatch (48 kHz audio in, 16 kHz decision).
+    // Case 1: audio rate mismatch (48 kHz audio against the 16 kHz
+    // poc_16k model).
     {
         let cfg = StreamingConfig {
             pipeline: pipeline_cfg.clone(),
@@ -392,18 +398,18 @@ fn streaming_with_tse_rejects_non_16k_rates() {
         match StreamingPipeline::new(pool, cfg, components) {
             Err(PipelineError::TseRateMismatch {
                 audio_sr,
-                decision_sr,
+                expected_sr,
             }) => {
                 assert_eq!(audio_sr, 48_000);
-                assert_eq!(decision_sr, 16_000);
+                assert_eq!(expected_sr, 16_000);
                 let err = PipelineError::TseRateMismatch {
                     audio_sr,
-                    decision_sr,
+                    expected_sr,
                 };
                 let msg = format!("{err}");
                 assert!(
-                    msg.contains("16 kHz"),
-                    "expected 16 kHz in error message, got {msg:?}"
+                    msg.contains("16000") || msg.contains("16 kHz"),
+                    "expected expected_sr in error message, got {msg:?}"
                 );
             }
             Err(other) => panic!("expected TseRateMismatch, got {other:?}"),
@@ -411,34 +417,7 @@ fn streaming_with_tse_rejects_non_16k_rates() {
         }
     }
 
-    // Case 2: decision rate mismatch (16 kHz audio in, 48 kHz
-    // decision rate). Hard-rejected even though the audio rate is
-    // 16 kHz, because the TSE model is trained at 16 kHz on the
-    // decision path.
-    {
-        let mut p_cfg = pipeline_cfg.clone();
-        p_cfg.sample_rate = 48_000;
-        let cfg = StreamingConfig {
-            pipeline: p_cfg,
-            gate: gate_cfg,
-            audio_sample_rate: 16_000,
-            diagnostics: true,
-        };
-        let (components, pool) = build_smoke_components(&ecapa_path, &vad_path);
-        match StreamingPipeline::new(pool, cfg, components) {
-            Err(PipelineError::TseRateMismatch {
-                audio_sr,
-                decision_sr,
-            }) => {
-                assert_eq!(audio_sr, 16_000);
-                assert_eq!(decision_sr, 48_000);
-            }
-            Err(other) => panic!("expected TseRateMismatch, got {other:?}"),
-            Ok(_) => panic!("expected TseRateMismatch, got Ok"),
-        }
-    }
-
-    // Case 3: async refresh + TSE must reject with
+    // Case 2: async refresh + TSE must reject with
     // `TseAsyncUnsupported` — same contract as offline.
     {
         let mut p_cfg = pipeline_cfg.clone();
@@ -486,6 +465,7 @@ fn streaming_with_tse_matches_offline_within_tolerance() {
         tse: Some(TseStageConfig {
             onnx_path: tse_onnx,
             chunk_samples: TSE_CHUNK,
+            model: TseConfig::poc_16k(),
         }),
         ..PipelineConfig::default()
     };

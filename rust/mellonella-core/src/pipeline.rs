@@ -253,13 +253,13 @@ pub struct PipelineConfig {
     /// computed on the raw decision-rate audio — only the audio the
     /// gate's envelope is applied to changes.
     ///
-    /// **PoC restriction (16 kHz only):** the PoC TSE model is trained
-    /// at 16 kHz. When this is `Some`, the offline pipeline rejects
-    /// any `(audio_sample_rate, sample_rate)` pair other than
-    /// `(16_000, 16_000)` with a clear [`PipelineError::TseRateMismatch`].
-    /// The 48 kHz prod TSE model is Phase 4 and will lift this
-    /// restriction — see `docs/architecture.md` and the TODO comment
-    /// at the rate-check call site in `process_offline`.
+    /// **Sample-rate contract:** the configured `TseStageConfig` carries
+    /// a `TseConfig` (`poc_16k` → 16 kHz, `prod_48k` → 48 kHz) and the
+    /// caller's `audio_sample_rate` must match it. The decision rate
+    /// (`PipelineConfig::sample_rate` — VAD/SV) is independent;
+    /// `apply_envelope_dual_rate` handles the dual-rate gate envelope.
+    /// Mismatched audio rate is rejected with
+    /// [`PipelineError::TseRateMismatch`].
     ///
     /// Default `None` — with the default the TSE stage is never
     /// constructed and the offline pipeline behaves byte-identically
@@ -449,8 +449,10 @@ pub enum PipelineError {
     /// pipeline_cfg.sample_rate == 16_000` (PoC model is 16 kHz only).
     /// The 48 kHz prod model will lift this restriction in Phase 4.
     TseRateMismatch {
+        /// Sample rate the caller's audio buffer is at.
         audio_sr: u32,
-        decision_sr: u32,
+        /// Sample rate the configured TSE model was exported at.
+        expected_sr: u32,
     },
     /// The Stage C TSE config was set but the embedding pool has no
     /// anchors yet (no enrolled target speaker) — TSE needs a 192-dim
@@ -472,12 +474,13 @@ impl std::fmt::Display for PipelineError {
             Self::TseStage(e) => write!(f, "TSE stage error: {e}"),
             Self::TseRateMismatch {
                 audio_sr,
-                decision_sr,
+                expected_sr,
             } => write!(
                 f,
-                "Stage C TSE requires 16 kHz audio and decision rates; \
-                 got audio_sr={audio_sr}, decision_sr={decision_sr}. \
-                 The 48 kHz prod TSE model is Phase 4."
+                "Stage C TSE audio_sr={audio_sr} Hz != model's expected SR \
+                 {expected_sr} Hz. Use the right `TseStageConfig` variant \
+                 (e.g. `TseStageConfig::new_prod_48k` for the 48 kHz model) \
+                 or resample audio to match."
             ),
             Self::TseMissingEnrollment => write!(
                 f,
@@ -738,20 +741,18 @@ pub fn process_offline(
     // Stage C TSE setup runs on **both** sync and async offline paths.
     // The pool may evolve via auto-learn during the run; snapshotting
     // the cond embedding here ("frozen for the run") is the simplest
-    // correct semantics for this PR. The 48 kHz prod TSE model
-    // (Phase 4) will replace this rate check with a per-config branch.
-    //
-    // TODO(phase-4-48k-tse): drop the hard 16 kHz check below in
-    // favour of "the model's expected SR must match audio_sr and
-    // decision_sr" so the 48 kHz prod export works without resample
-    // shenanigans. For the PoC the model is 16 kHz only.
+    // correct semantics for this PR. The model's expected sample rate
+    // (16 kHz for poc_16k, 48 kHz for prod_48k) is carried by the
+    // `TseStageConfig` and must match `audio_sample_rate`. The
+    // decision rate (VAD/SV) is independent — `apply_envelope_dual_rate`
+    // already handles the SR mismatch when applying the gate envelope.
     let tse_enabled = pipeline_cfg.tse.is_some();
-    if tse_enabled {
-        let decision_sr = pipeline_cfg.sample_rate;
-        if audio_sample_rate != 16_000 || decision_sr != 16_000 {
+    if let Some(stage_cfg) = pipeline_cfg.tse.as_ref() {
+        let expected_sr = stage_cfg.model.sample_rate();
+        if audio_sample_rate != expected_sr {
             return Err(PipelineError::TseRateMismatch {
                 audio_sr: audio_sample_rate,
-                decision_sr,
+                expected_sr,
             });
         }
         let cond = tse_cond_embedding(pool)?;
@@ -846,10 +847,11 @@ pub fn process_offline(
     // original mixture — so a future iteration may want to score on
     // TSE-cleaned audio; for now we keep gating untouched.
     //
-    // The rate-mismatch check at the head of `process_offline`
-    // guarantees `audio_sample_rate == pipeline_cfg.sample_rate ==
-    // 16_000` when we reach this branch, so the envelope's
-    // `decision_sr` argument matches the audio rate exactly.
+    // Decisions were computed at the decision rate
+    // (`pipeline_cfg.sample_rate` — 16 kHz for VAD). The audio is at
+    // the model's expected SR (16 kHz for poc_16k, 48 kHz for prod_48k).
+    // `apply_envelope_dual_rate` upsamples the per-frame envelope as
+    // needed, so the two rates may legitimately differ.
     let mut tse_applied = false;
     if let Some(stage) = components.tse.as_mut().filter(|_| tse_enabled) {
         let extracted = run_tse_offline(stage, audio)?;
@@ -857,7 +859,7 @@ pub fn process_offline(
             &extracted,
             &decisions,
             audio_sample_rate,
-            audio_sample_rate,
+            pipeline_cfg.sample_rate,
             *gate_cfg,
         )?;
         tse_applied = true;
