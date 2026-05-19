@@ -17,7 +17,6 @@ use mellonella_audio_io::{
     list_input_devices, list_output_devices, AudioDevice, LiveSession, LiveSessionStats, Recorder,
     SessionConfig, SessionEvent,
 };
-use mellonella_core::dfn3::Dfn3Pipeline;
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
 use mellonella_core::features::Fbank;
@@ -94,15 +93,14 @@ pub struct AppState {
     /// selection survives a device-list refresh.
     pub selected_input: Option<String>,
     pub selected_output: Option<String>,
-    /// User-toggled "Enable noise suppression". Honoured only when
-    /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
-    /// otherwise (see [`Self::dfn3_available`]).
-    pub enable_dfn3: bool,
-    /// User-toggled "Enable target-speaker extraction" (Stage C).
-    /// Honoured only when both the checkbox is on **and**
-    /// [`Self::tse_onnx_path`] is set; UI disables the checkbox
-    /// when no path is configured (see [`Self::tse_available`]).
-    pub enable_tse: bool,
+    /// When `true`, the auto-start loop in [`crate::app`] does not
+    /// re-spawn a session even when [`Self::can_start`] would otherwise
+    /// allow it. Flipped by the UI's Pause / Resume toggle and by the
+    /// auto-start path itself on construction failure (so a missing-
+    /// ONNX error doesn't loop on every frame). Default `false` so a
+    /// freshly-launched app with valid models + enrollment starts
+    /// streaming without a click.
+    pub user_paused: bool,
     /// Path to the TSE streaming ONNX (Stage C). Picked via a file
     /// dialog in the Settings panel; persisted in-memory only for this
     /// session.
@@ -147,8 +145,7 @@ impl Default for AppState {
             available_outputs,
             selected_input: None,
             selected_output: None,
-            enable_dfn3: false,
-            enable_tse: false,
+            user_paused: false,
             tse_onnx_path: None,
             tse_variant: TseVariant::default(),
             record_duration_secs: DEFAULT_RECORD_SECS,
@@ -358,34 +355,14 @@ impl AppState {
         }
     }
 
-    /// Enroll from 48 kHz mono audio. When `enable_dfn3` is on and a
-    /// DFN3 model is available, the audio is denoised at its native
-    /// 48 kHz before being downsampled to 16 kHz for ECAPA — this
-    /// keeps the anchor embeddings on the same audio distribution as
-    /// the live path's ECAPA refreshes. Without this match, cos_sim
-    /// drops noticeably under DFN3 ON and the gate ends up
-    /// fragmented (see B-symptom analysis from 2026-05-14 smoke).
+    /// Enroll from 48 kHz mono audio. Downsamples to 16 kHz and runs
+    /// ECAPA on the raw signal, matching the live engine's decision
+    /// path: after the Phase 5 refactor, DFN3 lives post-TSE in the
+    /// audio chain, while VAD / ECAPA / F0 see the raw mic input.
+    /// Keeping enrollment on raw audio matches that distribution so
+    /// anchor embeddings live in the same space as runtime refreshes.
     fn run_enrollment(&mut self, audio_48k: &[f32], origin: EnrollmentOrigin) {
-        let denoised: Vec<f32> = if self.enable_dfn3 {
-            let Some(path) = dfn3_path_from_env() else {
-                self.last_error = Some(
-                    "noise suppression toggle is on but MELLONELLA_DFN3_ONNX isn't set — \
-                     disable the checkbox before enrolling, or point the env var at the ONNX"
-                        .into(),
-                );
-                return;
-            };
-            match apply_dfn3_offline(audio_48k, &path) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    self.last_error = Some(e);
-                    return;
-                }
-            }
-        } else {
-            audio_48k.to_vec()
-        };
-        let audio_16k = match resample_to(&denoised, OUTPUT_SAMPLE_RATE, DECISION_SAMPLE_RATE) {
+        let audio_16k = match resample_to(audio_48k, OUTPUT_SAMPLE_RATE, DECISION_SAMPLE_RATE) {
             Ok(a) => a,
             Err(e) => {
                 self.last_error = Some(format!("resample 48 kHz → 16 kHz for ECAPA: {e}"));
@@ -406,6 +383,12 @@ impl AppState {
     }
 
     /// Spin up a `LiveSession` using the current in-memory pool.
+    ///
+    /// DFN3 and TSE are always enabled when their ONNX models are
+    /// reachable (DFN3 via `MELLONELLA_DFN3_ONNX`, TSE via
+    /// [`Self::tse_onnx_path`]). The GUI no longer exposes toggles
+    /// for them — the engine handles dual-stage absence gracefully
+    /// when an ONNX is unavailable.
     pub fn start(&mut self) {
         if self.session.is_some() {
             return;
@@ -421,25 +404,9 @@ impl AppState {
                 return;
             }
         };
-        let dfn3_onnx_path = if self.enable_dfn3 {
-            if let Some(p) = dfn3_path_from_env() {
-                Some(p)
-            } else {
-                self.last_error = Some(
-                    "MELLONELLA_DFN3_ONNX env var not set — can't enable noise suppression".into(),
-                );
-                return;
-            }
-        } else {
-            None
-        };
+        let dfn3_onnx_path = dfn3_path_from_env();
         let mut pipeline_cfg = self.pipeline_cfg.clone();
-        if self.enable_tse {
-            let Some(onnx) = self.tse_onnx_path.as_ref() else {
-                self.last_error =
-                    Some("TSE enabled but no ONNX path selected — pick one in Settings".into());
-                return;
-            };
+        if let Some(onnx) = self.tse_onnx_path.as_ref() {
             if !onnx.exists() {
                 self.last_error = Some(format!("TSE ONNX path does not exist: {}", onnx.display()));
                 return;
@@ -527,17 +494,17 @@ impl AppState {
     }
 
     /// Whether DFN3 noise suppression is reachable in this process
-    /// (env var set, file exists). The UI greys the toggle when
-    /// this returns `false`.
+    /// (env var set, file exists). Used by the status row to indicate
+    /// "NS active" and by [`Self::estimated_latency_ms`] to factor in
+    /// the DFN3 lookahead.
     #[must_use]
     #[allow(clippy::unused_self)] // method form is more discoverable from app.rs
     pub fn dfn3_available(&self) -> bool {
         dfn3_path_from_env().is_some()
     }
 
-    /// Whether the user has picked a TSE ONNX path that still exists
-    /// on disk. The UI greys the "Enable target-speaker extraction"
-    /// checkbox when this returns `false`.
+    /// Whether a TSE ONNX path has been configured and still exists
+    /// on disk. Used by the status row.
     #[must_use]
     pub fn tse_available(&self) -> bool {
         self.tse_onnx_path.as_deref().is_some_and(Path::exists)
@@ -593,18 +560,18 @@ impl AppState {
     /// Breakdown:
     ///
     /// * resampler: ~5 ms
-    /// * VAD: < 10 ms (assume 8 ms)
+    /// * VAD-frame alignment: ~32 ms (one VAD frame buffered)
     /// * envelope attack: `gate.attack_ms`
-    /// * DFN3: ~30 ms when `enable_dfn3` is on, else 0
+    /// * DFN3 lookahead: ~20 ms when DFN3 is available
     ///
     /// This is the architecture doc's published budget — values
     /// are conservative upper bounds, not measured per-frame on
     /// the host. Useful as a sanity check, not a benchmark.
     #[must_use]
     pub fn estimated_latency_ms(&self) -> f32 {
-        let mut total = 5.0_f32 + 8.0 + self.gate_cfg.attack_ms;
-        if self.enable_dfn3 && self.dfn3_available() {
-            total += 30.0;
+        let mut total = 5.0_f32 + 32.0 + self.gate_cfg.attack_ms;
+        if self.dfn3_available() {
+            total += 20.0;
         }
         total
     }
@@ -636,26 +603,6 @@ fn read_wav_to_48k_mono(path: &Path) -> Result<Vec<f32>, String> {
         return Ok(samples);
     }
     resample_to(&samples, spec.sample_rate, OUTPUT_SAMPLE_RATE).map_err(|e| e.to_string())
-}
-
-/// Push the whole enrollment recording through a fresh `Dfn3Pipeline`
-/// as one continuous stream — `push_samples` + `flush`, no per-chunk
-/// reset. This preserves the GRU + EMA evolution across the full
-/// recording (CLI's chunked `process()` resets between every ~1 s,
-/// which is fine for offline parity but here we want one coherent
-/// denoised stream that matches the live worker's continuous DFN3
-/// state).
-fn apply_dfn3_offline(audio_48k: &[f32], onnx_path: &Path) -> Result<Vec<f32>, String> {
-    let mut pipeline =
-        Dfn3Pipeline::from_onnx_path(onnx_path).map_err(|e| format!("DFN3 load: {e}"))?;
-    let mut enhanced = Vec::with_capacity(audio_48k.len());
-    enhanced.extend(
-        pipeline
-            .push_samples(audio_48k)
-            .map_err(|e| format!("DFN3 push: {e}"))?,
-    );
-    enhanced.extend(pipeline.flush().map_err(|e| format!("DFN3 flush: {e}"))?);
-    Ok(enhanced)
 }
 
 #[cfg(test)]
@@ -716,30 +663,23 @@ mod tests {
     }
 
     #[test]
-    fn estimated_latency_without_dfn3_is_under_50_ms() {
+    fn estimated_latency_is_in_real_time_budget() {
         let s = AppState::default();
         let latency = s.estimated_latency_ms();
+        // Without DFN3: 5 (resample) + 32 (VAD frame) + attack_ms (default ~5)
+        // = ~42 ms. With DFN3: ~62 ms. Either should sit under 100 ms.
         assert!(
-            (15.0..=50.0).contains(&latency),
-            "without DFN3 the budget should be in the 15–50 ms range, got {latency}"
+            (30.0..=100.0).contains(&latency),
+            "live budget should land in the 30 – 100 ms range, got {latency}"
         );
     }
 
     #[test]
-    fn estimated_latency_increases_with_dfn3() {
-        let mut s = AppState::default();
-        let without = s.estimated_latency_ms();
-        s.enable_dfn3 = true;
-        let with = s.estimated_latency_ms();
-        // DFN3 only counts when the env var also points at a real
-        // file — which `default()` doesn't guarantee. Either the
-        // values are equal (env unset) or DFN3 adds ~30 ms.
-        if with > without {
-            let delta = with - without;
-            assert!(
-                (25.0..=35.0).contains(&delta),
-                "DFN3 should add ~30 ms, got {delta}"
-            );
-        }
+    fn default_state_is_not_user_paused() {
+        let s = AppState::default();
+        assert!(
+            !s.user_paused,
+            "fresh state should auto-start once enrollment + models are ready"
+        );
     }
 }
