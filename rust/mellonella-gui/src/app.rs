@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::state::{AppState, EnrollmentOrigin, OUTPUT_SAMPLE_RATE};
+use crate::state::{AppState, EnrollmentOrigin};
 use crate::tray::{TrayCommand, TrayHandles};
 
 pub struct MellonellaApp {
@@ -70,8 +70,6 @@ impl MellonellaApp {
             ui.add_space(8.0);
             self.render_meters(ui);
             ui.add_space(6.0);
-            self.render_status(ui);
-            ui.add_space(6.0);
             self.render_error_row(ui);
             ui.add_space(6.0);
             self.render_settings_panel(ui);
@@ -96,10 +94,15 @@ impl MellonellaApp {
         }
     }
 
-    /// Compact "● Profile loaded" indicator + Re-enroll button. The
-    /// power-user "From WAV / Load / Save JSON" buttons live in the
-    /// Settings panel; the main UI exposes only the action the user
-    /// would actually want from here.
+    /// Compact "● Profile loaded" indicator + Re-enroll / Test
+    /// buttons. The power-user "From WAV / Load / Save JSON" buttons
+    /// live in the Settings panel; the main UI exposes only the
+    /// actions the user would actually want from here.
+    ///
+    /// "Test voice" records a short sample and scores it against the
+    /// loaded pool so the user can confirm "would my voice be
+    /// recognised right now" without having to listen to the live
+    /// session's gate behaviour.
     fn render_profile_pill(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let origin_short = match &self.state.origin {
@@ -119,9 +122,9 @@ impl MellonellaApp {
                     self.state.pool_f0_mu, self.state.pool_f0_sigma
                 ));
             }
-            // Re-enroll button lives at the right-hand edge of the row.
+            // Re-enroll / Test buttons live at the right-hand edge.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let busy = self.state.is_running();
+                let busy = self.state.is_recording();
                 let record_secs = self.state.record_duration_secs;
                 if ui
                     .add_enabled(!busy, egui::Button::new("Re-enroll"))
@@ -130,7 +133,42 @@ impl MellonellaApp {
                 {
                     self.state.start_recording(record_secs);
                 }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Test voice"))
+                    .on_hover_text(
+                        "Record a short sample and score it against the loaded profile, \
+                         so you can see whether your current voice would clear the gate.",
+                    )
+                    .clicked()
+                {
+                    self.state.start_test_recording(record_secs);
+                }
             });
+        });
+        if let Some(result) = self.state.test_result {
+            Self::render_test_result(ui, &result);
+        }
+    }
+
+    fn render_test_result(ui: &mut egui::Ui, result: &crate::state::TestResult) {
+        let (verdict, colour) = if result.would_pass {
+            ("● would pass gate", egui::Color32::from_rgb(80, 200, 120))
+        } else {
+            (
+                "○ would not pass gate",
+                egui::Color32::from_rgb(220, 120, 80),
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(verdict).color(colour));
+            ui.weak(format!(
+                "· score {:.2} (θ {:.2})",
+                result.match_score, result.theta_pass
+            ));
+            if result.f0_mu > 0.0 {
+                ui.weak(format!("· F0 μ ≈ {:.0} Hz", result.f0_mu));
+            }
+            ui.weak(format!("· vs {} anchors", result.anchors_checked));
         });
     }
 
@@ -307,50 +345,13 @@ impl MellonellaApp {
         });
     }
 
-    /// Pause / Resume toggle. The app auto-starts on first launch
-    /// when `can_start()` is true (see [`Self::maybe_auto_start`]);
-    /// this button just lets the user temporarily release the mic /
-    /// stop filtering without exiting the app.
+    /// Capability indicators: which optional ONNX backends are wired
+    /// up (DFN3 NS / TSE). The session itself auto-starts as soon as
+    /// the enrollment + ONNX models resolve (see
+    /// [`Self::maybe_auto_start`]), so this row has no manual control
+    /// — the meters below convey "is audio flowing" and the gate
+    /// light conveys "is the speaker recognised right now".
     fn render_run_controls(&mut self, ui: &mut egui::Ui) {
-        let running = self.state.is_running();
-        let can_start = self.state.can_start();
-        ui.horizontal(|ui| {
-            if running {
-                if ui
-                    .add(egui::Button::new("⏸ Pause").min_size(egui::vec2(140.0, 32.0)))
-                    .clicked()
-                {
-                    self.state.user_paused = true;
-                    self.state.stop();
-                }
-            } else {
-                let label = if self.state.user_paused {
-                    "▶ Resume"
-                } else {
-                    "▶ Start"
-                };
-                if ui
-                    .add_enabled(
-                        can_start,
-                        egui::Button::new(label).min_size(egui::vec2(140.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    self.state.user_paused = false;
-                    self.state.start();
-                }
-            }
-            let status = if running {
-                egui::RichText::new("● filtering").color(egui::Color32::from_rgb(80, 200, 120))
-            } else if self.state.user_paused {
-                egui::RichText::new("⏸ paused").color(egui::Color32::from_rgb(220, 200, 80))
-            } else if can_start {
-                egui::RichText::new("○ starting…").color(egui::Color32::from_rgb(220, 200, 80))
-            } else {
-                egui::RichText::new("○ enroll a voice first").color(egui::Color32::DARK_GRAY)
-            };
-            ui.label(status);
-        });
         let dfn3_available = self.state.dfn3_available();
         let tse_available = self.state.tse_available();
         ui.horizontal(|ui| {
@@ -384,16 +385,6 @@ impl MellonellaApp {
         if self.state.last_error.is_some() {
             self.state.user_paused = true;
         }
-    }
-
-    fn render_status(&self, ui: &mut egui::Ui) {
-        let s = self.state.last_stats;
-        let secs = s.samples_processed as f32 / OUTPUT_SAMPLE_RATE as f32;
-        let latency_ms = self.state.estimated_latency_ms();
-        ui.label(format!(
-            "Processed: {secs:.1} s   ·   latency: ~{latency_ms:.0} ms   ·   overruns: {}   underruns: {}",
-            s.input_overruns, s.output_underruns
-        ));
     }
 
     /// Step 18: live level meter + gate light. Renders two thin
