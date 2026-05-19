@@ -260,73 +260,83 @@ impl MellonellaApp {
         });
     }
 
+    /// Pause / Resume toggle. The app auto-starts on first launch
+    /// when `can_start()` is true (see [`Self::maybe_auto_start`]);
+    /// this button just lets the user temporarily release the mic /
+    /// stop filtering without exiting the app.
     fn render_run_controls(&mut self, ui: &mut egui::Ui) {
         let running = self.state.is_running();
         let can_start = self.state.can_start();
-        let dfn3_available = self.state.dfn3_available();
         ui.horizontal(|ui| {
-            let label = if running { "Stop" } else { "Start" };
-            let enabled = if running { true } else { can_start };
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(label).min_size(egui::vec2(120.0, 32.0)),
-                )
-                .clicked()
-            {
-                if running {
+            if running {
+                if ui
+                    .add(egui::Button::new("⏸ Pause").min_size(egui::vec2(140.0, 32.0)))
+                    .clicked()
+                {
+                    self.state.user_paused = true;
                     self.state.stop();
+                }
+            } else {
+                let label = if self.state.user_paused {
+                    "▶ Resume"
                 } else {
+                    "▶ Start"
+                };
+                if ui
+                    .add_enabled(
+                        can_start,
+                        egui::Button::new(label).min_size(egui::vec2(140.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.state.user_paused = false;
                     self.state.start();
                 }
             }
             let status = if running {
-                egui::RichText::new("● running").color(egui::Color32::from_rgb(80, 200, 120))
+                egui::RichText::new("● filtering").color(egui::Color32::from_rgb(80, 200, 120))
+            } else if self.state.user_paused {
+                egui::RichText::new("⏸ paused").color(egui::Color32::from_rgb(220, 200, 80))
             } else if can_start {
-                egui::RichText::new("○ ready").color(egui::Color32::from_rgb(220, 200, 80))
+                egui::RichText::new("○ starting…").color(egui::Color32::from_rgb(220, 200, 80))
             } else {
-                egui::RichText::new("○ idle").color(egui::Color32::DARK_GRAY)
+                egui::RichText::new("○ enroll a voice first").color(egui::Color32::DARK_GRAY)
             };
             ui.label(status);
         });
-        ui.horizontal(|ui| {
-            let tooltip = if dfn3_available {
-                "Run DFN3 noise suppression on the live audio path. Adds ~30 ms latency."
-            } else {
-                "Set MELLONELLA_DFN3_ONNX to enable noise suppression."
-            };
-            ui.add_enabled_ui(!running && dfn3_available, |ui| {
-                ui.checkbox(&mut self.state.enable_dfn3, "Enable noise suppression")
-                    .on_hover_text(tooltip);
-            });
-            if !dfn3_available {
-                ui.weak("(MELLONELLA_DFN3_ONNX not set)");
-            } else if self.state.enable_dfn3 {
-                ui.weak("+ ~30 ms latency");
-            }
-        });
+        let dfn3_available = self.state.dfn3_available();
         let tse_available = self.state.tse_available();
         ui.horizontal(|ui| {
-            let tooltip = if tse_available {
-                "Run Stage C target-speaker extraction on the live audio path. \
-                 Extracts only the enrolled speaker's voice from the mixture before \
-                 the gate envelope is applied. Adds ~10 ms latency."
+            ui.weak(if dfn3_available {
+                "● noise suppression"
             } else {
-                "Pick a TSE ONNX in Settings to enable target-speaker extraction."
-            };
-            ui.add_enabled_ui(!running && tse_available, |ui| {
-                ui.checkbox(
-                    &mut self.state.enable_tse,
-                    "Enable target-speaker extraction",
-                )
-                .on_hover_text(tooltip);
+                "○ noise suppression (MELLONELLA_DFN3_ONNX not set)"
             });
-            if !tse_available {
-                ui.weak("(no TSE ONNX selected)");
-            } else if self.state.enable_tse {
-                ui.weak("+ ~10 ms latency");
-            }
+            ui.separator();
+            ui.weak(if tse_available {
+                "● target-speaker extraction"
+            } else {
+                "○ target-speaker extraction (pick ONNX in Settings)"
+            });
         });
+    }
+
+    /// Auto-start a session on the first frame where conditions allow
+    /// it. Called from [`eframe::App::update`] before rendering so the
+    /// UI sees the running state immediately. Honours `user_paused` —
+    /// a manual Pause click stays paused until the user clicks Resume.
+    /// On construction failure (missing ONNX env var, etc.) flips
+    /// `user_paused` so the loop doesn't spam the failure on every
+    /// frame; the user can investigate the error and click Resume to
+    /// retry once it's fixed.
+    fn maybe_auto_start(&mut self) {
+        if self.state.user_paused || self.state.is_running() || !self.state.can_start() {
+            return;
+        }
+        self.state.start();
+        if self.state.last_error.is_some() {
+            self.state.user_paused = true;
+        }
     }
 
     fn render_status(&self, ui: &mut egui::Ui) {
@@ -472,7 +482,6 @@ impl MellonellaApp {
                         if self.state.tse_onnx_path.is_some() && ui.small_button("Clear").clicked()
                         {
                             self.state.tse_onnx_path = None;
-                            self.state.enable_tse = false;
                         }
                     });
                     ui.horizontal(|ui| {
@@ -515,6 +524,10 @@ impl eframe::App for MellonellaApp {
         self.state.poll_session();
         self.state.poll_recorder();
         self.drain_tray_commands(ctx);
+        // Auto-start a session as soon as enrollment + models are
+        // ready and the user hasn't manually paused. Idempotent: the
+        // call is a no-op once a session is already running.
+        self.maybe_auto_start();
 
         // Step 17: minimise-to-tray. When the user clicks the
         // window's close button AND the tray is available,
