@@ -462,10 +462,7 @@ fn apply_low_latency_profile(cfg: &mut PipelineConfig, enabled: bool) {
 /// sidecar) from HuggingFace into the local cache and return the
 /// `.onnx` path. Reuses a cached copy when present.
 fn fetch_tse_from_hf() -> Result<PathBuf, CliError> {
-    eprintln!(
-        "[info] fetching {} from HuggingFace (cached on subsequent runs)…",
-        TSE_PROD_48K_REPO
-    );
+    eprintln!("[info] fetching {TSE_PROD_48K_REPO} from HuggingFace (cached on subsequent runs)…");
     let onnx = fetch_tse_prod_48k(|file, so_far, total| {
         let mb = so_far as f32 / 1.0e6;
         if let Some(t) = total {
