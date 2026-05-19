@@ -316,15 +316,16 @@ fn log_first_nan(label: &'static str, samples: &[f32]) {
     use std::sync::OnceLock;
     static SEEN: OnceLock<Mutex<HashSet<(&'static str, &'static str)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let (nan_idx, inf_idx) = samples.iter().enumerate().fold(
-        (None::<usize>, None::<usize>),
-        |(n, i), (idx, x)| {
-            (
-                n.or_else(|| x.is_nan().then_some(idx)),
-                i.or_else(|| (!x.is_finite() && !x.is_nan()).then_some(idx)),
-            )
-        },
-    );
+    let (nan_idx, inf_idx) =
+        samples
+            .iter()
+            .enumerate()
+            .fold((None::<usize>, None::<usize>), |(n, i), (idx, x)| {
+                (
+                    n.or_else(|| x.is_nan().then_some(idx)),
+                    i.or_else(|| (!x.is_finite() && !x.is_nan()).then_some(idx)),
+                )
+            });
     if let Some(idx) = nan_idx {
         if let Ok(mut guard) = seen.lock() {
             if guard.insert((label, "nan")) {
