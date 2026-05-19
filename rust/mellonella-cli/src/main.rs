@@ -632,6 +632,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
             audio_sample_rate: OUTPUT_SAMPLE_RATE,
             diagnostics: false,
             dfn3_onnx_path: None,
+            ..Default::default()
         },
         dfn3_onnx_path,
         input_channel: args.input_channel.into(),

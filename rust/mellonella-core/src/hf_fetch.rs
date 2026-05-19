@@ -69,6 +69,15 @@ pub const DFN3_FILE: &str = "dfn3.onnx";
 pub const ECAPA_REPO: &str = "penta2himajin/ecapa-tdnn-onnx";
 pub const ECAPA_FILE: &str = "ecapa_tdnn.onnx";
 
+/// HuggingFace repository for the pyannote 3.0 segmentation model
+/// (community ONNX export from <https://huggingface.co/pyannote/segmentation-3.0>).
+/// Outputs per-frame 7-class powerset probabilities (silence, three
+/// solo-speaker classes, three two-speaker overlap classes); used to
+/// detect simultaneous-speaker situations and route the audio chain
+/// through TSE when overlap is present.
+pub const OVERLAP_SEG_REPO: &str = "onnx-community/pyannote-segmentation-3.0";
+pub const OVERLAP_SEG_FILE: &str = "onnx/model.onnx";
+
 /// Errors produced by [`fetch_file`] / [`fetch_tse_prod_48k`].
 #[derive(Debug)]
 pub enum FetchError {
@@ -321,6 +330,23 @@ pub fn ensure_ecapa_onnx(progress: impl FnMut(u64, Option<u64>)) -> Result<PathB
     resolve_model_path(
         "MELLONELLA_ECAPA_ONNX",
         Some((ECAPA_REPO, ECAPA_FILE)),
+        progress,
+    )
+}
+
+/// Ensure the pyannote 3.0 segmentation ONNX is available locally and
+/// return its path. Falls back to `MELLONELLA_OVERLAP_SEG_ONNX` when
+/// set so users can point at a local copy without round-tripping
+/// through HuggingFace.
+///
+/// # Errors
+/// As for [`fetch_file`].
+pub fn ensure_overlap_seg_onnx(
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, FetchError> {
+    resolve_model_path(
+        "MELLONELLA_OVERLAP_SEG_ONNX",
+        Some((OVERLAP_SEG_REPO, OVERLAP_SEG_FILE)),
         progress,
     )
 }

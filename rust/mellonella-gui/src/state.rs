@@ -418,6 +418,7 @@ impl AppState {
                 // on `SessionConfig` below — keep `None` here as the
                 // construction-time default.
                 dfn3_onnx_path: None,
+                ..Default::default()
             },
             dfn3_onnx_path,
             // GUI uses the safe default; multi-channel mic users
@@ -780,6 +781,7 @@ mod tests {
             audio_sample_rate: OUTPUT_SAMPLE_RATE,
             diagnostics: false,
             dfn3_onnx_path: Some(PathBuf::from(&dfn3_path)),
+            ..Default::default()
         };
 
         let mut pipeline = StreamingPipeline::new(pool, cfg, components)

@@ -355,6 +355,7 @@ fn build_pipeline(
         audio_sample_rate: sample_rate,
         diagnostics: false,
         dfn3_onnx_path: Some(dfn3_path),
+        ..Default::default()
     };
 
     let pipe = StreamingPipeline::new(pool, config, components)
