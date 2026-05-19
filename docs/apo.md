@@ -118,11 +118,19 @@ LADSPA-equivalent out-of-band channels, identical defaults:
 | VAD ONNX | (cache only) | same cache |
 | ECAPA ONNX | (cache only) | same cache |
 
-If no enrollment is found, the plugin runs in **DFN3-only** mode —
-the speaker gate stays fully open, but noise suppression still runs.
-Enroll once through `mellonella-gui` and the APO will pick the
-profile up on the next `lock_for_process` (i.e. when the audio
-stream next reopens — toggling the microphone in Settings is enough).
+If no enrollment is found, the plugin runs in **DFN3-only +
+bootstrap-auto-learn** mode: the speaker gate stays fully open, but
+the streaming engine still observes refreshes and seeds the first
+anchor from the first second of voiced speech it hears. Subsequent
+admissions accumulate into the adapted embedding, and on
+`unlock_for_process` the pool is persisted back to the enrollment
+path — so the next time the audio engine reopens the stream the APO
+loads the learned profile and runs the full gate. Existing
+enrollment files are never overwritten by this path (persistence
+only fires when the session started with an empty pool).
+
+If you want immediate gating, enroll explicitly through
+`mellonella-gui` before registering the APO.
 
 ## Troubleshooting
 

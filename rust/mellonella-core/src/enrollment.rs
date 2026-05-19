@@ -66,6 +66,16 @@ pub struct EmbeddingPoolConfig {
     /// lower = steadier. Default `0.3`; a starting point pending
     /// calibration.
     pub adapt_rate: f32,
+    /// When `true`, [`EmbeddingPool::bootstrap_seed`] is allowed to
+    /// install the very first anchor from a runtime embedding instead
+    /// of requiring an explicit enrollment recording. The streaming
+    /// engine uses this to let the LADSPA / APO plugins start with an
+    /// empty pool and learn the dominant speaker's profile as they
+    /// hear it, without an upfront enrollment step.
+    ///
+    /// Default `false` — preserves the existing contract where empty
+    /// pools never learn (`can_auto_learn` short-circuits to `false`).
+    pub allow_bootstrap_from_runtime: bool,
 }
 
 impl Default for EmbeddingPoolConfig {
@@ -74,6 +84,7 @@ impl Default for EmbeddingPoolConfig {
             anchor_distance_threshold: 0.4,
             adapt_residual_lambda: 0.1,
             adapt_rate: 0.3,
+            allow_bootstrap_from_runtime: false,
         }
     }
 }
@@ -261,12 +272,46 @@ impl EmbeddingPool {
 
     /// Drift-safety check before folding a candidate into the adapted
     /// embedding. Returns `false` when there are no anchors yet.
+    ///
+    /// `bootstrap_from_runtime` doesn't relax this check — pool needs
+    /// an anchor before `adapt` will accept anything. Use
+    /// [`Self::bootstrap_seed`] for the empty-pool case; once a seed
+    /// anchor exists, normal `adapt` admissions accumulate on top.
     #[must_use]
     pub fn can_auto_learn(&self, emb: &[f32]) -> bool {
         match self.anchor_distance(emb) {
             Some(d) => d <= self.config.anchor_distance_threshold,
             None => false,
         }
+    }
+
+    /// Seed the very first anchor from a runtime embedding, plus the
+    /// f0 prior to use against subsequent refreshes. Idempotent: only
+    /// fires once, when the pool is still empty *and*
+    /// [`EmbeddingPoolConfig::allow_bootstrap_from_runtime`] is on.
+    ///
+    /// Once it succeeds the normal [`Self::adapt`] path takes over —
+    /// later high-confidence runtime candidates accumulate into the
+    /// adapted embedding via the usual `anchor_distance_threshold` /
+    /// `adapt_rate` machinery. Callers that want a multi-anchor
+    /// bootstrap should call this once with the first admission and
+    /// then let `adapt` accumulate.
+    ///
+    /// Returns `true` iff the seed was installed.
+    pub fn bootstrap_seed<V: Into<Vec<f32>>>(&mut self, emb: V, f0_mu: f32, f0_sigma: f32) -> bool {
+        if !self.config.allow_bootstrap_from_runtime || !self.is_empty() {
+            return false;
+        }
+        let emb = emb.into();
+        self.anchors.push(emb);
+        self.anchor_centroid = elementwise_mean(&self.anchors);
+        self.metadata = EnrollmentMetadata { f0_mu, f0_sigma };
+        // `evidence` stays None — the bootstrapped anchor IS the
+        // entire pool for now; subsequent `adapt` calls will populate
+        // evidence and refresh `adapted` from `anchor_centroid +
+        // evidence` as usual.
+        self.recompute_adapted();
+        true
     }
 
     /// Fold a high-confidence runtime candidate into the adapted
@@ -571,6 +616,66 @@ mod tests {
         assert!(!pool.adapt(unit(&[1.0, 0.0])));
         assert!(pool.evidence().is_none());
         assert!(pool.adapted().is_none());
+    }
+
+    #[test]
+    fn bootstrap_seed_rejected_when_flag_disabled() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: false,
+            ..EmbeddingPoolConfig::default()
+        });
+        assert!(!pool.bootstrap_seed(unit(&[1.0, 0.0, 0.0]), 150.0, 30.0));
+        assert!(pool.is_empty());
+        assert_eq!(pool.metadata().f0_mu, 0.0);
+    }
+
+    #[test]
+    fn bootstrap_seed_rejected_when_pool_nonempty() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            ..EmbeddingPoolConfig::default()
+        });
+        pool.add_anchors([unit(&[1.0, 0.0, 0.0])]);
+        let before_count = pool.anchors().len();
+        // The seed must not replace or duplicate the existing anchor.
+        assert!(!pool.bootstrap_seed(unit(&[0.0, 1.0, 0.0]), 200.0, 50.0));
+        assert_eq!(pool.anchors().len(), before_count);
+    }
+
+    #[test]
+    fn bootstrap_seed_installs_first_anchor_and_f0() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            ..EmbeddingPoolConfig::default()
+        });
+        let seed = unit(&[1.0, 0.0, 0.0]);
+        assert!(pool.bootstrap_seed(seed.clone(), 175.0, 35.0));
+        assert_eq!(pool.anchors().len(), 1);
+        assert_eq!(pool.metadata().f0_mu, 175.0);
+        assert_eq!(pool.metadata().f0_sigma, 35.0);
+        // The centroid of a one-anchor pool is the anchor verbatim, so
+        // match_score against the seed is exactly 1.
+        let score = pool.match_score(&seed);
+        assert!((score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bootstrap_then_adapt_accumulates_evidence() {
+        // After bootstrap installs the first anchor, the normal
+        // `adapt` path takes over and folds further high-confidence
+        // candidates into evidence — i.e. bootstrap doesn't lock the
+        // pool, it kickstarts it.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig {
+            allow_bootstrap_from_runtime: true,
+            anchor_distance_threshold: 0.5,
+            ..EmbeddingPoolConfig::default()
+        });
+        assert!(pool.bootstrap_seed(unit(&[1.0, 0.0, 0.0]), 150.0, 30.0));
+        // A near candidate clears `can_auto_learn` because the anchor
+        // distance check now has an anchor to compare against.
+        let near = unit(&[0.95, 0.05, 0.0]);
+        assert!(pool.adapt(near));
+        assert!(pool.evidence().is_some());
     }
 
     #[test]

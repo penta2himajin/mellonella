@@ -57,6 +57,15 @@ pub struct MellonellaLadspa {
     sample_rate: u32,
     pipeline: Option<StreamingPipeline>,
     has_pool: bool,
+    /// `true` when activate() loaded an empty pool — i.e. this
+    /// session was running in DFN3-only + bootstrap-auto-learn mode.
+    /// Tells deactivate() whether persisting the pool back to disk
+    /// is meaningful: skip when an explicit enrollment was loaded so
+    /// we never clobber a user-curated profile with runtime drift.
+    started_empty: bool,
+    /// Path used by activate() to load the pool (and by deactivate()
+    /// to write it back when bootstrap admitted anything).
+    enrollment_path: Option<PathBuf>,
     input_scratch: Vec<f32>,
     output_ring: VecDeque<f32>,
     last_gate: f32,
@@ -101,6 +110,8 @@ impl Plugin for MellonellaLadspa {
             sample_rate,
             pipeline: None,
             has_pool: false,
+            started_empty: false,
+            enrollment_path: None,
             input_scratch: Vec::with_capacity(8192),
             output_ring: VecDeque::with_capacity(8192),
             last_gate: 0.0,
@@ -112,7 +123,10 @@ impl Plugin for MellonellaLadspa {
     fn activate(&mut self) {
         // Heavy init lives here, not in run(): ONNX session creation,
         // optional HuggingFace downloads, enrollment JSON parse.
-        match build_pipeline(self.sample_rate) {
+        let path = resolve_enrollment_path();
+        let result = build_pipeline(self.sample_rate, path.as_deref());
+        self.enrollment_path = path;
+        match result {
             Ok((pipe, has_pool)) => {
                 eprintln!(
                     "mellonella-ladspa: activated at {} Hz (enrollment loaded: {has_pool})",
@@ -121,17 +135,21 @@ impl Plugin for MellonellaLadspa {
                 if !has_pool {
                     eprintln!(
                         "mellonella-ladspa: no enrollment.json found — running in DFN3 \
-                         noise-suppression-only mode. Enroll via mellonella-gui to enable \
-                         target-speaker gating."
+                         noise-suppression-only mode with bootstrap auto-learn enabled. \
+                         The first anchor seeds itself from the first second of voiced \
+                         speech; subsequent refreshes accumulate, and the pool persists \
+                         on deactivate so the next session reuses the learned profile."
                     );
                 }
                 self.pipeline = Some(pipe);
                 self.has_pool = has_pool;
+                self.started_empty = !has_pool;
             }
             Err(e) => {
                 eprintln!("mellonella-ladspa: activate failed ({e}); plugin will pass audio through unchanged");
                 self.pipeline = None;
                 self.has_pool = false;
+                self.started_empty = false;
             }
         }
         self.output_ring.clear();
@@ -141,11 +159,40 @@ impl Plugin for MellonellaLadspa {
     }
 
     fn deactivate(&mut self) {
-        // Drop the pipeline so ONNX sessions / worker threads are
-        // released — activate() rebuilds on next start.
+        // Persist the bootstrapped pool back to disk before dropping
+        // the pipeline. Only fires when this session started empty
+        // (`started_empty`) so an explicit enrollment is never
+        // overwritten by runtime drift, and only when the pool
+        // actually accumulated anchors during the session.
+        if self.started_empty {
+            if let (Some(pipe), Some(path)) =
+                (self.pipeline.as_ref(), self.enrollment_path.as_ref())
+            {
+                let pool = pipe.pool();
+                if !pool.is_empty() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match pool.save(path) {
+                        Ok(()) => eprintln!(
+                            "mellonella-ladspa: persisted bootstrapped pool ({} anchors) to {}",
+                            pool.anchors().len(),
+                            path.display()
+                        ),
+                        Err(e) => eprintln!(
+                            "mellonella-ladspa: failed to persist pool to {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+
         self.pipeline = None;
         self.input_scratch.clear();
         self.output_ring.clear();
+        self.started_empty = false;
+        self.enrollment_path = None;
     }
 
     fn run(&mut self, _rt: &RealtimeContext, frames: usize, ports: &mut Ports<'_>) {
@@ -213,7 +260,10 @@ impl Plugin for MellonellaLadspa {
 
 plugin_entry!(MellonellaLadspa);
 
-fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String> {
+fn build_pipeline(
+    sample_rate: u32,
+    enrollment_path: Option<&std::path::Path>,
+) -> Result<(StreamingPipeline, bool), String> {
     let ecapa_path =
         hf_fetch::ensure_ecapa_onnx(noop_progress).map_err(|e| format!("ECAPA fetch: {e}"))?;
     let vad_path =
@@ -234,27 +284,44 @@ fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String>
         tse: None,
     };
 
-    let pool_cfg = EmbeddingPoolConfig::default();
-    let (pool, has_pool) = match resolve_enrollment_path() {
-        Some(path) if path.exists() => match EmbeddingPool::load(&path, pool_cfg) {
-            Ok(p) => {
-                let usable = !p.is_empty();
+    let loaded = enrollment_path.and_then(|p| {
+        if !p.exists() {
+            return None;
+        }
+        // Use a default pool config for an existing enrollment — the
+        // user's explicit anchors get the standard adapt residual /
+        // drift threshold, not the bootstrap-relaxed variant.
+        match EmbeddingPool::load(p, EmbeddingPoolConfig::default()) {
+            Ok(pool) => {
                 eprintln!(
                     "mellonella-ladspa: loaded enrollment from {} ({} anchors)",
-                    path.display(),
-                    p.anchors().len()
+                    p.display(),
+                    pool.anchors().len()
                 );
-                (p, usable)
+                Some(pool)
             }
             Err(e) => {
                 eprintln!(
                     "mellonella-ladspa: failed to parse {} ({e}); starting empty",
-                    path.display()
+                    p.display()
                 );
-                (EmbeddingPool::new(pool_cfg), false)
+                None
             }
-        },
-        _ => (EmbeddingPool::new(pool_cfg), false),
+        }
+    });
+
+    let (pool, has_pool) = match loaded {
+        Some(p) if !p.is_empty() => (p, true),
+        _ => {
+            // Empty-pool mode: enable bootstrap so the first
+            // VAD-positive voiced refresh seeds the initial anchor;
+            // normal `adapt` then accumulates on top.
+            let pool = EmbeddingPool::new(EmbeddingPoolConfig {
+                allow_bootstrap_from_runtime: true,
+                ..EmbeddingPoolConfig::default()
+            });
+            (pool, false)
+        }
     };
 
     let mut pipeline_cfg = PipelineConfig {
@@ -267,18 +334,19 @@ fn build_pipeline(sample_rate: u32) -> Result<(StreamingPipeline, bool), String>
     let mut gate_cfg = GateConfig::default();
 
     if !has_pool {
-        // NS-only fallback: keep the score-side gate fully open and
-        // skip auto-learn (which requires an anchor anyway). DFN3 in
-        // the streaming engine still runs because we set
-        // `dfn3_onnx_path` below, so the user gets noise suppression
-        // even without an enrolled profile.
+        // NS-only fallback while the pool is empty: keep the score-side
+        // gate fully open so the user can be heard from the start.
+        // `enable_auto_learn` stays on (its default) so the bootstrap
+        // path in `apply_refresh_result` can seed the first anchor; once
+        // an anchor exists the normal `adapt` admissions accumulate on
+        // top. Gate stays open all session — next session loads the
+        // bootstrapped anchors and runs the full gate.
         gate_cfg.theta_pass = f32::MIN;
         gate_cfg.theta_pass_as_norm = f32::MIN;
         gate_cfg.adaptive_theta = false;
         gate_cfg.hangover_ms = 10_000.0;
         pipeline_cfg.silence_force_off_ms = 0.0;
         pipeline_cfg.vad_threshold = -1.0;
-        pipeline_cfg.enable_auto_learn = false;
     }
 
     let config = StreamingConfig {
