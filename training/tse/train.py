@@ -709,12 +709,13 @@ def run_training(
         # EMA weights when EMA is on — that's what export uses, so
         # the val metric reflects what the deployed model will hit.
         if val_loader is not None:
-            stash = ema.swap_with(model) if ema is not None else None
+            ema_for_eval = ema  # rebind so mypy keeps the narrowing
+            stash = ema_for_eval.swap_with(model) if ema_for_eval is not None else None
             try:
                 val_stats = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
             finally:
-                if stash is not None:
-                    ema.swap_back(model, stash)
+                if ema_for_eval is not None and stash is not None:
+                    ema_for_eval.swap_back(model, stash)
             stats["val_loss"] = val_stats["loss"]
             stats["val_si_sdr"] = val_stats["si_sdr"]
 
