@@ -59,6 +59,7 @@ use mellonella_core::pipeline::{
 };
 use mellonella_core::resample::resample_to;
 use mellonella_core::streaming::StreamingConfig;
+use mellonella_core::tse_stage::TseStageConfig;
 use mellonella_core::vad::SileroVad;
 
 /// Internal decision rate (ECAPA-TDNN's training rate). The pipeline
@@ -202,6 +203,31 @@ struct ProcessArgs {
     /// `--low-latency` to exercise the new path.
     #[arg(long)]
     low_latency: bool,
+    /// Path to a streaming TSE ONNX (Stage C). When set, the offline
+    /// pipeline conditions on the enrolled anchor centroid and
+    /// extracts only the target speaker's voice before applying the
+    /// gate envelope. The companion `--tse-config` flag selects the
+    /// model variant (default `prod_48k` — matches the canonical
+    /// release at <https://huggingface.co/penta2himajin/tse-conv-tasnet-48k>).
+    /// The audio path stays at 48 kHz end-to-end for `prod_48k`;
+    /// `poc_16k` requires both the audio path and decision path to be
+    /// at 16 kHz, so combining `poc_16k` with the default 48 kHz audio
+    /// path will fail (resample input or pick `prod_48k`).
+    #[arg(long, value_name = "PATH")]
+    tse_onnx: Option<PathBuf>,
+    /// TSE model variant. `prod_48k` (default) matches the production
+    /// 48 kHz model on HuggingFace; `poc_16k` matches the original
+    /// 16 kHz PoC.
+    #[arg(long, value_enum, default_value_t = TseVariant::Prod48k)]
+    tse_config: TseVariant,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TseVariant {
+    #[value(name = "poc_16k")]
+    Poc16k,
+    #[value(name = "prod_48k")]
+    Prod48k,
 }
 
 #[derive(Debug)]
@@ -424,6 +450,19 @@ fn apply_low_latency_profile(cfg: &mut PipelineConfig, enabled: bool) {
     cfg.offset_fail_closed = true;
 }
 
+fn build_tse_stage_config(onnx: &Path, variant: TseVariant) -> Result<TseStageConfig, CliError> {
+    if !onnx.exists() {
+        return Err(CliError::Pipeline(format!(
+            "--tse-onnx points to a non-existent path: {}",
+            onnx.display()
+        )));
+    }
+    Ok(match variant {
+        TseVariant::Poc16k => TseStageConfig::new(onnx.to_path_buf()),
+        TseVariant::Prod48k => TseStageConfig::new_prod_48k(onnx.to_path_buf()),
+    })
+}
+
 fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
     let audio = prepare_audio_for_process(&args.input, args.enable_dfn3)?;
     let mut pool = EmbeddingPool::load(&args.enrollment, EmbeddingPoolConfig::default())
@@ -431,6 +470,14 @@ fn cmd_process(args: ProcessArgs) -> Result<(), CliError> {
     let mut components = build_components()?;
     let mut cfg = PipelineConfig::default();
     apply_low_latency_profile(&mut cfg, args.low_latency);
+    if let Some(tse_onnx) = args.tse_onnx.as_deref() {
+        cfg.tse = Some(build_tse_stage_config(tse_onnx, args.tse_config)?);
+        eprintln!(
+            "[info] Stage C TSE enabled: variant={:?}, onnx={}",
+            args.tse_config,
+            tse_onnx.display()
+        );
+    }
     let gate = GateConfig::default();
     let result = process_offline(
         &audio,

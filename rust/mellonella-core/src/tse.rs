@@ -128,6 +128,18 @@ impl TseConfig {
         self.n_repeats * self.n_blocks
     }
 
+    /// Sample rate (Hz) the model was exported at. Derived from
+    /// `enc_stride` — both the PoC and the production variant hold the
+    /// latent frame rate at 1 kHz (`enc_stride` samples per latent
+    /// frame), so `sample_rate = enc_stride * 1000`. `poc_16k` → 16 000,
+    /// `prod_48k` → 48 000.
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
+        // `enc_stride` is small (16 or 48 in shipped configs); the cast
+        // is exact for any plausible value.
+        (self.enc_stride as u32) * 1_000
+    }
+
     /// Number of state tensors threaded across `process_chunk` calls.
     ///
     /// Layout: `1 (enc overlap) + 3 (input-norm) + 7 * total_blocks
