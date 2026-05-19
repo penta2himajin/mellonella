@@ -2339,7 +2339,6 @@ dependencies = [
  "dirs 5.0.1",
  "eframe",
  "egui",
- "hound",
  "mellonella-audio-io",
  "mellonella-core",
  "rfd",

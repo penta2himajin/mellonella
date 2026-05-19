@@ -5,11 +5,11 @@
 //! live session is currently running (enrollment, device selection,
 //! last error are all sticky across start/stop cycles).
 //!
-//! Enrollment is held as an **in-memory `EmbeddingPool`** rather
-//! than a path: the GUI offers WAV-file and mic-recording flows
-//! that build the pool directly without round-tripping through the
-//! enrollment JSON on disk. The JSON load / save buttons are
-//! exposed as power-user controls for CLI interop.
+//! Enrollment is held as an **in-memory `EmbeddingPool`** built from
+//! the mic recording flow and updated by the auto-learn pool during
+//! a live session. The pool is persisted to
+//! `~/.config/mellonella/enrollment.json` and auto-loaded on next
+//! launch, so file-level import / export controls are unnecessary.
 
 use std::path::{Path, PathBuf};
 
@@ -41,41 +41,17 @@ pub const DECISION_SAMPLE_RATE: u32 = 16_000;
 pub const DEFAULT_RECORD_SECS: f32 = 5.0;
 
 /// Where the current enrollment came from. Surfaced in the UI so
-/// users see "Recorded 5.0 s" vs "Loaded from voice.wav" vs
-/// "Loaded enrollment.json".
+/// users see "Recorded 5.0 s" vs the auto-loaded persistent pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrollmentOrigin {
     None,
-    Wav(PathBuf),
-    Mic { secs: u32 },
-    Json(PathBuf),
-}
-
-/// TSE model variant — mirrors the CLI's `--tse-config` enum so the
-/// GUI's dropdown has the same options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TseVariant {
-    /// 16 kHz PoC. Requires both the audio path and decision path to
-    /// be at 16 kHz; will fail to start on the GUI's default 48 kHz
-    /// audio path (kept selectable so users running a custom build
-    /// at 16 kHz can still pick it).
-    Poc16k,
-    /// 48 kHz production model — the canonical release at
-    /// <https://huggingface.co/penta2himajin/tse-conv-tasnet-48k>.
-    /// Matches the GUI's 48 kHz audio path exactly.
-    #[default]
-    Prod48k,
-}
-
-impl TseVariant {
-    /// Display label for the dropdown.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Poc16k => "poc_16k (16 kHz)",
-            Self::Prod48k => "prod_48k (48 kHz)",
-        }
-    }
+    Mic {
+        secs: u32,
+    },
+    /// Auto-loaded from `default_enrollment_path()` on launch. Path
+    /// retained for display so the user can see which file backs the
+    /// in-memory pool.
+    AutoLoaded(PathBuf),
 }
 
 pub struct AppState {
@@ -97,11 +73,6 @@ pub struct AppState {
     /// dialog in the Settings panel; persisted in-memory only for this
     /// session.
     pub tse_onnx_path: Option<PathBuf>,
-    /// TSE model variant. `Prod48k` matches the production 48 kHz
-    /// model on HuggingFace; `Poc16k` matches the original 16 kHz PoC.
-    /// Defaults to `Prod48k` — the 48 kHz audio path the GUI uses
-    /// end-to-end matches that variant's expected SR exactly.
-    pub tse_variant: TseVariant,
     /// Mic-enrollment recording duration in seconds. Step 20 made
     /// this user-configurable from the GUI (a slider next to the
     /// Record button); default matches the previous fixed
@@ -138,7 +109,6 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             tse_onnx_path: None,
-            tse_variant: TseVariant::default(),
             record_duration_secs: DEFAULT_RECORD_SECS,
             gate_cfg: GateConfig::default(),
             pipeline_cfg: default_live_pipeline_cfg(),
@@ -277,46 +247,17 @@ impl AppState {
         self.pool_f0_sigma = 0.0;
     }
 
-    /// Load a pre-computed enrollment JSON (the CLI's
-    /// `mellonella enroll` output). Power-user path for parity with
-    /// the CLI workflow.
-    pub fn load_enrollment_json(&mut self, path: &Path) {
+    /// Auto-load the persistent enrollment from
+    /// `default_enrollment_path()` on launch. The enrollment pool is
+    /// otherwise managed entirely in-memory: mic recording builds it,
+    /// auto-learn updates it during a live session, and
+    /// [`Self::persist_enrollment_to_default_path`] writes it back.
+    fn load_enrollment_json(&mut self, path: &Path) {
         match EmbeddingPool::load(path, EmbeddingPoolConfig::default()) {
-            Ok(pool) => self.store_pool(pool, EnrollmentOrigin::Json(path.to_path_buf())),
+            Ok(pool) => self.store_pool(pool, EnrollmentOrigin::AutoLoaded(path.to_path_buf())),
             Err(e) => {
                 self.clear_pool();
                 self.last_error = Some(format!("load enrollment: {e}"));
-            }
-        }
-    }
-
-    /// Save the current enrollment to JSON so it can be re-used
-    /// from the CLI or a future session.
-    pub fn save_enrollment_json(&mut self, path: &Path) {
-        let Some(pool) = self.pool.as_ref() else {
-            self.last_error = Some("nothing to save — enrol a voice first".into());
-            return;
-        };
-        match pool.save(path) {
-            Ok(()) => {
-                self.last_error = None;
-            }
-            Err(e) => {
-                self.last_error = Some(format!("save enrollment: {e}"));
-            }
-        }
-    }
-
-    /// Read a clean voice recording from `path` (16-bit signed mono
-    /// WAV at any sample rate; resampled to 48 kHz internally so the
-    /// optional DFN3 pre-pass can run at its native rate), then route
-    /// through `run_enrollment`.
-    pub fn enroll_from_wav(&mut self, path: &Path) {
-        match read_wav_to_48k_mono(path) {
-            Ok(audio) => self.run_enrollment(&audio, EnrollmentOrigin::Wav(path.to_path_buf())),
-            Err(e) => {
-                self.clear_pool();
-                self.last_error = Some(format!("read WAV: {e}"));
             }
         }
     }
@@ -456,7 +397,6 @@ impl AppState {
         if self.tse_onnx_path.is_none() {
             if let Ok(p) = mellonella_core::hf_fetch::ensure_tse_prod_48k_onnx(|_, _, _| {}) {
                 self.tse_onnx_path = Some(p);
-                self.tse_variant = TseVariant::Prod48k;
             }
         }
         if let Some(onnx) = self.tse_onnx_path.as_ref() {
@@ -464,10 +404,7 @@ impl AppState {
                 self.last_error = Some(format!("TSE ONNX path does not exist: {}", onnx.display()));
                 return;
             }
-            pipeline_cfg.tse = Some(match self.tse_variant {
-                TseVariant::Poc16k => TseStageConfig::new(onnx.clone()),
-                TseVariant::Prod48k => TseStageConfig::new_prod_48k(onnx.clone()),
-            });
+            pipeline_cfg.tse = Some(TseStageConfig::new_prod_48k(onnx.clone()));
         }
         let cfg = SessionConfig {
             input_device: self.selected_input.clone(),
@@ -569,7 +506,6 @@ impl AppState {
         match mellonella_core::hf_fetch::fetch_tse_prod_48k(|_, _, _| {}) {
             Ok(path) => {
                 self.tse_onnx_path = Some(path);
-                self.tse_variant = TseVariant::Prod48k;
                 self.last_error = None;
             }
             Err(e) => {
@@ -599,34 +535,6 @@ impl AppState {
     }
 }
 
-/// Decode a 16-bit signed mono WAV at any common rate into f32
-/// samples at 48 kHz mono — the rate the enrollment pipeline
-/// operates at (DFN3 is native here, and we resample down to 16 kHz
-/// before ECAPA inside `run_enrollment`).
-fn read_wav_to_48k_mono(path: &Path) -> Result<Vec<f32>, String> {
-    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
-    let spec = reader.spec();
-    if spec.channels != 1 {
-        return Err(format!("expected mono, got {} channels", spec.channels));
-    }
-    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
-        return Err(format!(
-            "expected 16-bit signed int, got {:?} {}-bit",
-            spec.sample_format, spec.bits_per_sample
-        ));
-    }
-    let scale = 1.0_f32 / f32::from(i16::MAX);
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| f32::from(v) * scale))
-        .collect::<Result<Vec<f32>, _>>()
-        .map_err(|e| e.to_string())?;
-    if spec.sample_rate == OUTPUT_SAMPLE_RATE {
-        return Ok(samples);
-    }
-    resample_to(&samples, spec.sample_rate, OUTPUT_SAMPLE_RATE).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,16 +560,6 @@ mod tests {
         assert!(s.last_error.is_some(), "expected an error to be recorded");
         assert!(s.pool.is_none());
         assert!(matches!(s.origin, EnrollmentOrigin::None));
-        assert!(s.pool.is_none());
-    }
-
-    #[test]
-    fn enroll_from_missing_wav_records_an_error() {
-        let mut s = AppState::default();
-        s.enroll_from_wav(std::path::Path::new(
-            "/no/such/audio-mellonella-gui-test.wav",
-        ));
-        assert!(s.last_error.is_some());
         assert!(s.pool.is_none());
     }
 

@@ -108,9 +108,8 @@ impl MellonellaApp {
         ui.horizontal(|ui| {
             let origin_short = match &self.state.origin {
                 EnrollmentOrigin::None => "voice".to_string(),
-                EnrollmentOrigin::Wav(_) => "voice (from WAV)".to_string(),
                 EnrollmentOrigin::Mic { secs } => format!("voice ({secs}s recording)"),
-                EnrollmentOrigin::Json(_) => "voice (from JSON)".to_string(),
+                EnrollmentOrigin::AutoLoaded(_) => "voice (auto-loaded)".to_string(),
             };
             ui.label(
                 egui::RichText::new(format!("● Profile: {origin_short}"))
@@ -227,54 +226,6 @@ impl MellonellaApp {
             );
             if ui.button("Cancel").clicked() {
                 self.state.cancel_recording();
-            }
-        });
-    }
-
-    /// Power-user enrollment IO buttons — From WAV, Load JSON, Save
-    /// JSON. Hidden from the main page (those buttons are noise for
-    /// the common case where the user just records once via the
-    /// first-run wizard) and surfaced here for CLI interop.
-    fn render_enrollment_power_user_actions(&mut self, ui: &mut egui::Ui) {
-        let busy = self.state.is_running() || self.state.is_recording();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!busy, egui::Button::new("Enroll from WAV…"))
-                .on_hover_text("Pick a clean voice WAV (16-bit signed mono, any rate).")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("WAV audio", &["wav"])
-                    .pick_file()
-                {
-                    self.state.enroll_from_wav(&path);
-                }
-            }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Load JSON…"))
-                .on_hover_text("Load a pre-computed enrollment.json from the CLI.")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Enrollment JSON", &["json"])
-                    .pick_file()
-                {
-                    self.state.load_enrollment_json(&path);
-                }
-            }
-            let has_pool = self.state.pool.is_some();
-            if ui
-                .add_enabled(!busy && has_pool, egui::Button::new("Save JSON…"))
-                .on_hover_text("Export the current profile (in addition to the auto-save).")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Enrollment JSON", &["json"])
-                    .set_file_name("enrollment.json")
-                    .save_file()
-                {
-                    self.state.save_enrollment_json(&path);
-                }
             }
         });
     }
@@ -408,12 +359,6 @@ impl MellonellaApp {
                          reads its config when the session starts.",
                     );
                 }
-                ui.label(egui::RichText::new("Enrollment IO").strong());
-                ui.weak(
-                    "Mellonella auto-saves the profile to ~/.config/mellonella/enrollment.json. \
-                     These buttons exist for CLI interop / advanced flows.",
-                );
-                self.render_enrollment_power_user_actions(ui);
                 {
                     ui.separator();
                     ui.label(egui::RichText::new("Stage C — Target Speaker Extraction").strong());
@@ -451,20 +396,6 @@ impl MellonellaApp {
                         {
                             self.state.tse_onnx_path = None;
                         }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Model variant:");
-                        let current = self.state.tse_variant;
-                        egui::ComboBox::from_id_salt("tse_variant_combo")
-                            .selected_text(current.label())
-                            .show_ui(ui, |ui| {
-                                for v in [
-                                    crate::state::TseVariant::Prod48k,
-                                    crate::state::TseVariant::Poc16k,
-                                ] {
-                                    ui.selectable_value(&mut self.state.tse_variant, v, v.label());
-                                }
-                            });
                     });
                     ui.label(
                         egui::RichText::new(
