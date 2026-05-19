@@ -5,12 +5,23 @@ Runs a small fixed test set (clean target / target+noise / target+interferer
 and scores the input mixture and the extracted output with DNSMOS P.835
 (SIG / BAK / OVRL) and P.808.
 
-Purpose: a regression gate for the cross-corpus generalisation of the
-Stage C TSE. The HF model card reports +9.90 dB SI-SDR on its VCTK + DEMAND
-validation; this runner measures the same model on a different corpus
-(LibriTTS-R or any user-supplied 48 kHz mono WAV pairs) so that
-:doc:`docs/decisions.md` D-014's "scenario-level evaluation" trigger has a
-concrete data point.
+This module ships **two** baseline JSONs side by side; they answer
+different questions:
+
+* ``tse_dnsmos_in_distribution_v3.json`` — the **performance benchmark**.
+  VCTK held-out speakers + DEMAND noise + 1-second segments — i.e. the
+  same distribution the model was trained on, only with held-out
+  speakers. v3 epoch-49 EMA weights show Δ_SI-SDR of +2 to +4 dB on the
+  three interfering scenarios. Use this number to gate "is the model
+  still doing its job".
+* ``tse_dnsmos_cross_corpus_2026_05_19.json`` — a **drift sentinel**.
+  LibriTTS-R speech + synthetic pink noise — both outside the training
+  distribution. The expected Δ is *negative*; this exists so we notice
+  if a future model release silently regresses on the same OOD probe.
+  Do NOT read this as a quality metric — pink noise is a synthetic
+  stationary signal that simpler filters (spectral subtraction, Wiener)
+  already handle, so a TSE model under-performing here is expected and
+  not a defect.
 
 Inputs
 ------

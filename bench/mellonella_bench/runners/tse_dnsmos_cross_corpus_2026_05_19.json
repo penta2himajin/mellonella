@@ -1,5 +1,7 @@
 {
+  "purpose": "DRIFT SENTINEL \u2014 NOT a performance benchmark. This fixture mixes the target with **synthetic pink noise** (1/f spectrum), which is outside the model's training distribution (DEMAND real environmental noise). The expected \u0394_OVRL is therefore negative; this file exists so we can detect REGRESSIONS over time (the numbers should stay roughly stable, not improve), not to measure model quality. For the actual performance benchmark see tse_dnsmos_in_distribution_v3.json.",
   "note": "Fixture captured 2026-05-19 using LibriTTS-R dev-clean 24kHz upsampled to 48kHz (speakers 84/2035), pink noise. Records the cross-corpus generalisation gap discussed in docs/decisions.md D-014 \u00a7Future revisit triggers.",
+  "note_2026_05_19_v2": "When this fixture was captured the released HF model was the v1 export \u2014 which (per PR #151) had a `torch.compile` interaction that left EMA at random init, so the ONNX shipped was effectively a randomly-initialised network. The numbers below therefore reflect a degenerate model on an OOD test set; the same fixture re-run against the v3 release would land at different (less-bad) values. Either way the file's purpose is drift detection, not absolute quality.",
   "tse_onnx": "penta2himajin/tse-conv-tasnet-48k @ tse_prod_48k.onnx (epoch 45, SI-SDR 9.90 on VCTK+DEMAND val per metrics.json)",
   "ecapa": "speechbrain/spkrec-ecapa-voxceleb",
   "dnsmos": "microsoft/DNS-Challenge sig_bak_ovr.onnx + model_v8.onnx (non-personalised)",
