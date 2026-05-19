@@ -752,8 +752,7 @@ mod tests {
             return;
         };
         assert!(
-            p.ends_with("mellonella/enrollment.json")
-                || p.ends_with("mellonella\\enrollment.json"),
+            p.ends_with("mellonella/enrollment.json") || p.ends_with("mellonella\\enrollment.json"),
             "unexpected suffix: {}",
             p.display()
         );
