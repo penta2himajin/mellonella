@@ -237,6 +237,41 @@ pub struct StreamingConfig {
     /// real plosive is much worse than the soft-saturation it
     /// replaces.
     pub chain_soft_clip: bool,
+    /// **Phase 2.** When `true` and the chain is in
+    /// [`crate::streaming::ChainMode::Overlap`], the TSE-only output
+    /// chunk is rescaled so its RMS matches the corresponding raw-
+    /// input chunk's RMS (Asteroid's canonical Conv-TasNet rescale).
+    /// This is empirically a much better fix for the ~10 dB
+    /// Conv-TasNet loss than a static gain — separator outputs are
+    /// scale-arbitrary, so a fixed offset over-amplifies quiet
+    /// stretches and under-amplifies loud ones.
+    ///
+    /// Solo mode ignores this flag and uses
+    /// [`Self::makeup_gain_db_solo`] (DFN3's loss is fairly
+    /// uniform, so a static offset is fine there).
+    ///
+    /// Default `true`. Set `false` to fall back to
+    /// [`Self::makeup_gain_db_overlap`].
+    pub overlap_rms_match: bool,
+    /// Hard cap on the RMS-match scale factor expressed in dB. The
+    /// raw ratio `in_rms / out_rms` can blow up during stretches
+    /// where TSE attenuates aggressively (e.g. a target-speaker
+    /// pause in the middle of an overlap) — clamping keeps a
+    /// silent TSE chunk from getting boosted into pure noise.
+    ///
+    /// Default `+20 dB` (10× linear). The soft-clip after the
+    /// match catches the rare case where this isn't enough.
+    pub overlap_rms_match_max_gain_db: f32,
+    /// **Phase 2.** Wet / dry mix applied while in Overlap mode:
+    /// `out = α · clean + (1 − α) · raw`. Adds a small amount of
+    /// the original mixture back into the TSE output to mask
+    /// Conv-TasNet's frame-to-frame mask artefacts (the warble
+    /// the user reported). Industry survey of commercial
+    /// separators converges on values in the 0.85-0.9 range.
+    ///
+    /// Default `0.9` — overwhelmingly clean, just enough raw to
+    /// fill in the spectral cracks. Set `1.0` to disable.
+    pub overlap_wet_dry_alpha: f32,
 }
 
 impl Default for StreamingConfig {
@@ -254,6 +289,9 @@ impl Default for StreamingConfig {
             makeup_gain_db_solo: 5.0,
             makeup_gain_db_overlap: 0.0,
             chain_soft_clip: true,
+            overlap_rms_match: true,
+            overlap_rms_match_max_gain_db: 20.0,
+            overlap_wet_dry_alpha: 0.9,
         }
     }
 }
@@ -784,6 +822,12 @@ pub(crate) struct StreamingState {
     /// Empty (and unused) when both `tse_stage` and `dfn3_stream` are
     /// `None`.
     chain_pending_gain: VecDeque<f32>,
+    /// **Phase 2.** Raw (pre-chain, pre-dither) audio samples queued
+    /// in lockstep with `chain_pending_gain`. Drained sample-by-
+    /// sample alongside the chain output so the Overlap wet / dry
+    /// mix can pull a time-aligned raw sample for each cleaned
+    /// sample. Unused (always empty) in Solo mode.
+    chain_pending_raw: VecDeque<f32>,
     /// Optional pyannote-3.0 segmentation detector. Present when
     /// [`StreamingConfig::overlap_onnx_path`] resolves and both TSE
     /// and DFN3 are also configured (the toggle has no effect
@@ -1369,6 +1413,7 @@ impl StreamingState {
             tse_stage: None,
             dfn3_stream: None,
             chain_pending_gain: VecDeque::new(),
+            chain_pending_raw: VecDeque::new(),
             overlap_detector: None,
             chain_mode: ChainMode::Solo,
             overlap_above_ms: 0.0,
@@ -1441,6 +1486,7 @@ impl StreamingState {
             stream.reset();
         }
         self.chain_pending_gain.clear();
+        self.chain_pending_raw.clear();
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -1573,6 +1619,7 @@ impl StreamingState {
     /// passed in by `&mut` (rather than reached through
     /// `PipelineComponents`) because in async mode the rest of the
     /// components live in a worker thread.
+    #[allow(clippy::cast_precision_loss)]
     pub(crate) fn step_one_frame_core(
         &mut self,
         audio_chunk: &[f32],
@@ -1799,6 +1846,13 @@ impl StreamingState {
             // conv lookahead), so we queue per-sample gains and pop
             // them as the chain's **last active stage** emits.
             self.chain_pending_gain.extend(gain.iter().copied());
+            // Phase 2: queue the pre-dither, pre-chain audio so the
+            // Overlap-mode wet / dry mix can read a time-aligned raw
+            // sample for every cleaned sample the chain emits. Solo
+            // mode never consumes from this queue, but pushing
+            // unconditionally keeps the bookkeeping simple — the
+            // queue is cleared on every Solo ↔ Overlap transition.
+            self.chain_pending_raw.extend(audio_chunk.iter().copied());
             log_first_nan("chain input audio_chunk", audio_chunk);
             log_first_nan("chain input gain", &gain);
             if let Some(stage) = self.tse_stage.as_ref() {
@@ -1849,40 +1903,76 @@ impl StreamingState {
                 after_tse
             };
             log_first_nan("after DFN3", &after_dfn3);
-            // Mode-aware static makeup gain. DFN3-only attenuates real
-            // speech by ~4-6 dB RMS and TSE-only by ~10 dB; gate-off
-            // frames stay silent regardless because the gain multiply
-            // below sets them to zero. This mirrors the universal
-            // "NS → AGC" pattern in Krisp / Teams / Zoom — static
-            // (not AGC) so a residual-noise burst during a quiet
-            // section doesn't get pumped up. Phase 2 will replace
-            // the Overlap static gain with input-RMS matching
-            // (Asteroid's canonical Conv-TasNet fix).
-            let makeup_db = match self.chain_mode {
-                ChainMode::Solo => config.makeup_gain_db_solo,
-                ChainMode::Overlap => config.makeup_gain_db_overlap,
-            };
-            let makeup_lin = if makeup_db == 0.0 {
+            // Mode-aware level recovery. The universal NS → makeup
+            // pattern (Krisp / Teams / Zoom) — applied **before**
+            // the envelope multiply so gate-off frames stay silent.
+            //
+            // Solo (DFN3-only): static dB gain. DFN3's attenuation
+            // is fairly uniform across speech levels so a fixed
+            // offset is appropriate.
+            //
+            // Overlap (TSE-only): RMS-match to the raw input over
+            // this emit chunk (Asteroid's canonical Conv-TasNet
+            // rescale). Conv-TasNet outputs are scale-arbitrary so
+            // a static gain over-amplifies quiet stretches and
+            // under-amplifies loud ones. The match ratio is
+            // clamped to `overlap_rms_match_max_gain_db` so a
+            // silent TSE chunk doesn't get boosted into pure
+            // noise. Followed by a wet / dry mix that re-injects a
+            // small amount of raw audio to mask Conv-TasNet's
+            // frame-to-frame mask artefacts.
+            let soft_clip_enabled = config.chain_soft_clip;
+            let makeup_solo_lin = if config.makeup_gain_db_solo == 0.0 {
                 1.0
             } else {
-                10.0_f32.powf(makeup_db / 20.0)
+                10.0_f32.powf(config.makeup_gain_db_solo / 20.0)
             };
-            let soft_clip_enabled = config.chain_soft_clip;
+            let makeup_overlap_static_lin = if config.makeup_gain_db_overlap == 0.0 {
+                1.0
+            } else {
+                10.0_f32.powf(config.makeup_gain_db_overlap / 20.0)
+            };
+            let rms_match_lin = if self.chain_mode == ChainMode::Overlap
+                && config.overlap_rms_match
+                && !after_dfn3.is_empty()
+            {
+                let n = after_dfn3.len();
+                let in_sum_sq: f32 = self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
+                let in_rms = (in_sum_sq / n.max(1) as f32).sqrt();
+                let out_sum_sq: f32 = after_dfn3.iter().map(|s| s * s).sum();
+                let out_rms = (out_sum_sq / n.max(1) as f32).sqrt();
+                let raw_ratio = in_rms.max(1e-9) / out_rms.max(1e-9);
+                let max_lin = 10.0_f32.powf(config.overlap_rms_match_max_gain_db / 20.0);
+                raw_ratio.min(max_lin)
+            } else {
+                1.0
+            };
+            let alpha = config.overlap_wet_dry_alpha.clamp(0.0, 1.0);
+
             for &x in &after_dfn3 {
                 let g = self
                     .chain_pending_gain
                     .pop_front()
                     .expect("chain_pending_gain length matches chain input cumulative length");
-                let amplified = x * makeup_lin;
-                // tanh soft-saturates peaks that the makeup gain
-                // pushed past full-scale, while leaving smaller
-                // values byte-identical. Cheaper than a true-peak
-                // limiter (Phase 3) and catches the same plosive
-                // clip case.
-                let limited = if soft_clip_enabled {
-                    amplified.tanh()
+                let raw = self
+                    .chain_pending_raw
+                    .pop_front()
+                    .expect("chain_pending_raw length matches chain input cumulative length");
+                let chain_processed = match self.chain_mode {
+                    ChainMode::Solo => x * makeup_solo_lin,
+                    ChainMode::Overlap => x * rms_match_lin * makeup_overlap_static_lin,
+                };
+                // Wet / dry mix: identity in Solo (alpha is bypassed),
+                // configured value in Overlap.
+                let mixed = if self.chain_mode == ChainMode::Overlap && alpha < 1.0 {
+                    alpha * chain_processed + (1.0 - alpha) * raw
                 } else {
-                    amplified
+                    chain_processed
+                };
+                let limited = if soft_clip_enabled {
+                    mixed.tanh()
+                } else {
+                    mixed
                 };
                 let sample = limited * g;
                 // Belt-and-braces: replace any non-finite value
@@ -1960,6 +2050,7 @@ impl StreamingState {
                 // active path starts fresh; drop pending gains held
                 // behind the now-bypassed stage.
                 self.chain_pending_gain.clear();
+                self.chain_pending_raw.clear();
                 if let Some(t) = self.tse_stage.as_mut() {
                     t.reset();
                 }
@@ -2216,6 +2307,7 @@ impl StreamingState {
             out.audio.push(x * g);
         }
         self.chain_pending_gain.clear();
+        self.chain_pending_raw.clear();
         out.tse_applied = self.tse_stage.is_some();
         Ok(())
     }
