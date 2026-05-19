@@ -306,6 +306,49 @@ pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral:
     last_score + weight * (fm_fast - neutral)
 }
 
+/// One-shot NaN diagnostic — logs the first time `samples` contains a
+/// NaN under the given label, then suppresses further reports. The
+/// suppression is per `(label, kind)` pair (kind ∈ {NaN, Inf}) so each
+/// diagnostic site reports independently.
+fn log_first_nan(label: &'static str, samples: &[f32]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashSet<(&'static str, &'static str)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let (nan_idx, inf_idx) =
+        samples
+            .iter()
+            .enumerate()
+            .fold((None::<usize>, None::<usize>), |(n, i), (idx, x)| {
+                (
+                    n.or_else(|| x.is_nan().then_some(idx)),
+                    i.or_else(|| (!x.is_finite() && !x.is_nan()).then_some(idx)),
+                )
+            });
+    if let Some(idx) = nan_idx {
+        if let Ok(mut guard) = seen.lock() {
+            if guard.insert((label, "nan")) {
+                eprintln!(
+                    "[diag] first NaN in `{label}` at index {idx} / {len} samples",
+                    len = samples.len(),
+                );
+            }
+        }
+    }
+    if let Some(idx) = inf_idx {
+        if let Ok(mut guard) = seen.lock() {
+            if guard.insert((label, "inf")) {
+                eprintln!(
+                    "[diag] first Inf in `{label}` at index {idx} / {len} samples (value {val})",
+                    len = samples.len(),
+                    val = samples[idx],
+                );
+            }
+        }
+    }
+}
+
 /// **Stage B, Part 2** — adaptive-window lifecycle state.
 ///
 /// * `Steady`   — long window, normal cadence (the only reachable
@@ -1624,16 +1667,23 @@ impl StreamingState {
             // `out.audio` lags by the chain's accumulated buffering
             // until [`Self::flush`] drains the tail.
             self.chain_pending_gain.extend(gain.iter().copied());
+            log_first_nan("chain input audio_chunk", audio_chunk);
+            log_first_nan("chain input gain", &gain);
+            if let Some(stage) = self.tse_stage.as_ref() {
+                log_first_nan("chain input cond_embedding", stage.cond_embedding());
+            }
             let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
                 stage.process(audio_chunk).map_err(PipelineError::from)?
             } else {
                 audio_chunk.to_vec()
             };
+            log_first_nan("after TSE", &after_tse);
             let after_dfn3: Vec<f32> = if let Some(stream) = self.dfn3_stream.as_mut() {
                 stream.push_samples(&after_tse)?
             } else {
                 after_tse
             };
+            log_first_nan("after DFN3", &after_dfn3);
             for &x in &after_dfn3 {
                 let g = self
                     .chain_pending_gain
