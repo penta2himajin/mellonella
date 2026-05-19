@@ -1,0 +1,80 @@
+{
+  "note": "Fixture captured 2026-05-19 using LibriTTS-R dev-clean 24kHz upsampled to 48kHz (speakers 84/2035), pink noise. Records the cross-corpus generalisation gap discussed in docs/decisions.md D-014 \u00a7Future revisit triggers.",
+  "tse_onnx": "penta2himajin/tse-conv-tasnet-48k @ tse_prod_48k.onnx (epoch 45, SI-SDR 9.90 on VCTK+DEMAND val per metrics.json)",
+  "ecapa": "speechbrain/spkrec-ecapa-voxceleb",
+  "dnsmos": "microsoft/DNS-Challenge sig_bak_ovr.onnx + model_v8.onnx (non-personalised)",
+  "summary": {
+    "A_clean": {
+      "input": {
+        "SIG": 3.525967916694573,
+        "BAK": 4.01245582639857,
+        "OVRL": 3.2222285771786496,
+        "P808": 3.7417758852243423
+      },
+      "tse": {
+        "SIG": 1.9630156454454475,
+        "BAK": 2.133869350961114,
+        "OVRL": 1.604937558030584,
+        "P808": 2.2214578439792
+      },
+      "delta_OVRL": -1.617291019148066,
+      "si_sdr_input": 159.90219216564105,
+      "si_sdr_tse": -45.09609596322853,
+      "delta_si_sdr": -204.99828812886955
+    },
+    "B_t_noise_10dB": {
+      "input": {
+        "SIG": 3.314868656864029,
+        "BAK": 1.7402236582577864,
+        "OVRL": 1.9456715399691429,
+        "P808": 2.485480971634388
+      },
+      "tse": {
+        "SIG": 1.2175959435635786,
+        "BAK": 1.1078864455227018,
+        "OVRL": 1.1533219102408867,
+        "P808": 2.3480217133959136
+      },
+      "delta_OVRL": -0.7923496297282562,
+      "si_sdr_input": 9.992123654372135,
+      "si_sdr_tse": -43.96795713791215,
+      "delta_si_sdr": -53.96008079228429
+    },
+    "C_t_inter_0dB": {
+      "input": {
+        "SIG": 3.414651636767195,
+        "BAK": 2.327412726096821,
+        "OVRL": 2.2959624017823996,
+        "P808": 3.558426092068354
+      },
+      "tse": {
+        "SIG": 1.2205502381006614,
+        "BAK": 1.3392453889943077,
+        "OVRL": 1.1323114047904639,
+        "P808": 2.3393419608473778
+      },
+      "delta_OVRL": -1.1636509969919353,
+      "si_sdr_input": -0.016397777219995333,
+      "si_sdr_tse": -46.56050762753267,
+      "delta_si_sdr": -46.54410985031268
+    },
+    "D_t_inter_n_5dB": {
+      "input": {
+        "SIG": 2.8365751061565248,
+        "BAK": 1.376024541437719,
+        "OVRL": 1.5375161957213233,
+        "P808": 2.184062292178472
+      },
+      "tse": {
+        "SIG": 1.188920248989001,
+        "BAK": 1.1509482921949536,
+        "OVRL": 1.096662066208883,
+        "P808": 2.2005417570471764
+      },
+      "delta_OVRL": -0.4408541295124402,
+      "si_sdr_input": 1.9675791761488184,
+      "si_sdr_tse": -44.05089540706682,
+      "delta_si_sdr": -46.018474583215635
+    }
+  }
+}
