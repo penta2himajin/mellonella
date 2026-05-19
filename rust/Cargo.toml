@@ -5,6 +5,7 @@ members = [
     "mellonella-cli",
     "mellonella-audio-io",
     "mellonella-gui",
+    "mellonella-ladspa",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ tray-icon = "0.22"
 rfd = "0.15"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 dirs = "5"
+tympan-ladspa = "0.1"
 
 [profile.release]
 lto = "fat"
