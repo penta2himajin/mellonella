@@ -94,15 +94,16 @@ impl MellonellaApp {
         }
     }
 
-    /// Compact "● Profile loaded" indicator + Re-enroll / Test
-    /// buttons. The power-user "From WAV / Load / Save JSON" buttons
-    /// live in the Settings panel; the main UI exposes only the
-    /// actions the user would actually want from here.
+    /// Compact "● Profile loaded" indicator + Re-enroll + Test voice
+    /// (live monitor toggle) buttons. The power-user "From WAV / Load
+    /// / Save JSON" buttons live in the Settings panel; the main UI
+    /// exposes only the actions the user would actually want from
+    /// here.
     ///
-    /// "Test voice" records a short sample and scores it against the
-    /// loaded pool so the user can confirm "would my voice be
-    /// recognised right now" without having to listen to the live
-    /// session's gate behaviour.
+    /// **Test voice** toggles a `LiveSession` that loops the mic
+    /// straight through the gate to the selected output device — the
+    /// most direct way to confirm "is my voice being recognised right
+    /// now and reaching the speaker". Clicking again stops it.
     fn render_profile_pill(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let origin_short = match &self.state.origin {
@@ -124,51 +125,38 @@ impl MellonellaApp {
             }
             // Re-enroll / Test buttons live at the right-hand edge.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let busy = self.state.is_recording();
+                let recording = self.state.is_recording();
+                let running = self.state.is_running();
                 let record_secs = self.state.record_duration_secs;
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Re-enroll"))
+                    .add_enabled(!recording && !running, egui::Button::new("Re-enroll"))
                     .on_hover_text("Replace the saved profile with a new mic recording.")
                     .clicked()
                 {
                     self.state.start_recording(record_secs);
                 }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Test voice"))
-                    .on_hover_text(
-                        "Record a short sample and score it against the loaded profile, \
-                         so you can see whether your current voice would clear the gate.",
+                let (label, hover) = if running {
+                    ("■ Stop test", "Stop the live monitor loopback.")
+                } else {
+                    (
+                        "▶ Test voice",
+                        "Start a live monitor: mic → gate → speaker, so you can hear \
+                         your voice through the filter as if you were on a call. \
+                         Click again to stop.",
                     )
+                };
+                if ui
+                    .add_enabled(!recording, egui::Button::new(label))
+                    .on_hover_text(hover)
                     .clicked()
                 {
-                    self.state.start_test_recording(record_secs);
+                    if running {
+                        self.state.stop();
+                    } else {
+                        self.state.start();
+                    }
                 }
             });
-        });
-        if let Some(result) = self.state.test_result {
-            Self::render_test_result(ui, &result);
-        }
-    }
-
-    fn render_test_result(ui: &mut egui::Ui, result: &crate::state::TestResult) {
-        let (verdict, colour) = if result.would_pass {
-            ("● would pass gate", egui::Color32::from_rgb(80, 200, 120))
-        } else {
-            (
-                "○ would not pass gate",
-                egui::Color32::from_rgb(220, 120, 80),
-            )
-        };
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(verdict).color(colour));
-            ui.weak(format!(
-                "· score {:.2} (θ {:.2})",
-                result.match_score, result.theta_pass
-            ));
-            if result.f0_mu > 0.0 {
-                ui.weak(format!("· F0 μ ≈ {:.0} Hz", result.f0_mu));
-            }
-            ui.weak(format!("· vs {} anchors", result.anchors_checked));
         });
     }
 
@@ -346,11 +334,9 @@ impl MellonellaApp {
     }
 
     /// Capability indicators: which optional ONNX backends are wired
-    /// up (DFN3 NS / TSE). The session itself auto-starts as soon as
-    /// the enrollment + ONNX models resolve (see
-    /// [`Self::maybe_auto_start`]), so this row has no manual control
-    /// — the meters below convey "is audio flowing" and the gate
-    /// light conveys "is the speaker recognised right now".
+    /// up (DFN3 NS / TSE). The Test voice button on the profile pill
+    /// is the only way to start / stop the live monitor, so this row
+    /// is informational only.
     fn render_run_controls(&mut self, ui: &mut egui::Ui) {
         let dfn3_available = self.state.dfn3_available();
         let tse_available = self.state.tse_available();
@@ -367,24 +353,6 @@ impl MellonellaApp {
                 "○ target-speaker extraction (pick ONNX in Settings)"
             });
         });
-    }
-
-    /// Auto-start a session on the first frame where conditions allow
-    /// it. Called from [`eframe::App::update`] before rendering so the
-    /// UI sees the running state immediately. Honours `user_paused` —
-    /// a manual Pause click stays paused until the user clicks Resume.
-    /// On construction failure (missing ONNX env var, etc.) flips
-    /// `user_paused` so the loop doesn't spam the failure on every
-    /// frame; the user can investigate the error and click Resume to
-    /// retry once it's fixed.
-    fn maybe_auto_start(&mut self) {
-        if self.state.user_paused || self.state.is_running() || !self.state.can_start() {
-            return;
-        }
-        self.state.start();
-        if self.state.last_error.is_some() {
-            self.state.user_paused = true;
-        }
     }
 
     /// Step 18: live level meter + gate light. Renders two thin
@@ -434,15 +402,19 @@ impl MellonellaApp {
         egui::CollapsingHeader::new("Settings")
             .default_open(false)
             .show(ui, |ui| {
-                ui.add_enabled_ui(!running, |ui| {
-                    ui.label(egui::RichText::new("Enrollment IO").strong());
+                if running {
                     ui.weak(
-                        "Mellonella auto-saves the profile to ~/.config/mellonella/enrollment.json. \
-                         These buttons exist for CLI interop / advanced flows.",
+                        "Changes apply on the next Test-voice session — the engine \
+                         reads its config when the session starts.",
                     );
-                });
+                }
+                ui.label(egui::RichText::new("Enrollment IO").strong());
+                ui.weak(
+                    "Mellonella auto-saves the profile to ~/.config/mellonella/enrollment.json. \
+                     These buttons exist for CLI interop / advanced flows.",
+                );
                 self.render_enrollment_power_user_actions(ui);
-                ui.add_enabled_ui(!running, |ui| {
+                {
                     ui.separator();
                     ui.label(egui::RichText::new("Stage C — Target Speaker Extraction").strong());
                     ui.horizontal(|ui| {
@@ -501,7 +473,7 @@ impl MellonellaApp {
                         .small()
                         .color(egui::Color32::GRAY),
                     );
-                });
+                }
             });
     }
 
@@ -520,10 +492,6 @@ impl eframe::App for MellonellaApp {
         self.state.poll_session();
         self.state.poll_recorder();
         self.drain_tray_commands(ctx);
-        // Auto-start a session as soon as enrollment + models are
-        // ready and the user hasn't manually paused. Idempotent: the
-        // call is a no-op once a session is already running.
-        self.maybe_auto_start();
 
         // Step 17: minimise-to-tray. When the user clicks the
         // window's close button AND the tray is available,

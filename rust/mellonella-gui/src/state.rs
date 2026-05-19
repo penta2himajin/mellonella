@@ -51,39 +51,6 @@ pub enum EnrollmentOrigin {
     Json(PathBuf),
 }
 
-/// Distinguishes between the two reasons the GUI can run the mic
-/// `Recorder`: rebuilding the speaker pool (`Enroll`) or measuring how
-/// the loaded pool would respond to the current mic (`Test`). They
-/// share the same audio capture path because they're mutually
-/// exclusive — you can't be enrolling and verifying at the same time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RecordingMode {
-    #[default]
-    Enroll,
-    Test,
-}
-
-/// Outcome of a "Test voice" recording: the cosine match score against
-/// the currently-loaded pool, the gate threshold it would be compared
-/// to, and the resulting pass/fail decision. Surfaced inline next to
-/// the profile pill so the user can sanity-check their enrollment
-/// without having to start a live session.
-#[derive(Debug, Clone, Copy)]
-pub struct TestResult {
-    /// `pool.match_score(test_embedding)` — cosine against the
-    /// anchor centroid maxed with cosine against the adapted embedding.
-    pub match_score: f32,
-    /// Threshold used for the pass/fail decision (the legacy
-    /// `theta_pass`; we don't surface an AS-Norm variant in this UI).
-    pub theta_pass: f32,
-    /// `match_score >= theta_pass`.
-    pub would_pass: bool,
-    /// Mean f0 of the test recording's voiced frames.
-    pub f0_mu: f32,
-    /// Anchors the score was compared against (informational).
-    pub anchors_checked: usize,
-}
-
 /// TSE model variant — mirrors the CLI's `--tse-config` enum so the
 /// GUI's dropdown has the same options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,13 +93,6 @@ pub struct AppState {
     /// selection survives a device-list refresh.
     pub selected_input: Option<String>,
     pub selected_output: Option<String>,
-    /// Latch flipped by `maybe_auto_start` when a session-construction
-    /// attempt errors, so the failure doesn't loop on every frame.
-    /// `store_pool` clears it on the next successful enrollment / load
-    /// so the user only has to fix what was wrong (e.g. enroll, set
-    /// `MELLONELLA_DFN3_ONNX`) for the auto-start path to retry —
-    /// there's no Pause / Resume button to clear it manually any more.
-    pub user_paused: bool,
     /// Path to the TSE streaming ONNX (Stage C). Picked via a file
     /// dialog in the Settings panel; persisted in-memory only for this
     /// session.
@@ -159,14 +119,6 @@ pub struct AppState {
     pub pipeline_cfg: PipelineConfig,
     pub session: Option<LiveSession>,
     pub recorder: Option<Recorder>,
-    /// Distinguishes whether the active `recorder` is collecting audio
-    /// for an enrollment (`Enroll`) or a verification ("Test voice")
-    /// (`Test`). `poll_recorder` branches on this when the recorder
-    /// completes.
-    pub recording_mode: RecordingMode,
-    /// Latest "Test voice" outcome, shown inline next to the profile
-    /// pill. Cleared on the next test or by starting an enrollment.
-    pub test_result: Option<TestResult>,
     pub last_error: Option<String>,
     pub last_stats: LiveSessionStats,
 }
@@ -185,7 +137,6 @@ impl Default for AppState {
             available_outputs,
             selected_input: None,
             selected_output: None,
-            user_paused: false,
             tse_onnx_path: None,
             tse_variant: TseVariant::default(),
             record_duration_secs: DEFAULT_RECORD_SECS,
@@ -193,8 +144,6 @@ impl Default for AppState {
             pipeline_cfg: default_live_pipeline_cfg(),
             session: None,
             recorder: None,
-            recording_mode: RecordingMode::default(),
-            test_result: None,
             last_error: None,
             last_stats: LiveSessionStats::default(),
         };
@@ -318,15 +267,6 @@ impl AppState {
         self.origin = origin;
         self.pool = Some(pool);
         self.last_error = None;
-        // A successful enrollment / load is the natural moment to
-        // release the auto-start latch that `maybe_auto_start` flips
-        // on a previous failed start. Without the Pause/Resume button
-        // there's no other surface that clears it, so a stale latch
-        // would otherwise wedge the app in "never starts" mode after
-        // the user fixes whatever was wrong.
-        self.user_paused = false;
-        // A fresh pool invalidates any previous Test verdict.
-        self.test_result = None;
     }
 
     fn clear_pool(&mut self) {
@@ -387,34 +327,12 @@ impl AppState {
     /// the live ECAPA refresh path. Call `poll_recorder` once per
     /// frame to detect completion.
     pub fn start_recording(&mut self, secs: f32) {
-        self.start_recording_with_mode(secs, RecordingMode::Enroll);
-    }
-
-    /// Like [`Self::start_recording`] but the resulting audio is
-    /// scored against the currently-loaded pool instead of replacing
-    /// it. Surfaces the cosine score and a "would pass" verdict in
-    /// [`Self::test_result`]; no-op when no pool is loaded.
-    pub fn start_test_recording(&mut self, secs: f32) {
-        if self.pool.is_none() {
-            self.last_error = Some("test voice: enroll first".to_string());
-            return;
-        }
-        self.start_recording_with_mode(secs, RecordingMode::Test);
-    }
-
-    fn start_recording_with_mode(&mut self, secs: f32, mode: RecordingMode) {
         if self.recorder.is_some() {
             return;
-        }
-        if mode == RecordingMode::Test {
-            // Clear stale result so the UI doesn't show last
-            // session's verdict while the new recording is in flight.
-            self.test_result = None;
         }
         match Recorder::start(self.selected_input.clone(), OUTPUT_SAMPLE_RATE, secs) {
             Ok(r) => {
                 self.recorder = Some(r);
-                self.recording_mode = mode;
                 self.last_error = None;
             }
             Err(e) => self.last_error = Some(format!("start recording: {e}")),
@@ -430,11 +348,10 @@ impl AppState {
         }
     }
 
-    /// Poll the active recorder for completion. On success either
-    /// runs enrolment on the captured buffer (`RecordingMode::Enroll`)
-    /// or scores it against the loaded pool (`RecordingMode::Test`).
-    /// Returns silently when no recorder is active or it's still
-    /// capturing.
+    /// Poll the active recorder for completion. On success runs
+    /// enrolment on the captured buffer and stores the resulting
+    /// pool. Returns silently when no recorder is active or it's
+    /// still capturing.
     pub fn poll_recorder(&mut self) {
         let Some(recorder) = self.recorder.as_mut() else {
             return;
@@ -444,87 +361,18 @@ impl AppState {
         };
         // Recorder finished; pull it out and consume the result.
         let target_secs = recorder.target_seconds().round() as u32;
-        let mode = self.recording_mode;
         self.recorder = None;
-        self.recording_mode = RecordingMode::default();
         match result {
             Ok(audio) => {
                 if audio.len() < OUTPUT_SAMPLE_RATE as usize {
-                    let needed = match mode {
-                        RecordingMode::Enroll => "ECAPA enrolment",
-                        RecordingMode::Test => "voice test",
-                    };
                     self.last_error =
-                        Some(format!("recording too short for {needed} (need ≥ 1 s)"));
+                        Some("recording too short for ECAPA enrolment (need ≥ 1 s)".to_string());
                     return;
                 }
-                match mode {
-                    RecordingMode::Enroll => {
-                        self.run_enrollment(&audio, EnrollmentOrigin::Mic { secs: target_secs });
-                    }
-                    RecordingMode::Test => self.run_voice_test(&audio),
-                }
+                self.run_enrollment(&audio, EnrollmentOrigin::Mic { secs: target_secs });
             }
             Err(e) => self.last_error = Some(format!("recording failed: {e}")),
         }
-    }
-
-    /// Score 48 kHz mono audio against the loaded pool — same code
-    /// path as `run_enrollment` up to the ECAPA call, but instead of
-    /// replacing the pool we take the resulting centroid as a single
-    /// test embedding and compute `pool.match_score`. Mirrors what the
-    /// live streaming engine would do on each refresh while the user
-    /// speaks into the mic.
-    fn run_voice_test(&mut self, audio_48k: &[f32]) {
-        let Some(pool) = self.pool.clone() else {
-            self.last_error = Some("test voice: no pool loaded".to_string());
-            return;
-        };
-        let audio_16k = match resample_to(audio_48k, OUTPUT_SAMPLE_RATE, DECISION_SAMPLE_RATE) {
-            Ok(a) => a,
-            Err(e) => {
-                self.last_error = Some(format!("resample 48 kHz → 16 kHz for test: {e}"));
-                return;
-            }
-        };
-        let mut components = match Self::build_components() {
-            Ok(c) => c,
-            Err(e) => {
-                self.last_error = Some(e);
-                return;
-            }
-        };
-        // `enroll_from_recording` is overkill — it builds a multi-anchor
-        // pool. We only need the centroid embedding to score against the
-        // user's existing pool, so the throw-away pool's anchor_centroid
-        // is what the live refresh path would have produced for the
-        // same audio. Reusing the helper keeps the windowing /
-        // ECAPA-feature pipeline byte-identical to enrollment.
-        let probe_pool = match enroll_from_recording(
-            &audio_16k,
-            &mut components,
-            EmbeddingPoolConfig::default(),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                self.last_error = Some(format!("test voice: {e}"));
-                return;
-            }
-        };
-        let Some(centroid) = probe_pool.anchor_centroid() else {
-            self.last_error = Some("test voice: ECAPA produced no embedding".to_string());
-            return;
-        };
-        let match_score = pool.match_score(centroid);
-        let theta_pass = self.gate_cfg.theta_pass;
-        let f0_mu = probe_pool.metadata().f0_mu;
-        self.test_result = Some(TestResult {
-            match_score,
-            theta_pass,
-            would_pass: match_score >= theta_pass,
-            f0_mu,
-            anchors_checked: pool.anchors().len(),
-        });
     }
 
     /// Enroll from 48 kHz mono audio. Downsamples to 16 kHz and runs
@@ -693,11 +541,6 @@ impl AppState {
         self.recorder.is_some()
     }
 
-    #[must_use]
-    pub fn can_start(&self) -> bool {
-        self.pool.is_some() && self.session.is_none() && self.recorder.is_none()
-    }
-
     /// Whether DFN3 noise suppression is reachable in this process
     /// (env var set, file exists). Used by the status row to indicate
     /// "NS active" and by [`Self::estimated_latency_ms`] to factor in
@@ -797,7 +640,7 @@ mod tests {
         assert!(matches!(s.origin, EnrollmentOrigin::None));
         assert!(!s.is_running());
         assert!(!s.is_recording());
-        assert!(!s.can_start());
+        assert!(s.pool.is_none());
         assert!(s.last_error.is_none());
     }
 
@@ -810,7 +653,7 @@ mod tests {
         assert!(s.last_error.is_some(), "expected an error to be recorded");
         assert!(s.pool.is_none());
         assert!(matches!(s.origin, EnrollmentOrigin::None));
-        assert!(!s.can_start());
+        assert!(s.pool.is_none());
     }
 
     #[test]
@@ -839,15 +682,6 @@ mod tests {
             OUTPUT_SAMPLE_RATE,
             mellonella_audio_io::INTERNAL_SAMPLE_RATE,
             "OUTPUT_SAMPLE_RATE must match mellonella-audio-io's INTERNAL_SAMPLE_RATE",
-        );
-    }
-
-    #[test]
-    fn default_state_is_not_user_paused() {
-        let s = AppState::default();
-        assert!(
-            !s.user_paused,
-            "fresh state should auto-start once enrollment + models are ready"
         );
     }
 
