@@ -1,0 +1,19 @@
+[package]
+name = "mellonella-ladspa"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mellonella LADSPA plugin — target-speaker hard-gating + DeepFilterNet 3 noise suppression as a Linux audio-server filter"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mellonella-core = { path = "../mellonella-core" }
+tympan-ladspa = { workspace = true }
+dirs = { workspace = true }
+
+[lints]
+workspace = true

@@ -2338,6 +2338,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mellonella-ladspa"
+version = "0.0.0"
+dependencies = [
+ "dirs 5.0.1",
+ "mellonella-core",
+ "tympan-ladspa",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4122,6 +4131,12 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "tympan-ladspa"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a24268b0a97f2bfbf334acc77682ff275261bbb22b8132a4b6c369ed134e2610"
 
 [[package]]
 name = "type-map"
