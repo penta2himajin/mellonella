@@ -23,9 +23,17 @@
 //! A failed download leaves nothing in cache; the next call retries
 //! from scratch.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn has_onnx_extension(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+}
 
 /// Canonical TSE production model repo on HuggingFace.
 pub const TSE_PROD_48K_REPO: &str = "penta2himajin/tse-conv-tasnet-48k";
@@ -40,8 +48,9 @@ pub const TSE_PROD_48K_FILES: &[&str] = &["tse_prod_48k.onnx", "tse_prod_48k.onn
 pub enum FetchError {
     /// Cache directory couldn't be determined or created.
     Cache(io::Error),
-    /// Underlying HTTP transport failure.
-    Http(ureq::Error),
+    /// Underlying HTTP transport failure. Boxed because
+    /// `ureq::Error` is large (~272 B) and bloats the enum.
+    Http(Box<ureq::Error>),
     /// File write failure during download.
     Io(io::Error),
     /// Server returned a non-200 response.
@@ -71,7 +80,7 @@ impl std::error::Error for FetchError {
 
 impl From<ureq::Error> for FetchError {
     fn from(e: ureq::Error) -> Self {
-        Self::Http(e)
+        Self::Http(Box::new(e))
     }
 }
 
@@ -182,7 +191,7 @@ pub fn fetch_tse_prod_48k(
         let path = fetch_file(TSE_PROD_48K_REPO, file, |so_far, total| {
             progress(file, so_far, total);
         })?;
-        if file.ends_with(".onnx") {
+        if has_onnx_extension(file) {
             onnx_path = Some(path);
         }
     }
@@ -221,7 +230,7 @@ mod tests {
 
     #[test]
     fn tse_prod_48k_constants_are_consistent() {
-        assert!(TSE_PROD_48K_FILES.iter().any(|f| f.ends_with(".onnx")));
+        assert!(TSE_PROD_48K_FILES.iter().any(|f| has_onnx_extension(f)));
         assert!(TSE_PROD_48K_FILES.iter().any(|f| f.ends_with(".onnx.data")));
     }
 }
