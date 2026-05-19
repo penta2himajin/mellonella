@@ -1148,6 +1148,56 @@ prod TSE retrain lifts the check.
   is model-agnostic, so a swap is a checkpoint / retrain question, not
   a re-architecture.
 
+### Cross-corpus generalisation gap (2026-05-19 addendum)
+
+A first cross-corpus DNSMOS measurement of the published 48 kHz prod
+checkpoint (`penta2himajin/tse-conv-tasnet-48k`, epoch 45 with reported
++9.90 dB SI-SDR on its VCTK + DEMAND validation) was run against a
+LibriTTS-R dev-clean test set (4 target / 4 interferer utterances from
+speakers 84 and 2035, 24 kHz native resampled to 48 kHz; pink noise
+ambient) using DNSMOS P.835 + P.808 from the Microsoft DNS-Challenge
+ONNX models. Conditioning was a 192-dim ECAPA-TDNN
+(`speechbrain/spkrec-ecapa-voxceleb`) embedding computed from a 33-second
+target-speaker enrolment clip distinct from the test utterances.
+
+Results (mean of 4 utterances per scenario):
+
+| Scenario | input OVRL → tse OVRL | Δ OVRL | input SI-SDR → tse SI-SDR | Δ SI-SDR |
+|---|---|---|---|---|
+| A clean target | 3.22 → 1.60 | −1.62 | +∞ → −45.1 dB | −∞ |
+| B target + noise (SNR 10 dB) | 1.95 → 1.15 | −0.79 | +10.0 → −44.0 dB | −54.0 |
+| C target + interferer (SIR 0 dB) | 2.30 → 1.13 | −1.16 | −0.0 → −46.6 dB | −46.5 |
+| D target + interferer + noise (SIR/SNR 5 dB) | 1.54 → 1.10 | −0.44 | +2.0 → −44.0 dB | −46.0 |
+
+The 50+ dB SI-SDR collapse across every scenario, combined with
+near-zero cross-correlation between extracted output and clean target
+reference, indicates that the published checkpoint does not perform
+target-speaker extraction on this out-of-distribution corpus. Diagnostic
+probes ruled out the obvious culprits: PyTorch ↔ ONNX parity is intact
+(`tse_prod_48k.onnx.weights.pt` reproduces the ONNX output bit-for-bit),
+state initialisation matches the README spec (89 zero-initialised
+tensors), FiLM conditioning is live (different cond vectors produce
+measurably different outputs), and bandwidth augmentation (synthesising
+12–22 kHz content above the LibriTTS-R 12 kHz cutoff) does not change
+the result. The cumulative-LN epsilon (1e-8) does NaN on pure-silence
+chunks; the runner adds 1e-6 RMS dither (~−120 dBFS, inaudible) to side-
+step it without affecting the substantive findings.
+
+This addendum does not attribute a root cause — VCTK overfitting,
+training-time cond/utterance leakage, or an EMA-vs-raw weight-export
+mismatch (the `.weights.pt` sidecar carries only the `model` key, not
+the EMA shadow that `train.py` maintains when `--ema-decay > 0`) are all
+candidates and a separate diagnostic / retrain pass is needed.
+
+What it does change: the "48 kHz prod TSE lands" trigger above is **not
+yet satisfied** by the published checkpoint. Lifting the 16 kHz hard-
+rate check in `mellonella-core::tse` or flipping `PipelineConfig.tse`
+defaults towards "on" is on hold until a checkpoint passes cross-corpus
+scenario evaluation. The bench runner that produced these numbers is
+shipped as `bench/mellonella_bench/runners/run_tse_dnsmos.py`; the
+captured summary is preserved alongside it at
+`tse_dnsmos_cross_corpus_2026_05_19.json` as the regression baseline.
+
 ### References
 
 - D-001 (hard-gating chosen over off-the-shelf TSE — re-examined here)
