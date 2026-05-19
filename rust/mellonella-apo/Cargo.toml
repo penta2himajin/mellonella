@@ -1,0 +1,23 @@
+[package]
+name = "mellonella-apo"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mellonella Windows APO — target-speaker hard-gating + DeepFilterNet 3 NS exposed as a Windows Audio Processing Object"
+
+[lib]
+crate-type = ["cdylib"]
+
+# All real dependencies are Windows-only. On non-Windows targets this
+# crate compiles to an empty cdylib so `cargo check --workspace` keeps
+# working on Linux/macOS CI runners (tympan-apo itself follows the same
+# pattern — see its README).
+[target.'cfg(windows)'.dependencies]
+tympan-apo = { workspace = true }
+mellonella-core = { path = "../mellonella-core" }
+dirs = { workspace = true }
+
+[lints]
+workspace = true

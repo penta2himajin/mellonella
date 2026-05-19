@@ -6,6 +6,7 @@ members = [
     "mellonella-audio-io",
     "mellonella-gui",
     "mellonella-ladspa",
+    "mellonella-apo",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ rfd = "0.15"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 dirs = "5"
 tympan-ladspa = "0.1"
+tympan-apo = "0.1"
 
 [profile.release]
 lto = "fat"

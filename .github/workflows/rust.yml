@@ -67,3 +67,31 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace
+
+  windows-cross:
+    # mellonella-apo is cfg(windows)-only: on Linux it compiles to an
+    # empty cdylib, so the main `check` job above can't catch
+    # regressions in its plugin.rs. This job cross-compiles via
+    # mingw-w64 to keep the Windows code path honest.
+    name: cargo check (x86_64-pc-windows-gnu)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mingw-w64 (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: mingw-w64
+          version: 1.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: windows-cross
+      - name: cargo check -p mellonella-apo (windows-gnu)
+        run: cargo check -p mellonella-apo --target x86_64-pc-windows-gnu --all-targets
+      - name: cargo clippy -p mellonella-apo (windows-gnu)
+        run: cargo clippy -p mellonella-apo --target x86_64-pc-windows-gnu --all-targets -- -D warnings
