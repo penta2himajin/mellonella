@@ -23,6 +23,17 @@ use rubato::{
 use crate::devices::DeviceKind;
 use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 
+/// Producer→consumer ring depth (chunks). The ring is *only* a
+/// jitter shock-absorber between the worker and the cpal output
+/// callback — larger sizes just stack monitoring latency. With
+/// ~10 ms worker chunks at 48 kHz and ~22 ms output callbacks,
+/// 3 chunks leaves ~30 ms of headroom: enough to absorb a single
+/// callback period of jitter and no more. When the ring is full
+/// the producer drops the chunk (same back-pressure semantics as
+/// the input side), so latency is bounded by `RING_CHUNKS` × chunk
+/// duration regardless of pipeline behaviour.
+const RING_CHUNKS: usize = 3;
+
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
 /// Most users want `SessionConfig::default()`; named device fields
@@ -38,12 +49,6 @@ pub struct SessionConfig {
     /// overridden internally to [`INTERNAL_SAMPLE_RATE`] (48 kHz) —
     /// the cpal-side resamplers convert from the device rate.
     pub streaming: StreamingConfig,
-    /// Internal ring buffer capacity, measured in 48 kHz mono
-    /// samples. Default 24_000 (= 0.5 s of buffering) which keeps
-    /// glitches absorbing nicely without paying a huge memory bill.
-    /// The cpal callbacks drop chunks (input) / emit silence
-    /// (output) when this is exhausted.
-    pub ring_capacity_samples: usize,
     /// When `Some(path)`, the streaming engine runs DFN3 noise
     /// suppression at 48 kHz **after** the optional TSE stage and
     /// before the gate envelope. `None` → no NS.
@@ -167,11 +172,8 @@ impl LiveSession {
             output_channels
         );
 
-        let ring_cap = config
-            .ring_capacity_samples
-            .max(INTERNAL_SAMPLE_RATE as usize / 10);
-        let (input_tx, input_rx) = bounded::<Vec<f32>>(ring_capacity_chunks(ring_cap));
-        let (output_tx, output_rx) = bounded::<Vec<f32>>(ring_capacity_chunks(ring_cap));
+        let (input_tx, input_rx) = bounded::<Vec<f32>>(RING_CHUNKS);
+        let (output_tx, output_rx) = bounded::<Vec<f32>>(RING_CHUNKS);
         let (events_tx, events_rx) = bounded::<SessionEvent>(64);
 
         let samples_processed = Arc::new(AtomicU64::new(0));
@@ -224,6 +226,8 @@ impl LiveSession {
             input_rms_bits.clone(),
             output_rms_bits.clone(),
             gate_on.clone(),
+            input_overruns.clone(),
+            output_underruns.clone(),
         )?;
 
         input_stream
@@ -337,12 +341,32 @@ fn spawn_worker(
     input_rms_bits: Arc<AtomicU32>,
     output_rms_bits: Arc<AtomicU32>,
     gate_on: Arc<AtomicBool>,
+    input_overruns: Arc<AtomicU64>,
+    output_underruns: Arc<AtomicU64>,
 ) -> Result<JoinHandle<()>, AudioIoError> {
     std::thread::Builder::new()
         .name("mellonella-audio-io-worker".into())
         .spawn(move || {
             let mut first_input_logged = false;
             let mut first_nonempty_output_logged = false;
+            let mut first_producer_drop_logged = false;
+            // Producer-side back-pressure: incremented whenever the
+            // ring is full and the worker drops a freshly produced
+            // chunk. This means the output device is slower than the
+            // pipeline (or the worker is bursting after a stall).
+            // Separate from `output_underruns` (= cpal callback fired
+            // with an empty ring) so the two distinct failure modes
+            // are visible.
+            let mut producer_drops: u64 = 0;
+            // Periodic stats: every ~1 s of wall clock, log delta
+            // counters so the user can see if underruns / overruns
+            // continue past startup (= persistent CPU shortfall) or
+            // were a one-shot stream-startup artifact.
+            let mut last_stats_at = std::time::Instant::now();
+            let mut last_underruns = 0_u64;
+            let mut last_overruns = 0_u64;
+            let mut last_processed = 0_u64;
+            let mut last_producer_drops = 0_u64;
             while let Ok(chunk) = input_rx.recv() {
                 if !first_input_logged && !chunk.is_empty() {
                     let r = rms(&chunk);
@@ -376,21 +400,65 @@ fn spawn_worker(
                             }
                         }
                         let n = out.audio.len() as u64;
-                        if n > 0 && output_tx.send(out.audio).is_err() {
-                            break;
+                        if n > 0 {
+                            match output_tx.try_send(out.audio) {
+                                Ok(()) => {
+                                    samples_processed.fetch_add(n, Ordering::Relaxed);
+                                }
+                                Err(TrySendError::Full(_)) => {
+                                    // Ring full → drop the freshest
+                                    // chunk to keep monitoring
+                                    // latency bounded by ring size.
+                                    // Symmetric with the input-side
+                                    // overrun behaviour.
+                                    producer_drops += 1;
+                                    if !first_producer_drop_logged {
+                                        eprintln!(
+                                            "[audio-io] worker: first producer drop — output \
+                                             ring full ({RING_CHUNKS} chunks). Further drops \
+                                             are silent; check the periodic stats line."
+                                        );
+                                        first_producer_drop_logged = true;
+                                    }
+                                }
+                                Err(TrySendError::Disconnected(_)) => break,
+                            }
                         }
-                        samples_processed.fetch_add(n, Ordering::Relaxed);
                     }
                     Err(e) => {
                         let _ = events_tx.send(SessionEvent::Error(e.to_string()));
                         return;
                     }
                 }
+                // Once every ~1 s of wall clock, dump rolling stats so
+                // post-startup behaviour (persistent underruns vs.
+                // clean steady state) is visible without a debugger.
+                if last_stats_at.elapsed() >= std::time::Duration::from_secs(1) {
+                    let u = output_underruns.load(Ordering::Relaxed);
+                    let o = input_overruns.load(Ordering::Relaxed);
+                    let p = samples_processed.load(Ordering::Relaxed);
+                    let d = producer_drops;
+                    eprintln!(
+                        "[audio-io] stats: +{du} underruns, +{do_} overruns, +{dd} producer \
+                         drops, +{dp} samples in last {ms} ms (totals: underruns={u}, \
+                         overruns={o}, producer_drops={d}, samples={p})",
+                        du = u.saturating_sub(last_underruns),
+                        do_ = o.saturating_sub(last_overruns),
+                        dd = d.saturating_sub(last_producer_drops),
+                        dp = p.saturating_sub(last_processed),
+                        ms = last_stats_at.elapsed().as_millis(),
+                    );
+                    last_underruns = u;
+                    last_overruns = o;
+                    last_processed = p;
+                    last_producer_drops = d;
+                    last_stats_at = std::time::Instant::now();
+                }
             }
             if let Ok(tail) = pipeline.flush() {
                 let n = tail.audio.len() as u64;
                 if n > 0 {
-                    let _ = output_tx.send(tail.audio);
+                    let _ = output_tx.try_send(tail.audio);
                 }
                 samples_processed.fetch_add(n, Ordering::Relaxed);
             }
@@ -412,11 +480,6 @@ fn rms(samples: &[f32]) -> f32 {
     }
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
-}
-
-fn ring_capacity_chunks(ring_cap_samples: usize) -> usize {
-    let slots = ring_cap_samples / (INTERNAL_SAMPLE_RATE as usize / 1000).max(1);
-    slots.max(16)
 }
 
 fn pick_device(

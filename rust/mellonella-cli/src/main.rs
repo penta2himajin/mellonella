@@ -633,7 +633,6 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
             diagnostics: false,
             dfn3_onnx_path: None,
         },
-        ring_capacity_samples: 0, // accept the audio-io default
         dfn3_onnx_path,
         input_channel: args.input_channel.into(),
     };

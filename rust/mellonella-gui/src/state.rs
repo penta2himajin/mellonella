@@ -482,7 +482,6 @@ impl AppState {
                 // construction-time default.
                 dfn3_onnx_path: None,
             },
-            ring_capacity_samples: 0,
             dfn3_onnx_path,
             // GUI uses the safe default; multi-channel mic users
             // who want a specific channel use the CLI's
