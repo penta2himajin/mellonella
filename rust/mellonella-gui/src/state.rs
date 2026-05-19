@@ -25,6 +25,7 @@ use mellonella_core::gating::GateConfig;
 use mellonella_core::pipeline::{enroll_from_recording, PipelineComponents, PipelineConfig};
 use mellonella_core::resample::resample_to;
 use mellonella_core::streaming::StreamingConfig;
+use mellonella_core::tse_stage::TseStageConfig;
 use mellonella_core::vad::SileroVad;
 
 /// Output sample rate used end-to-end (matches the CLI's offline
@@ -51,6 +52,33 @@ pub enum EnrollmentOrigin {
     Json(PathBuf),
 }
 
+/// TSE model variant — mirrors the CLI's `--tse-config` enum so the
+/// GUI's dropdown has the same options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TseVariant {
+    /// 16 kHz PoC. Requires both the audio path and decision path to
+    /// be at 16 kHz; will fail to start on the GUI's default 48 kHz
+    /// audio path (kept selectable so users running a custom build
+    /// at 16 kHz can still pick it).
+    Poc16k,
+    /// 48 kHz production model — the canonical release at
+    /// <https://huggingface.co/penta2himajin/tse-conv-tasnet-48k>.
+    /// Matches the GUI's 48 kHz audio path exactly.
+    #[default]
+    Prod48k,
+}
+
+impl TseVariant {
+    /// Display label for the dropdown.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Poc16k => "poc_16k (16 kHz)",
+            Self::Prod48k => "prod_48k (48 kHz)",
+        }
+    }
+}
+
 pub struct AppState {
     /// Current speaker pool. `None` until the user enrolls a voice.
     /// Held in-memory so `Start` doesn't have to re-read JSON.
@@ -70,6 +98,20 @@ pub struct AppState {
     /// `MELLONELLA_DFN3_ONNX` is set; UI disables the checkbox
     /// otherwise (see [`Self::dfn3_available`]).
     pub enable_dfn3: bool,
+    /// User-toggled "Enable target-speaker extraction" (Stage C).
+    /// Honoured only when both the checkbox is on **and**
+    /// [`Self::tse_onnx_path`] is set; UI disables the checkbox
+    /// when no path is configured (see [`Self::tse_available`]).
+    pub enable_tse: bool,
+    /// Path to the TSE streaming ONNX (Stage C). Picked via a file
+    /// dialog in the Settings panel; persisted in-memory only for this
+    /// session.
+    pub tse_onnx_path: Option<PathBuf>,
+    /// TSE model variant. `Prod48k` matches the production 48 kHz
+    /// model on HuggingFace; `Poc16k` matches the original 16 kHz PoC.
+    /// Defaults to `Prod48k` — the 48 kHz audio path the GUI uses
+    /// end-to-end matches that variant's expected SR exactly.
+    pub tse_variant: TseVariant,
     /// Mic-enrollment recording duration in seconds. Step 20 made
     /// this user-configurable from the GUI (a slider next to the
     /// Record button); default matches the previous fixed
@@ -106,6 +148,9 @@ impl Default for AppState {
             selected_input: None,
             selected_output: None,
             enable_dfn3: false,
+            enable_tse: false,
+            tse_onnx_path: None,
+            tse_variant: TseVariant::default(),
             record_duration_secs: DEFAULT_RECORD_SECS,
             gate_cfg: GateConfig::default(),
             pipeline_cfg: default_live_pipeline_cfg(),
@@ -388,11 +433,27 @@ impl AppState {
         } else {
             None
         };
+        let mut pipeline_cfg = self.pipeline_cfg.clone();
+        if self.enable_tse {
+            let Some(onnx) = self.tse_onnx_path.as_ref() else {
+                self.last_error =
+                    Some("TSE enabled but no ONNX path selected — pick one in Settings".into());
+                return;
+            };
+            if !onnx.exists() {
+                self.last_error = Some(format!("TSE ONNX path does not exist: {}", onnx.display()));
+                return;
+            }
+            pipeline_cfg.tse = Some(match self.tse_variant {
+                TseVariant::Poc16k => TseStageConfig::new(onnx.clone()),
+                TseVariant::Prod48k => TseStageConfig::new_prod_48k(onnx.clone()),
+            });
+        }
         let cfg = SessionConfig {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
             streaming: StreamingConfig {
-                pipeline: self.pipeline_cfg.clone(),
+                pipeline: pipeline_cfg,
                 gate: self.gate_cfg,
                 audio_sample_rate: OUTPUT_SAMPLE_RATE,
                 diagnostics: false,
@@ -468,6 +529,14 @@ impl AppState {
     #[allow(clippy::unused_self)] // method form is more discoverable from app.rs
     pub fn dfn3_available(&self) -> bool {
         dfn3_path_from_env().is_some()
+    }
+
+    /// Whether the user has picked a TSE ONNX path that still exists
+    /// on disk. The UI greys the "Enable target-speaker extraction"
+    /// checkbox when this returns `false`.
+    #[must_use]
+    pub fn tse_available(&self) -> bool {
+        self.tse_onnx_path.as_deref().is_some_and(Path::exists)
     }
 
     /// Latest input RMS from the worker (0.0 when no session is

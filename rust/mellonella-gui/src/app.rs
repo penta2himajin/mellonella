@@ -305,6 +305,28 @@ impl MellonellaApp {
                 ui.weak("+ ~30 ms latency");
             }
         });
+        let tse_available = self.state.tse_available();
+        ui.horizontal(|ui| {
+            let tooltip = if tse_available {
+                "Run Stage C target-speaker extraction on the live audio path. \
+                 Extracts only the enrolled speaker's voice from the mixture before \
+                 the gate envelope is applied. Adds ~10 ms latency."
+            } else {
+                "Pick a TSE ONNX in Settings to enable target-speaker extraction."
+            };
+            ui.add_enabled_ui(!running && tse_available, |ui| {
+                ui.checkbox(
+                    &mut self.state.enable_tse,
+                    "Enable target-speaker extraction",
+                )
+                .on_hover_text(tooltip);
+            });
+            if !tse_available {
+                ui.weak("(no TSE ONNX selected)");
+            } else if self.state.enable_tse {
+                ui.weak("+ ~10 ms latency");
+            }
+        });
     }
 
     fn render_status(&self, ui: &mut egui::Ui) {
@@ -359,6 +381,7 @@ impl MellonellaApp {
     /// streaming pipeline reads the config at `LiveSession::new`,
     /// not per-frame, so mid-stream changes wouldn't take effect
     /// until Stop / Start anyway.
+    #[allow(clippy::too_many_lines)]
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.state.is_running();
         egui::CollapsingHeader::new("Settings")
@@ -414,6 +437,54 @@ impl MellonellaApp {
                         self.state.gate_cfg = mellonella_core::gating::GateConfig::default();
                         self.state.pipeline_cfg = crate::state::default_live_pipeline_cfg();
                     }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Stage C — Target Speaker Extraction").strong());
+                    ui.horizontal(|ui| {
+                        let label = self.state.tse_onnx_path.as_deref().map_or_else(
+                            || "(no file selected)".to_string(),
+                            |p| {
+                                p.file_name().map_or_else(
+                                    || p.display().to_string(),
+                                    |n| n.to_string_lossy().into_owned(),
+                                )
+                            },
+                        );
+                        if ui.button("Pick TSE ONNX…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("ONNX model", &["onnx"])
+                                .pick_file()
+                            {
+                                self.state.tse_onnx_path = Some(path);
+                            }
+                        }
+                        ui.label(label);
+                        if self.state.tse_onnx_path.is_some() && ui.small_button("Clear").clicked()
+                        {
+                            self.state.tse_onnx_path = None;
+                            self.state.enable_tse = false;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Model variant:");
+                        let current = self.state.tse_variant;
+                        egui::ComboBox::from_id_salt("tse_variant_combo")
+                            .selected_text(current.label())
+                            .show_ui(ui, |ui| {
+                                for v in [
+                                    crate::state::TseVariant::Prod48k,
+                                    crate::state::TseVariant::Poc16k,
+                                ] {
+                                    ui.selectable_value(&mut self.state.tse_variant, v, v.label());
+                                }
+                            });
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Download from huggingface.co/penta2himajin/tse-conv-tasnet-48k",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
                 });
             });
     }
