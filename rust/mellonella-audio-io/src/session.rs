@@ -345,9 +345,13 @@ fn spawn_worker(
             let mut first_nonempty_output_logged = false;
             while let Ok(chunk) = input_rx.recv() {
                 if !first_input_logged && !chunk.is_empty() {
+                    let r = rms(&chunk);
+                    let nan_count = chunk.iter().filter(|s| s.is_nan()).count();
                     eprintln!(
-                        "[audio-io] worker: first input chunk received ({} samples)",
-                        chunk.len()
+                        "[audio-io] worker: first input chunk received ({} samples, RMS {:.4}, NaN count {})",
+                        chunk.len(),
+                        r,
+                        nan_count,
                     );
                     first_input_logged = true;
                 }
