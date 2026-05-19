@@ -601,6 +601,44 @@ def _scan_demand_noise(data_dir: Path, demand_root: str) -> list[Path]:
     return []
 
 
+def vctk_speaker_split(
+    speakers: list[str],
+    *,
+    val_speakers: int = 11,
+    test_speakers: int = 11,
+) -> dict[str, list[str]]:
+    """Deterministic speaker-level train / val / test partition of VCTK.
+
+    VCTK has 110 speakers (`p225`..`p376` minus a few gaps); the default
+    `(val=11, test=11)` keeps ~80 % for training (88 speakers), and
+    10 % each for validation and held-out test. Both held-out sets see
+    ZERO overlap with the training set — the test SI-SDR is a real
+    generalisation signal.
+
+    Partitioning is by speaker-id hash so the split is stable across
+    runs, machines, and dataset re-mounts (no reliance on insertion
+    order). Returns a dict with keys ``"train"``, ``"val"``, ``"test"``.
+    """
+    if val_speakers + test_speakers >= len(speakers):
+        raise ValueError(
+            f"val_speakers + test_speakers ({val_speakers} + {test_speakers}) "
+            f"must be < total speakers ({len(speakers)})"
+        )
+    # Sort by a stable hash of the speaker id so e.g. `p225` doesn't
+    # always land in train just because it sorts first. SHA-1 isn't a
+    # cryptographic requirement here, just an order-independent ranking.
+    import hashlib
+
+    def rank(spk: str) -> bytes:
+        return hashlib.sha1(spk.encode("ascii")).digest()
+
+    ranked = sorted(speakers, key=rank)
+    test = sorted(ranked[:test_speakers])
+    val = sorted(ranked[test_speakers : test_speakers + val_speakers])
+    train = sorted(ranked[test_speakers + val_speakers :])
+    return {"train": train, "val": val, "test": test}
+
+
 def vctk_demand_sources(
     data_dir: Path | None = None,
     *,
@@ -611,6 +649,7 @@ def vctk_demand_sources(
     embeddings_npz: Path | None = None,
     cond_dim: int = 192,
     seed: int = 0,
+    speakers_subset: list[str] | None = None,
 ) -> list[TSESourceItem]:
     """Build :class:`TSESourceItem` bundles from local VCTK + DEMAND.
 
@@ -646,6 +685,13 @@ def vctk_demand_sources(
         raise FileNotFoundError(f"VCTK directory not found: {vctk_dir}")
 
     by_speaker = _scan_vctk_speakers(vctk_dir)
+    if speakers_subset is not None:
+        # Restrict to the requested subset (e.g. one side of a
+        # speaker-level train/val/test split). Silently drops subset
+        # entries that don't appear on disk so misconfigured subsets
+        # surface via the "need >= 2 speakers" check below rather than
+        # a KeyError.
+        by_speaker = {s: by_speaker[s] for s in speakers_subset if s in by_speaker}
     if len(by_speaker) < 2:
         raise RuntimeError(f"need >= 2 speakers under {vctk_dir}, found {len(by_speaker)}")
 
