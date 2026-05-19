@@ -306,14 +306,13 @@ pub(crate) fn fuse_fast_cue(last_score: f32, fm_fast: f32, weight: f32, neutral:
     last_score + weight * (fm_fast - neutral)
 }
 
-/// Threshold below which a chain-input chunk is treated as
-/// "essentially silent" and gets sub-LSB dither injected to keep the
-/// TSE model away from zero-variance NaN territory. 1e-9 is well
-/// below any real f32 ADC noise floor.
-const CHAIN_SILENCE_EPS: f32 = 1e-9;
-
-/// Sub-LSB dither amplitude. ±1e-7 ≈ -140 dBFS, below 24-bit
-/// quantisation noise and inaudible, but non-zero variance.
+/// Sub-LSB dither amplitude added unconditionally to the TSE → DFN3
+/// chain input. ±1e-7 ≈ -140 dBFS, below the 24-bit noise floor
+/// (~-138 dBFS) and far below the perceptual threshold of human
+/// hearing. Applied to every sample so no STFT window inside the
+/// chain can be exactly zero-variance — a single all-zero window
+/// is enough to put TSE's GRU hidden state into a NaN it never
+/// recovers from. Real audio is altered by an inaudible amount.
 const CHAIN_DITHER: f32 = 1e-7;
 
 /// One-shot NaN diagnostic — logs the first time `samples` contains a
@@ -1682,33 +1681,32 @@ impl StreamingState {
             if let Some(stage) = self.tse_stage.as_ref() {
                 log_first_nan("chain input cond_embedding", stage.cond_embedding());
             }
-            // WASAPI / cpal commonly delivers one or more zero-filled
-            // primer chunks at stream startup before the real mic
-            // audio lands. TSE's normalisation layers divide by /
-            // take `log` of per-frame energy, so a zero-variance
-            // chunk produces NaN that poisons the GRU hidden state
-            // for the rest of the run. Inject sub-LSB dither
-            // (±1e-7 ≈ -140 dBFS, well below the 24-bit noise floor
-            // and inaudible) whenever the chunk is essentially
-            // silent, so the model never sees an exactly-zero
-            // variance. Real audio is left untouched.
-            let dithered_chunk: Vec<f32>;
-            let chain_audio: &[f32] = if audio_chunk.iter().all(|s| s.abs() < CHAIN_SILENCE_EPS) {
-                dithered_chunk = audio_chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| {
-                        if i % 2 == 0 {
-                            CHAIN_DITHER
-                        } else {
-                            -CHAIN_DITHER
-                        }
-                    })
-                    .collect();
-                &dithered_chunk
-            } else {
-                audio_chunk
-            };
+            // TSE's normalisation layers divide by / take `log` of
+            // per-STFT-frame energy, so any **STFT window** that is
+            // entirely zero-variance produces NaN that poisons the
+            // GRU hidden state for the rest of the run. The previous
+            // "dither only when the whole audio_chunk is silent"
+            // gate missed the common case: an audio_chunk that
+            // begins with N zero samples (WASAPI primer / leading
+            // file silence / mid-speech pauses) followed by real
+            // audio still gives TSE its first STFT window full of
+            // zeros. Apply the dither unconditionally — ±1e-7 ≈
+            // -140 dBFS is below the 24-bit noise floor (~-138 dBFS)
+            // and below the perceptual threshold of human hearing,
+            // so real audio is altered by an amount no one can
+            // measure but every STFT window has non-zero variance.
+            let chain_audio_owned: Vec<f32> = audio_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    s + if i % 2 == 0 {
+                        CHAIN_DITHER
+                    } else {
+                        -CHAIN_DITHER
+                    }
+                })
+                .collect();
+            let chain_audio: &[f32] = &chain_audio_owned;
             let after_tse: Vec<f32> = if let Some(stage) = self.tse_stage.as_mut() {
                 stage.process(chain_audio).map_err(PipelineError::from)?
             } else {
