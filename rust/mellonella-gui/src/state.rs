@@ -187,18 +187,26 @@ pub fn default_live_pipeline_cfg() -> PipelineConfig {
     }
 }
 
-/// `Some(path)` when `MELLONELLA_DFN3_ONNX` is set and the file
-/// exists. Used by the UI to decide whether to enable the "Enable
-/// noise suppression" checkbox.
+/// `Some(path)` when the DFN3 ONNX is reachable — either via the
+/// `MELLONELLA_DFN3_ONNX` env var or the on-disk cache populated by
+/// [`mellonella_core::hf_fetch::ensure_dfn3_onnx`]. Used by the UI's
+/// status row and by [`AppState::start`] to decide whether to wire
+/// DFN3 into the live engine. Cheap (no network) — the actual fetch
+/// happens elsewhere; this is just a "is the file there yet?" probe.
 #[must_use]
 pub fn dfn3_path_from_env() -> Option<PathBuf> {
-    let raw = std::env::var_os("MELLONELLA_DFN3_ONNX")?;
-    let p = PathBuf::from(raw);
-    if p.exists() {
-        Some(p)
-    } else {
-        None
+    if let Some(raw) = std::env::var_os("MELLONELLA_DFN3_ONNX") {
+        let p = PathBuf::from(raw);
+        if p.exists() {
+            return Some(p);
+        }
     }
+    let cached = mellonella_core::hf_fetch::cached_path(
+        mellonella_core::hf_fetch::MELLONELLA_MODELS_REPO,
+        mellonella_core::hf_fetch::DFN3_FILE,
+    )
+    .ok()?;
+    cached.exists().then_some(cached)
 }
 
 impl AppState {
@@ -219,12 +227,15 @@ impl AppState {
         }
     }
 
-    /// Build a fresh `PipelineComponents` from the ONNX env vars.
+    /// Build a fresh `PipelineComponents`, resolving ONNX paths through
+    /// the cache-first fallback chain in [`mellonella_core::hf_fetch`]
+    /// (env var → cache → HuggingFace fetch). Falls back gracefully to
+    /// the legacy env-var-only setup for models without an HF mirror.
     fn build_components() -> Result<PipelineComponents, String> {
-        let ecapa_path = std::env::var("MELLONELLA_ECAPA_ONNX")
-            .map_err(|_| "MELLONELLA_ECAPA_ONNX env var not set".to_string())?;
-        let vad_path = std::env::var("MELLONELLA_VAD_ONNX")
-            .map_err(|_| "MELLONELLA_VAD_ONNX env var not set".to_string())?;
+        let ecapa_path = mellonella_core::hf_fetch::ensure_ecapa_onnx(|_, _| {})
+            .map_err(|e| format!("ECAPA ONNX: {e}"))?;
+        let vad_path = mellonella_core::hf_fetch::ensure_vad_onnx(|_, _| {})
+            .map_err(|e| format!("VAD ONNX: {e}"))?;
         let fbank = Fbank::with_speechbrain_filterbank().map_err(|e| format!("Fbank init: {e}"))?;
         let ecapa =
             EcapaTdnn::from_onnx_path(&ecapa_path).map_err(|e| format!("ECAPA load: {e}"))?;
@@ -406,6 +417,15 @@ impl AppState {
         };
         let dfn3_onnx_path = dfn3_path_from_env();
         let mut pipeline_cfg = self.pipeline_cfg.clone();
+        // Auto-resolve TSE ONNX if the user hasn't picked one — the
+        // fetcher's cache hit path makes this cheap on every launch
+        // after the first.
+        if self.tse_onnx_path.is_none() {
+            if let Ok(p) = mellonella_core::hf_fetch::ensure_tse_prod_48k_onnx(|_, _, _| {}) {
+                self.tse_onnx_path = Some(p);
+                self.tse_variant = TseVariant::Prod48k;
+            }
+        }
         if let Some(onnx) = self.tse_onnx_path.as_ref() {
             if !onnx.exists() {
                 self.last_error = Some(format!("TSE ONNX path does not exist: {}", onnx.display()));
