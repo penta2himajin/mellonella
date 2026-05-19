@@ -107,6 +107,21 @@ impl TseConfig {
         }
     }
 
+    /// Production 48 kHz config — encoder kernel 96 / stride 48 so the
+    /// latent frame rate stays at 1 kHz; separator is byte-identical
+    /// to the PoC.
+    #[must_use]
+    pub const fn prod_48k() -> Self {
+        Self {
+            enc_stride: 48,
+            enc_overlap: 48, // enc_kernel(96) - enc_stride(48)
+            hidden: 256,
+            tcn_kernel: 3,
+            n_blocks: 6,
+            n_repeats: 2,
+        }
+    }
+
     /// Number of TCN blocks in the separator (`n_repeats * n_blocks`).
     #[must_use]
     pub const fn total_blocks(&self) -> usize {
