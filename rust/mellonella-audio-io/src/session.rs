@@ -13,7 +13,6 @@ use std::thread::JoinHandle;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use mellonella_core::dfn3::Dfn3Streamer;
 use mellonella_core::enrollment::EmbeddingPool;
 use mellonella_core::pipeline::PipelineComponents;
 use mellonella_core::streaming::{StreamingConfig, StreamingPipeline};
@@ -45,14 +44,13 @@ pub struct SessionConfig {
     /// The cpal callbacks drop chunks (input) / emit silence
     /// (output) when this is exhausted.
     pub ring_capacity_samples: usize,
-    /// When `Some(path)`, the worker runs DFN3 noise suppression on
-    /// the captured audio (at 48 kHz) before handing it to the
-    /// streaming pipeline. `None` → no NS.
+    /// When `Some(path)`, the streaming engine runs DFN3 noise
+    /// suppression at 48 kHz **after** the optional TSE stage and
+    /// before the gate envelope. `None` → no NS.
     ///
-    /// Latency cost: the stateful per-frame DFN3 wrapper introduced
-    /// in step 13.5 adds ~30 ms of algorithmic latency (2-frame
-    /// conv lookahead + ~10 ms model). Negligible compared to the
-    /// previous 1.02 s the 102-frame export forced.
+    /// Latency cost: ~20 ms (2-frame DFN3 conv lookahead at the
+    /// 48 kHz hop). Forwarded into [`StreamingConfig::dfn3_onnx_path`]
+    /// at session construction.
     pub dfn3_onnx_path: Option<PathBuf>,
     /// How to fold a multi-channel input device's interleaved
     /// frames down to mono. Default `Average` — same as step 12's
@@ -202,26 +200,23 @@ impl LiveSession {
         )?;
 
         // Override audio_sample_rate so the pipeline sees the
-        // post-resample 48 kHz the worker actually feeds it.
+        // post-resample 48 kHz the worker actually feeds it, and
+        // forward the DFN3 path so the engine wires NS as the
+        // post-TSE stage in the audio chain.
         let mut streaming_cfg = config.streaming.clone();
         streaming_cfg.audio_sample_rate = INTERNAL_SAMPLE_RATE;
+        streaming_cfg
+            .dfn3_onnx_path
+            .clone_from(&config.dfn3_onnx_path);
+        let dfn3_enabled = streaming_cfg.dfn3_onnx_path.is_some();
         let pipeline = StreamingPipeline::new(pool, streaming_cfg, components)
             .map_err(|e| AudioIoError::Pipeline(e.to_string()))?;
-
-        let dfn3 = match config.dfn3_onnx_path.as_deref() {
-            Some(path) => Some(
-                Dfn3Streamer::from_onnx_path(path)
-                    .map_err(|e| AudioIoError::Pipeline(format!("DFN3 load: {e}")))?,
-            ),
-            None => None,
-        };
-        if dfn3.is_some() {
-            eprintln!("[audio-io] noise suppression: ENABLED (+ ~30 ms latency)");
+        if dfn3_enabled {
+            eprintln!("[audio-io] noise suppression: ENABLED (+ ~20 ms latency, post-TSE)");
         }
 
         let worker = spawn_worker(
             pipeline,
-            dfn3,
             input_rx,
             output_tx,
             events_tx,
@@ -335,7 +330,6 @@ impl Drop for LiveSession {
 /// the input cpal stream was torn down).
 fn spawn_worker(
     mut pipeline: StreamingPipeline,
-    mut dfn3: Option<Dfn3Streamer>,
     input_rx: Receiver<Vec<f32>>,
     output_tx: Sender<Vec<f32>>,
     events_tx: Sender<SessionEvent>,
@@ -348,34 +342,11 @@ fn spawn_worker(
         .name("mellonella-audio-io-worker".into())
         .spawn(move || {
             while let Ok(chunk) = input_rx.recv() {
-                // Update input level meter before any processing —
-                // gives the GUI a "raw mic signal" reading
-                // independent of DFN3 / gate.
                 if !chunk.is_empty() {
                     input_rms_bits.store(rms(&chunk).to_bits(), Ordering::Relaxed);
                 }
-                // DFN3 (if enabled) runs first — it buffers up to
-                // ~1.02 s and emits whole chunks. When the buffer
-                // isn't full yet, `enhanced` is empty and we skip
-                // straight to the next input.
-                let enhanced = if let Some(streamer) = dfn3.as_mut() {
-                    match streamer.push_samples(&chunk) {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            let _ = events_tx.send(SessionEvent::Error(format!("DFN3: {e}")));
-                            return;
-                        }
-                    }
-                } else {
-                    chunk
-                };
-                if enhanced.is_empty() {
-                    continue;
-                }
-                match pipeline.push_samples(&enhanced) {
+                match pipeline.push_samples(&chunk) {
                     Ok(out) => {
-                        // Pull the latest gate state from the run-
-                        // length decisions emitted this iteration.
                         if let Some(&(_, is_on)) = out.gate_decisions.last() {
                             gate_on.store(is_on, Ordering::Relaxed);
                         }
@@ -384,8 +355,6 @@ fn spawn_worker(
                         }
                         let n = out.audio.len() as u64;
                         if n > 0 && output_tx.send(out.audio).is_err() {
-                            // Output side disconnected — session is
-                            // shutting down. Exit cleanly.
                             break;
                         }
                         samples_processed.fetch_add(n, Ordering::Relaxed);
@@ -393,26 +362,6 @@ fn spawn_worker(
                     Err(e) => {
                         let _ = events_tx.send(SessionEvent::Error(e.to_string()));
                         return;
-                    }
-                }
-            }
-            // Input closed — flush DFN3 first so any sub-chunk
-            // residue gets enhanced, then flush the streaming
-            // pipeline.
-            if let Some(streamer) = dfn3.as_mut() {
-                match streamer.flush() {
-                    Ok(buf) if !buf.is_empty() => {
-                        if let Ok(out) = pipeline.push_samples(&buf) {
-                            let n = out.audio.len() as u64;
-                            if n > 0 {
-                                let _ = output_tx.send(out.audio);
-                            }
-                            samples_processed.fetch_add(n, Ordering::Relaxed);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = events_tx.send(SessionEvent::Error(format!("DFN3 flush: {e}")));
                     }
                 }
             }

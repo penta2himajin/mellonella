@@ -154,6 +154,7 @@ fn streaming_identity_rate_per_frame_matches_offline() {
         gate: gate_cfg,
         audio_sample_rate: 16_000,
         diagnostics: true,
+        dfn3_onnx_path: None,
     };
     let mut pipeline = StreamingPipeline::new(pool_b, config, components_b).expect("streaming new");
     let part1 = pipeline.push_samples(&audio).expect("push");
@@ -232,6 +233,7 @@ fn streaming_turn_detect_identity_rate_matches_offline() {
         gate: gate_cfg,
         audio_sample_rate: 16_000,
         diagnostics: true,
+        dfn3_onnx_path: None,
     };
     let mut pipeline = StreamingPipeline::new(pool_b, config, components_b).expect("streaming new");
     let part1 = pipeline.push_samples(&audio).expect("push");
@@ -267,6 +269,7 @@ fn streaming_identity_rate_chunk_invariance() {
         gate: GateConfig::default(),
         audio_sample_rate: 16_000,
         diagnostics: true,
+        dfn3_onnx_path: None,
     };
 
     let run = |chunk_size: usize| -> StreamingOutput {
@@ -329,6 +332,7 @@ fn streaming_dual_rate_well_formed() {
         gate: GateConfig::default(),
         audio_sample_rate: 48_000,
         diagnostics: true,
+        dfn3_onnx_path: None,
     };
     let mut pipeline = StreamingPipeline::new(pool, config, components).expect("streaming new");
     let parts = vec![
