@@ -90,6 +90,10 @@ pub struct TseConfig {
     pub n_blocks: usize,
     /// Number of TCN repeats.
     pub n_repeats: usize,
+    /// Encoder basis count (`N`) — the channel width of the masked
+    /// latent. Sets the shape of the trailing mask-EMA carry state
+    /// `(1, n_basis, 1)`.
+    pub n_basis: usize,
 }
 
 impl TseConfig {
@@ -104,6 +108,7 @@ impl TseConfig {
             tcn_kernel: 3,
             n_blocks: 6,
             n_repeats: 2,
+            n_basis: 256,
         }
     }
 
@@ -119,6 +124,7 @@ impl TseConfig {
             tcn_kernel: 3,
             n_blocks: 6,
             n_repeats: 2,
+            n_basis: 256,
         }
     }
 
@@ -143,10 +149,10 @@ impl TseConfig {
     /// Number of state tensors threaded across `process_chunk` calls.
     ///
     /// Layout: `1 (enc overlap) + 3 (input-norm) + 7 * total_blocks
-    /// + 1 (dec overlap)`.
+    /// + 1 (dec overlap) + 1 (mask-EMA carry)`.
     #[must_use]
     pub const fn n_state_tensors(&self) -> usize {
-        1 + 3 + 7 * self.total_blocks() + 1
+        1 + 3 + 7 * self.total_blocks() + 1 + 1
     }
 
     /// Dilation of the `block`-th block in any repeat — the dilation
@@ -275,6 +281,12 @@ fn make_initial_state(config: TseConfig) -> Vec<ArrayD<f32>> {
     }
     // 4) Decoder overlap: (1, 1, enc_overlap).
     state.push(ArrayD::<f32>::zeros(IxDyn(&[1, 1, config.enc_overlap])));
+    // 5) Mask-EMA carry: (1, n_basis, 1). Threads the temporal mask
+    //    smoother's previous frame across chunks. Inert (the EMA is
+    //    the identity) when the model was exported with
+    //    `mask_smoothing_beta == 0`, but always present so the state
+    //    layout is independent of the beta value.
+    state.push(ArrayD::<f32>::zeros(IxDyn(&[1, config.n_basis, 1])));
     state
 }
 
@@ -460,8 +472,9 @@ mod tests {
         assert_eq!(cfg.n_blocks, 6);
         assert_eq!(cfg.n_repeats, 2);
         assert_eq!(cfg.total_blocks(), 12);
-        // 1 enc + 3 input-norm + 7 * 12 blocks + 1 dec = 89.
-        assert_eq!(cfg.n_state_tensors(), 89);
+        assert_eq!(cfg.n_basis, 256);
+        // 1 enc + 3 input-norm + 7 * 12 blocks + 1 dec + 1 mask-EMA = 90.
+        assert_eq!(cfg.n_state_tensors(), 90);
     }
 
     #[test]
@@ -502,6 +515,9 @@ mod tests {
         }
         // dec overlap
         assert_eq!(state[idx].shape(), &[1, 1, cfg.enc_overlap]);
+        idx += 1;
+        // mask-EMA carry
+        assert_eq!(state[idx].shape(), &[1, cfg.n_basis, 1]);
         assert_eq!(idx + 1, cfg.n_state_tensors());
     }
 }

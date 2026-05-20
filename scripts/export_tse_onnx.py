@@ -132,6 +132,12 @@ def cmd_export(args: argparse.Namespace) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     config = _load_config(args.config)
+    if getattr(args, "mask_smoothing_beta", None) is not None:
+        config = config.with_overrides(mask_smoothing_beta=args.mask_smoothing_beta)
+        print(
+            f"[export] mask_smoothing_beta override = {args.mask_smoothing_beta}",
+            file=sys.stderr,
+        )
     if args.chunk % config.enc_stride != 0:
         print(
             f"[export] chunk {args.chunk} is not a multiple of enc_stride "
@@ -412,6 +418,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--checkpoint", type=Path, default=None, help="optional trained-weights .pt"
+    )
+    common.add_argument(
+        "--mask-smoothing-beta",
+        type=float,
+        default=None,
+        help="override TSEConfig.mask_smoothing_beta (temporal mask EMA; 0 = off)",
     )
 
     p_export = sub.add_parser("export", parents=[common])

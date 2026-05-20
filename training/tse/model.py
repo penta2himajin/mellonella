@@ -292,8 +292,16 @@ class CausalConvTasNetTSE(nn.Module):
 
     @property
     def n_state_tensors(self) -> int:
-        """Number of tensors in the flat streaming-state list."""
-        return 1 + 3 + 7 * len(self.blocks) + 1
+        """Number of tensors in the flat streaming-state list.
+
+        Layout: 1 enc-overlap + 3 input-norm + 7 per TCN block + 1
+        dec-overlap + 1 mask-EMA carry. The trailing mask-EMA tensor
+        is always present (it threads the temporal mask smoother's
+        `prev` frame across chunks); with ``mask_smoothing_beta == 0``
+        the smoother is the identity, so the tensor is inert but kept
+        so the state layout doesn't depend on the beta value.
+        """
+        return 1 + 3 + 7 * len(self.blocks) + 1 + 1
 
     def receptive_field_samples(self) -> int:
         """Total causal receptive field of the separator, in input samples."""
@@ -348,6 +356,21 @@ class CausalConvTasNetTSE(nn.Module):
         m = self.mask_conv(m)
         mask = self._apply_mask_act(m)  # (B, N, L)
 
+        # Temporal mask smoothing (matches `forward_streaming`), seeded
+        # from a zero carry so the full-sequence and chunked-streaming
+        # masks agree frame-for-frame (the `verify` parity check relies
+        # on this). `beta` here is `mask_smoothing_beta`, not the FiLM
+        # beta bound above.
+        smooth_beta = cfg.mask_smoothing_beta
+        smoothed_frames: list[torch.Tensor] = []
+        cur_mask = torch.zeros(
+            mask.shape[0], mask.shape[1], 1, device=mask.device, dtype=mask.dtype
+        )
+        for t in range(mask.shape[2]):
+            cur_mask = smooth_beta * cur_mask + (1.0 - smooth_beta) * mask[:, :, t : t + 1]
+            smoothed_frames.append(cur_mask)
+        mask = torch.cat(smoothed_frames, dim=2)
+
         masked = enc * mask
         out = self.decoder(masked)  # (B, 1, T_dec)
         # The transposed-conv decoded stream starts at decoded-index 0; this
@@ -385,6 +408,8 @@ class CausalConvTasNetTSE(nn.Module):
             state.extend([z11(), z11(), z11()])  # cln1
             state.extend([z11(), z11(), z11()])  # cln2
         state.append(torch.zeros(batch_size, 1, cfg.enc_overlap, device=dev))  # dec overlap
+        # Mask-EMA carry: last smoothed mask frame, shape (B, n_basis, 1).
+        state.append(torch.zeros(batch_size, cfg.n_basis, 1, device=dev))
         return state
 
     def forward_streaming(
@@ -462,6 +487,23 @@ class CausalConvTasNetTSE(nn.Module):
         m = self.mask_prelu(skip_sum)
         m = self.mask_conv(m)
         mask = self._apply_mask_act(m)
+        # Temporal mask smoothing (Option B): low-pass the per-frame
+        # mask along time with a one-pole EMA, threading the last
+        # frame across chunks via the trailing state tensor. This
+        # suppresses the frame-to-frame mask flicker that Conv-TasNet
+        # produces in ambiguous regions (the "ジャギジャギ" musical
+        # noise). `beta == 0` makes the recurrence the identity, so
+        # the state is inert and the output is byte-identical to the
+        # unsmoothed model.
+        prev_mask_ema = states[-1]  # (B, n_basis, 1)
+        beta = cfg.mask_smoothing_beta
+        smoothed_frames: list[torch.Tensor] = []
+        cur_mask = prev_mask_ema
+        for t in range(mask.shape[2]):
+            cur_mask = beta * cur_mask + (1.0 - beta) * mask[:, :, t : t + 1]
+            smoothed_frames.append(cur_mask)
+        mask = torch.cat(smoothed_frames, dim=2)
+        new_mask_ema = cur_mask
         masked = enc * mask
         dec = self.decoder(masked)  # (B, 1, chunk_len + enc_overlap)
 
@@ -478,6 +520,7 @@ class CausalConvTasNetTSE(nn.Module):
             out = dec[:, :, :chunk_len]
             new_dec_overlap = dec_overlap_state
         new_states.append(new_dec_overlap)
+        new_states.append(new_mask_ema)
         return out.squeeze(1), new_states
 
 

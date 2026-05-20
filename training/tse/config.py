@@ -60,8 +60,13 @@ class TSEConfig:
     film_hidden: int = 256
     mask_act: str = "sigmoid"
     ln_eps: float = 1e-8
+    mask_smoothing_beta: float = 0.0
 
     def __post_init__(self) -> None:
+        if not (0.0 <= self.mask_smoothing_beta < 1.0):
+            raise ValueError(
+                f"mask_smoothing_beta must be in [0, 1), got {self.mask_smoothing_beta}"
+            )
         if self.enc_kernel % self.enc_stride != 0:
             raise ValueError(
                 f"enc_kernel ({self.enc_kernel}) must be a multiple of "
