@@ -607,6 +607,11 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
     } else {
         None
     };
+    // Auto-resolve the pyannote-3.0 segmentation ONNX so the live
+    // session picks the adaptive (Solo→DFN3 / Overlap→TSE) chain.
+    // Best-effort: if the fetcher can't reach the model, fall back
+    // to the legacy cascade.
+    let overlap_onnx_path = mellonella_core::hf_fetch::ensure_overlap_seg_onnx(|_, _| {}).ok();
 
     // Live mode opts into the silence force-off + score EMA smoothing
     // that the library defaults leave dormant. Mirrors the GUI's
@@ -635,6 +640,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
             ..Default::default()
         },
         dfn3_onnx_path,
+        overlap_onnx_path,
         input_channel: args.input_channel.into(),
     };
 
