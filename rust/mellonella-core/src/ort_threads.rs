@@ -11,22 +11,31 @@
 //! and the live worker only ever has **one** ONNX session active at
 //! a moment because it runs the chain stages sequentially):
 //!
-//! * `intra_op_num_threads` — the physical core count, clamped at 4.
-//!   The clamp used to be 2 (tuned for 2-vCPU CI VMs), but on a real
-//!   4-8 core laptop that left the heavier per-chunk inferences
-//!   (TSE Conv-TasNet especially) unable to keep up at realtime —
-//!   the live monitor logged a steady ~10-25 underruns/s. Since the
-//!   worker serialises the stages, giving the single active session
-//!   up to 4 threads doesn't oversubscribe the way a 16-thread pool
-//!   on a 2-vCPU box did. Still capped so a 32-core workstation
-//!   doesn't spawn a 32-thread pool for a tiny linear graph.
+//! * `intra_op_num_threads` — the physical core count, clamped at 2.
+//!   #179 briefly raised this to 4 on the theory that the heavier
+//!   per-chunk inferences (TSE Conv-TasNet) needed more cores. A
+//!   bench on a 4-vCPU box proved the opposite — ORT's intra-op pool
+//!   busy-waits, so giving it 4 threads on a 4-core machine starves
+//!   the worker / cpal / OS threads and makes the chain *slower*:
+//!
+//!   | intra | Solo RTF | Overlap (TSE) RTF |
+//!   |------:|---------:|------------------:|
+//!   |     1 |    2.44× |             1.54× |
+//!   |   **2** | **2.75×** |        **1.64×** |
+//!   |     3 |    2.02× |             1.35× |
+//!   |     4 |    1.62× |             1.06× |
+//!
+//!   2 is the clear optimum; everything above it regresses. The clamp
+//!   is back to 2. The real win for an underrunning laptop is a
+//!   lighter TSE (int8 export) or moving ECAPA/TSE off the realtime
+//!   thread, not more threads.
 //! * `inter_op_num_threads` — fixed at 1. We never benefit from
 //!   parallelising ops within a single inference call because the
 //!   graph is essentially linear and small.
 //!
 //! Override via the `MELLONELLA_ORT_INTRA_THREADS` env var when the
-//! defaults don't fit (e.g. a 2-vCPU CI box that wants the old
-//! clamp of 2, or a dedicated server with a wide CPU).
+//! defaults don't fit (e.g. a dedicated server with a wide CPU and
+//! nothing else competing for cores).
 
 /// Returns the intra-op thread count to pin on each `Session`.
 #[must_use]
@@ -38,5 +47,5 @@ pub fn intra_op_threads() -> usize {
     }
     std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
-        .min(4)
+        .min(2)
 }
