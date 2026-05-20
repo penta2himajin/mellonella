@@ -27,12 +27,17 @@ use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 /// jitter shock-absorber between the worker and the cpal output
 /// callback — larger sizes just stack monitoring latency. With
 /// ~10 ms worker chunks at 48 kHz and ~22 ms output callbacks,
-/// 3 chunks leaves ~30 ms of headroom: enough to absorb a single
-/// callback period of jitter and no more. When the ring is full
-/// the producer drops the chunk (same back-pressure semantics as
-/// the input side), so latency is bounded by `RING_CHUNKS` × chunk
-/// duration regardless of pipeline behaviour.
-const RING_CHUNKS: usize = 3;
+/// 6 chunks leaves ~60 ms of headroom. The original value was 3
+/// (~30 ms), but on a real laptop the per-chunk ONNX inferences
+/// (ECAPA refresh, TSE) jitter by more than one callback period,
+/// and 30 ms wasn't enough slack to ride out the heavier chunks —
+/// the live monitor logged a steady stream of underruns. 60 ms is
+/// still well under the perceptual round-trip-monitoring threshold
+/// (~100 ms) while absorbing the inference jitter. When the ring is
+/// full the producer drops the chunk (same back-pressure semantics
+/// as the input side), so latency stays bounded by `RING_CHUNKS` ×
+/// chunk duration regardless of pipeline behaviour.
+const RING_CHUNKS: usize = 6;
 
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
