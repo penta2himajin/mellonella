@@ -390,6 +390,15 @@ impl AppState {
             }
         };
         let dfn3_onnx_path = dfn3_path_from_env();
+        // Auto-resolve the pyannote-3.0 segmentation ONNX so the
+        // streaming engine picks the adaptive (Solo→DFN3 /
+        // Overlap→TSE) routing path. Without this, the engine
+        // falls back to the legacy TSE → DFN3 cascade which both
+        // (a) attenuates voice by ~28 dB and (b) runs both stages
+        // simultaneously per chunk, ~doubling the CPU cost and
+        // producing the steady ~15 underruns/s we saw in the
+        // user's first-run logs.
+        let overlap_onnx_path = mellonella_core::hf_fetch::ensure_overlap_seg_onnx(|_, _| {}).ok();
         let mut pipeline_cfg = self.pipeline_cfg.clone();
         // Auto-resolve TSE ONNX if the user hasn't picked one — the
         // fetcher's cache hit path makes this cheap on every launch
@@ -421,6 +430,7 @@ impl AppState {
                 ..Default::default()
             },
             dfn3_onnx_path,
+            overlap_onnx_path,
             // GUI uses the safe default; multi-channel mic users
             // who want a specific channel use the CLI's
             // `mellonella live --input-channel N` for now. A GUI

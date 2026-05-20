@@ -57,6 +57,15 @@ pub struct SessionConfig {
     /// 48 kHz hop). Forwarded into [`StreamingConfig::dfn3_onnx_path`]
     /// at session construction.
     pub dfn3_onnx_path: Option<PathBuf>,
+    /// When `Some(path)`, the streaming engine wires in the pyannote
+    /// 3.0 segmentation ONNX as an overlap detector and routes the
+    /// chain adaptively: solo speaker → DFN3 only, overlap → TSE only.
+    /// `None` → legacy TSE → DFN3 cascade (which attenuates by ~28 dB
+    /// — definitely not what users want).
+    ///
+    /// Forwarded into [`StreamingConfig::overlap_onnx_path`] at
+    /// session construction.
+    pub overlap_onnx_path: Option<PathBuf>,
     /// How to fold a multi-channel input device's interleaved
     /// frames down to mono. Default `Average` — same as step 12's
     /// hard-coded behaviour. Use `Channel(n)` to pick a specific
@@ -210,7 +219,21 @@ impl LiveSession {
         streaming_cfg
             .dfn3_onnx_path
             .clone_from(&config.dfn3_onnx_path);
+        streaming_cfg
+            .overlap_onnx_path
+            .clone_from(&config.overlap_onnx_path);
         let dfn3_enabled = streaming_cfg.dfn3_onnx_path.is_some();
+        let adaptive_enabled = streaming_cfg.overlap_onnx_path.is_some()
+            && streaming_cfg.pipeline.tse.is_some()
+            && dfn3_enabled;
+        eprintln!(
+            "[audio-io] chain routing: {}",
+            if adaptive_enabled {
+                "ADAPTIVE (Solo→DFN3, Overlap→TSE)"
+            } else {
+                "legacy cascade (TSE → DFN3) — set overlap_onnx_path for adaptive mode"
+            }
+        );
         let pipeline = StreamingPipeline::new(pool, streaming_cfg, components)
             .map_err(|e| AudioIoError::Pipeline(e.to_string()))?;
         if dfn3_enabled {
