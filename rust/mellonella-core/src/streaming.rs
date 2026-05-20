@@ -127,6 +127,7 @@ type DrainedFrame = (Vec<f32>, Vec<f32>);
 /// consumes; `audio_sample_rate` and `diagnostics` are streaming-
 /// specific.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StreamingConfig {
     /// Pipeline-side cadence (window / refresh / VAD threshold /
     /// auto-learn switch / async refresh). `pipeline.sample_rate`
@@ -294,6 +295,33 @@ pub struct StreamingConfig {
     /// disable the crossfade and revert to the Phase 2 hard
     /// transition.
     pub mode_transition_crossfade_samples: u32,
+    /// When `true` and `overlap_rms_match` is also `true`, the
+    /// Overlap path's RMS-match targets the **rolling EMA of recent
+    /// Solo-mode output RMS** instead of the raw mixture input RMS.
+    /// This is what the user actually wants when they say "match
+    /// the TSE output level to the DFN3 output level": during a
+    /// multi-speaker burst the raw input RMS reflects all speakers
+    /// summed (often louder than the lone target's), so matching to
+    /// that boosts TSE output beyond what's comfortable and
+    /// saturates the tanh soft-clip. Matching to the Solo target
+    /// instead keeps perceived loudness consistent across mode
+    /// flips and avoids the "音割れ" artefact reported during
+    /// overlap.
+    ///
+    /// Falls back to raw-input matching when no Solo-mode EMA is
+    /// available yet (e.g. session started directly in Overlap or
+    /// the user has never been in Solo).
+    ///
+    /// Default `true`.
+    pub overlap_match_solo_loudness: bool,
+    /// EMA smoothing factor for the Solo-output loudness tracker.
+    /// Each Solo emit chunk's RMS contributes `alpha`, the
+    /// previous EMA contributes `1 − alpha`. Default `0.10` —
+    /// ~10-chunk (i.e. ~100 ms at the typical chain emit cadence)
+    /// time constant, fast enough to follow speech but slow
+    /// enough that a single quiet chunk doesn't drag the target
+    /// down for the next Overlap segment.
+    pub solo_loudness_ema_alpha: f32,
 }
 
 impl Default for StreamingConfig {
@@ -315,6 +343,8 @@ impl Default for StreamingConfig {
             overlap_rms_match_max_gain_db: 20.0,
             overlap_wet_dry_alpha: 0.9,
             mode_transition_crossfade_samples: 9_600,
+            overlap_match_solo_loudness: true,
+            solo_loudness_ema_alpha: 0.10,
         }
     }
 }
@@ -885,6 +915,13 @@ pub(crate) struct StreamingState {
     /// value during the active crossfade. The **to** value is
     /// the new mode's α (1.0 for Solo, configured for Overlap).
     chain_transition_prev_alpha: f32,
+    /// Rolling EMA of recent **Solo-mode** post-makeup output RMS.
+    /// Updated only while in `ChainMode::Solo`; read by the Overlap
+    /// path's RMS-match when `overlap_match_solo_loudness` is set so
+    /// the extracted-voice level tracks the denoised solo level
+    /// rather than the (louder) raw mixture. Zero until the first
+    /// Solo chunk is emitted.
+    solo_output_rms_ema: f32,
     /// Optional pyannote-3.0 segmentation detector. Present when
     /// [`StreamingConfig::overlap_onnx_path`] resolves and both TSE
     /// and DFN3 are also configured (the toggle has no effect
@@ -1475,6 +1512,7 @@ impl StreamingState {
             chain_transition_total: 0,
             chain_transition_prev_makeup_lin: 1.0,
             chain_transition_prev_alpha: 1.0,
+            solo_output_rms_ema: 0.0,
             overlap_detector: None,
             chain_mode: ChainMode::Solo,
             overlap_above_ms: 0.0,
@@ -1972,16 +2010,20 @@ impl StreamingState {
             // is fairly uniform across speech levels so a fixed
             // offset is appropriate.
             //
-            // Overlap (TSE-only): RMS-match to the raw input over
-            // this emit chunk (Asteroid's canonical Conv-TasNet
-            // rescale). Conv-TasNet outputs are scale-arbitrary so
-            // a static gain over-amplifies quiet stretches and
-            // under-amplifies loud ones. The match ratio is
-            // clamped to `overlap_rms_match_max_gain_db` so a
-            // silent TSE chunk doesn't get boosted into pure
-            // noise. Followed by a wet / dry mix that re-injects a
-            // small amount of raw audio to mask Conv-TasNet's
-            // frame-to-frame mask artefacts.
+            // Overlap (TSE-only): RMS-match the extracted voice to a
+            // target level, then clamp to
+            // `overlap_rms_match_max_gain_db`. The target is either:
+            //   * the rolling EMA of recent **Solo** output RMS
+            //     (`overlap_match_solo_loudness`, default) — keeps
+            //     perceived loudness equal across mode flips and
+            //     stops TSE from being boosted to the (louder) raw
+            //     mixture level, which was saturating the soft-clip
+            //     and producing the "音割れ" the user reported; or
+            //   * the raw-input RMS over this emit chunk (Asteroid's
+            //     canonical Conv-TasNet rescale) as a fallback when
+            //     no Solo EMA exists yet.
+            // Followed by a wet / dry mix that re-injects a small
+            // amount of raw audio to mask Conv-TasNet artefacts.
             let soft_clip_enabled = config.chain_soft_clip;
             let target_makeup_lin = match self.chain_mode {
                 ChainMode::Solo => db_to_lin(config.makeup_gain_db_solo),
@@ -1989,12 +2031,19 @@ impl StreamingState {
                     let static_lin = db_to_lin(config.makeup_gain_db_overlap);
                     let rms_match_lin = if config.overlap_rms_match && !after_dfn3.is_empty() {
                         let n = after_dfn3.len();
-                        let in_sum_sq: f32 =
-                            self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
-                        let in_rms = (in_sum_sq / n.max(1) as f32).sqrt();
                         let out_sum_sq: f32 = after_dfn3.iter().map(|s| s * s).sum();
                         let out_rms = (out_sum_sq / n.max(1) as f32).sqrt();
-                        let raw_ratio = in_rms.max(1e-9) / out_rms.max(1e-9);
+                        // Pick the match target.
+                        let target_rms = if config.overlap_match_solo_loudness
+                            && self.solo_output_rms_ema > 1e-6
+                        {
+                            self.solo_output_rms_ema
+                        } else {
+                            let in_sum_sq: f32 =
+                                self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
+                            (in_sum_sq / n.max(1) as f32).sqrt()
+                        };
+                        let raw_ratio = target_rms.max(1e-9) / out_rms.max(1e-9);
                         let max_lin = db_to_lin(config.overlap_rms_match_max_gain_db);
                         raw_ratio.min(max_lin)
                     } else {
@@ -2008,6 +2057,8 @@ impl StreamingState {
                 ChainMode::Overlap => config.overlap_wet_dry_alpha.clamp(0.0, 1.0),
             };
 
+            let mut solo_active_sum_sq = 0.0_f32;
+            let mut solo_active_count = 0_usize;
             for &x in &after_dfn3 {
                 let g = self
                     .chain_pending_gain
@@ -2049,12 +2100,29 @@ impl StreamingState {
                     mixed
                 };
                 let sample = limited * g;
+                let sample = if sample.is_finite() { sample } else { 0.0 };
                 // Belt-and-braces: replace any non-finite value
                 // with 0 so a poisoned model state can't push NaN /
                 // Inf to the DAC even if the dither earlier didn't
                 // help.
-                out.audio
-                    .push(if sample.is_finite() { sample } else { 0.0 });
+                out.audio.push(sample);
+                // Track the Solo path's active-speech output level
+                // (gate substantially open) so the Overlap path can
+                // match it. Gate-off samples are excluded so trailing
+                // silence doesn't drag the loudness target down.
+                if self.chain_mode == ChainMode::Solo && g > 0.5 {
+                    solo_active_sum_sq += sample * sample;
+                    solo_active_count += 1;
+                }
+            }
+            if self.chain_mode == ChainMode::Solo && solo_active_count > 0 {
+                let chunk_rms = (solo_active_sum_sq / solo_active_count as f32).sqrt();
+                let a = config.solo_loudness_ema_alpha.clamp(0.0, 1.0);
+                self.solo_output_rms_ema = if self.solo_output_rms_ema <= 1e-9 {
+                    chunk_rms
+                } else {
+                    (1.0 - a) * self.solo_output_rms_ema + a * chunk_rms
+                };
             }
             out.tse_applied = self.tse_stage.is_some();
         } else {
