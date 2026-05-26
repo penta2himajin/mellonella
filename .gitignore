@@ -30,3 +30,6 @@ models/
 benchmark_results/
 *.wav
 !tests/**/*.wav
+
+# Claude
+.claude/
