@@ -78,10 +78,10 @@ class StableGatedDeltaCore(nn.Module):
         self.q = nn.Linear(d_model, n_heads * d_k, bias=False)
         self.k = nn.Linear(d_model, n_heads * d_k, bias=False)
         self.v = nn.Linear(d_model, n_heads * d_v, bias=False)
-        self.wg = nn.Linear(d_model, n_heads * d_v)      # channel-wise write gate
-        self.decay = nn.Linear(d_model, n_heads * d_k)   # channel-wise decay (log-space)
-        self.beta = nn.Linear(d_model, n_heads)          # scalar erase strength / head
-        self.g = nn.Linear(d_model, n_heads * d_v)       # output gate
+        self.wg = nn.Linear(d_model, n_heads * d_v)  # channel-wise write gate
+        self.decay = nn.Linear(d_model, n_heads * d_k)  # channel-wise decay (log-space)
+        self.beta = nn.Linear(d_model, n_heads)  # scalar erase strength / head
+        self.g = nn.Linear(d_model, n_heads * d_v)  # output gate
         self.norm = RMSNorm(n_heads * d_v)
         self.out = nn.Linear(n_heads * d_v, d_model, bias=False)
         nn.init.constant_(self.decay.bias, 2.0)
@@ -93,8 +93,8 @@ class StableGatedDeltaCore(nn.Module):
         k = F.normalize(self.k(x).view(n, t, h, dk), dim=-1)
         v = self.v(x).view(n, t, h, dv)
         w = torch.sigmoid(self.wg(x).view(n, t, h, dv))
-        alpha = torch.exp(-F.softplus(self.decay(x).view(n, t, h, dk)))   # (0, 1)
-        beta = 2.0 * torch.sigmoid(self.beta(x).view(n, t, h))            # (0, 2)
+        alpha = torch.exp(-F.softplus(self.decay(x).view(n, t, h, dk)))  # (0, 1)
+        beta = 2.0 * torch.sigmoid(self.beta(x).view(n, t, h))  # (0, 2)
         return q, k, v, w, alpha, beta, self.g(x)
 
     def _cell(self, q, k, v, w, alpha, beta, state):
@@ -105,8 +105,11 @@ class StableGatedDeltaCore(nn.Module):
             bt = beta[:, t].unsqueeze(-1).unsqueeze(-1)
             decayed = alpha[:, t].unsqueeze(-1) * state
             pred = torch.einsum("nhkv,nhk->nhv", decayed, kt)
-            state = decayed - bt * torch.einsum("nhk,nhv->nhkv", kt, pred) \
-                            + bt * torch.einsum("nhk,nhv->nhkv", kt, zt)
+            state = (
+                decayed
+                - bt * torch.einsum("nhk,nhv->nhkv", kt, pred)
+                + bt * torch.einsum("nhk,nhv->nhkv", kt, zt)
+            )
             outs.append(torch.einsum("nhkv,nhk->nhv", state, qt))
         return torch.stack(outs, 1), state
 
@@ -131,16 +134,17 @@ class StableGatedDeltaCore(nn.Module):
         n, t, _ = x.shape
         q, k, v, w, alpha, beta, g = self._proj(x)
         eye = torch.eye(self.dk, device=x.device)
-        amap = (eye - beta[..., None, None] * torch.einsum("bthk,bthj->bthkj", k, k)) \
-            * alpha[:, :, :, None, :]
+        amap = (eye - beta[..., None, None] * torch.einsum("bthk,bthj->bthkj", k, k)) * alpha[
+            :, :, :, None, :
+        ]
         cmap = beta[..., None, None] * torch.einsum("bthk,bthv->bthkv", k, w * v)
         amap = amap.transpose(1, 2).contiguous()
         cmap = cmap.transpose(1, 2).contiguous()
         d = 1
         while d < t:
             left = amap[:, :, d:]
-            amap = torch.cat([amap[:, :, :d], left @ amap[:, :, :t - d]], 2)
-            cmap = torch.cat([cmap[:, :, :d], left @ cmap[:, :, :t - d] + cmap[:, :, d:]], 2)
+            amap = torch.cat([amap[:, :, :d], left @ amap[:, :, : t - d]], 2)
+            cmap = torch.cat([cmap[:, :, :d], left @ cmap[:, :, : t - d] + cmap[:, :, d:]], 2)
             d *= 2
         o = torch.einsum("bhtkv,bthk->bthv", cmap, q).reshape(n, t, self.n_heads * self.dv)
         return self._readout(o, g, n, t)
@@ -153,15 +157,21 @@ class StableGatedDeltaCore(nn.Module):
         bt = beta[:, 0].unsqueeze(-1).unsqueeze(-1)
         decayed = alpha[:, 0].unsqueeze(-1) * state
         pred = torch.einsum("nhkv,nhk->nhv", decayed, kt)
-        state = decayed - bt * torch.einsum("nhk,nhv->nhkv", kt, pred) \
-                        + bt * torch.einsum("nhk,nhv->nhkv", kt, zt)
-        o = torch.einsum("nhkv,nhk->nhv", state, qt).reshape(x_t.shape[0], 1, self.n_heads * self.dv)
+        state = (
+            decayed
+            - bt * torch.einsum("nhk,nhv->nhkv", kt, pred)
+            + bt * torch.einsum("nhk,nhv->nhkv", kt, zt)
+        )
+        o = torch.einsum("nhkv,nhk->nhv", state, qt).reshape(
+            x_t.shape[0], 1, self.n_heads * self.dv
+        )
         return state, self._readout(o, g, x_t.shape[0], 1)
 
 
 # ---------------------------------------------------------------------------
 # Spike checks (CPU, no datasets)
 # ---------------------------------------------------------------------------
+
 
 def check_stability(seeds: int = 8) -> None:
     worst = 0.0
@@ -183,7 +193,7 @@ def check_overfit(seeds: int = 5) -> None:
         core = StableGatedDeltaCore(24, 2, 16, 16)
         x = torch.randn(1, 48, 24)
         y = torch.zeros_like(x)
-        y[:, 2:] = x[:, :-2]                       # delay-2 copy: needs recurrent memory
+        y[:, 2:] = x[:, :-2]  # delay-2 copy: needs recurrent memory
         opt = torch.optim.Adam(core.parameters(), 3e-3)
         for i in range(400):
             opt.zero_grad()
@@ -229,8 +239,15 @@ def check_onnx() -> None:
     state = torch.zeros(1, 2, 16, 16)
     x = torch.randn(1, 1, 24)
     path = "/tmp/bs_deltagridnet_step.onnx"
-    torch.onnx.export(_Step(core), (state, x), path, input_names=["state_in", "x_t"],
-                      output_names=["state_out", "o_t"], dynamo=False, opset_version=17)
+    torch.onnx.export(
+        _Step(core),
+        (state, x),
+        path,
+        input_names=["state_in", "x_t"],
+        output_names=["state_out", "o_t"],
+        dynamo=False,
+        opset_version=17,
+    )
     sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
     state_pt, state_ort = state.clone(), state.clone().numpy()
     err = 0.0
@@ -238,8 +255,7 @@ def check_onnx() -> None:
         x = torch.randn(1, 1, 24)
         with torch.no_grad():
             state_pt, o_pt = core.step(state_pt, x)
-        state_ort, o_ort = sess.run(
-            ["state_out", "o_t"], {"state_in": state_ort, "x_t": x.numpy()})
+        state_ort, o_ort = sess.run(["state_out", "o_t"], {"state_in": state_ort, "x_t": x.numpy()})
         err = max(err, float(np.abs(o_pt.numpy() - o_ort).max()))
     print(f"[onnx]      10-step streaming round-trip max|torch-ort| = {err:.2e}")
     assert err < 1e-4
