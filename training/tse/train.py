@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 
 from .config import TSEConfig
 from .data import TSEMixtureDataset, synthetic_fixture_dataset
-from .loss import neg_si_sdr_loss, si_sdr
+from .loss import composite_loss, si_sdr
 from .model import CausalConvTasNetTSE, count_parameters
 
 
@@ -189,6 +189,8 @@ def overfit_one_batch(
     device: str = "cpu",
     log_every: int = 25,
     seed: int = 0,
+    mr_stft_weight: float = 0.0,
+    mix_consist_weight: float = 0.0,
 ) -> OverfitResult:
     """Overfit a single synthetic mixture for ``steps`` steps.
 
@@ -210,7 +212,13 @@ def overfit_one_batch(
     for step in range(steps):
         optimizer.zero_grad()
         est = model(mixture, cond)
-        loss = neg_si_sdr_loss(est, target)
+        loss = composite_loss(
+            est,
+            target,
+            mixture,
+            mr_stft_weight=mr_stft_weight,
+            mix_consist_weight=mix_consist_weight,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
@@ -245,6 +253,8 @@ def train_epoch(
     scaler: torch.amp.GradScaler | None = None,
     ema: ExponentialMovingAverage | None = None,
     clip_grad_norm: float = 5.0,
+    mr_stft_weight: float = 0.0,
+    mix_consist_weight: float = 0.0,
 ) -> dict[str, float]:
     """One training epoch.
 
@@ -277,7 +287,13 @@ def train_epoch(
             device_type=autocast_device, dtype=amp_dtype, enabled=amp_dtype is not None
         ):
             est = model(mixture, cond)
-            loss = neg_si_sdr_loss(est, target)
+            loss = composite_loss(
+                est,
+                target,
+                mixture,
+                mr_stft_weight=mr_stft_weight,
+                mix_consist_weight=mix_consist_weight,
+            )
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -308,6 +324,8 @@ def evaluate(
     device: str,
     *,
     amp_dtype: torch.dtype | None = None,
+    mr_stft_weight: float = 0.0,
+    mix_consist_weight: float = 0.0,
 ) -> dict[str, float]:
     """No-grad evaluation pass — mirrors `train_epoch`'s loss/SI-SDR
     accumulation contract.
@@ -331,7 +349,13 @@ def evaluate(
             device_type=autocast_device, dtype=amp_dtype, enabled=amp_dtype is not None
         ):
             est = model(mixture, cond)
-            loss = neg_si_sdr_loss(est, target)
+            loss = composite_loss(
+                est,
+                target,
+                mixture,
+                mr_stft_weight=mr_stft_weight,
+                mix_consist_weight=mix_consist_weight,
+            )
         total_loss = total_loss + loss.detach() * bs
         total_sisdr = total_sisdr + si_sdr(target, est).sum()
         n += bs
@@ -627,9 +651,12 @@ def run_training(
     ema_decay: float = 0.0,
     amp: str = "auto",
     clip_grad_norm: float = 5.0,
+    mr_stft_weight: float = 0.0,
+    mix_consist_weight: float = 0.0,
     compile_model: bool = False,
     device: str = "cpu",
     resume: bool = False,
+    init_checkpoint: Path | None = None,
     num_workers: int = 0,
     seed: int = 0,
     val_dataset: TSEMixtureDataset | None = None,
@@ -643,6 +670,18 @@ def run_training(
         torch.backends.cudnn.benchmark = True
 
     model = CausalConvTasNetTSE(config).to(device)
+    # Warm-start: load weights from an arbitrary checkpoint (e.g. the
+    # shipped prod_48k SI-SDR-only model) so a short fine-tune with the
+    # composite anti-artefact loss starts from the trained model rather
+    # than scratch. Loads model weights only — optimizer state and the
+    # epoch counter are left fresh (that's what distinguishes this from
+    # ``--resume``). A ``--resume`` from ``out_dir`` later in this
+    # function takes precedence if both are set.
+    if init_checkpoint is not None:
+        ckpt = torch.load(init_checkpoint, map_location=device)
+        state = ckpt.get("model", ckpt)
+        model.load_state_dict(state)
+        print(f"[train] warm-started from {init_checkpoint}", file=sys.stderr)
     optimizer = _build_optimizer(model, optimizer_name, lr, weight_decay)
     scheduler = _build_scheduler(optimizer, lr_schedule, epochs, warmup_epochs=warmup_epochs)
     amp_dtype = _resolve_amp_dtype(amp, device)
@@ -719,6 +758,8 @@ def run_training(
             scaler=scaler,
             ema=ema,
             clip_grad_norm=clip_grad_norm,
+            mr_stft_weight=mr_stft_weight,
+            mix_consist_weight=mix_consist_weight,
         )
         global_step += len(loader)
         elapsed = time.perf_counter() - t0
@@ -733,7 +774,14 @@ def run_training(
             ema_for_eval = ema  # rebind so mypy keeps the narrowing
             stash = ema_for_eval.swap_with(model) if ema_for_eval is not None else None
             try:
-                val_stats = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
+                val_stats = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    amp_dtype=amp_dtype,
+                    mr_stft_weight=mr_stft_weight,
+                    mix_consist_weight=mix_consist_weight,
+                )
             finally:
                 if ema_for_eval is not None and stash is not None:
                     ema_for_eval.swap_back(model, stash)
@@ -856,6 +904,32 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mr-stft-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the multi-resolution STFT loss added on top of SI-SDR. "
+            "Default 0.0 = pure SI-SDR (legacy behaviour). Set 0.1–0.5 to add "
+            "a spectral-domain perceptual term that suppresses the broadband "
+            "frame-to-frame mask jitter SI-SDR is deaf to — the dominant "
+            "cause of musical-noise / ジャギジャギ artefacts on overlapping "
+            "speech (Kolbæk 2019; Yamamoto 2020). Recommended fine-tune "
+            "value: 0.3."
+        ),
+    )
+    parser.add_argument(
+        "--mix-consist-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the mixture-consistency penalty (Wisdom 2019, single-"
+            "source form). Penalises correlation between the extracted target "
+            "and its residual ``mixture - est`` — discourages the over-"
+            "suppression bursts that produce musical noise in overlap "
+            "regions. Default 0.0 = off. Recommended fine-tune value: 0.1."
+        ),
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="wrap the model in torch.compile (falls back silently if unsupported)",
@@ -911,6 +985,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", type=Path, default=Path("build/tse"), help="output directory")
     parser.add_argument("--resume", action="store_true", help="resume from latest checkpoint")
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "warm-start model weights from this checkpoint before training "
+            "(optimizer/epoch state stay fresh — unlike --resume). Use this "
+            "to fine-tune the shipped prod_48k weights with the composite "
+            "anti-artefact loss (--mr-stft-weight / --mix-consist-weight)."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -959,7 +1044,13 @@ def main(argv: list[str] | None = None) -> int:
         model = CausalConvTasNetTSE(config)
         print(f"[train] overfit mode — params={count_parameters(model):,}", file=sys.stderr)
         result = overfit_one_batch(
-            model, steps=args.overfit_steps, lr=args.lr, device=args.device, seed=args.seed
+            model,
+            steps=args.overfit_steps,
+            lr=args.lr,
+            device=args.device,
+            seed=args.seed,
+            mr_stft_weight=args.mr_stft_weight,
+            mix_consist_weight=args.mix_consist_weight,
         )
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "overfit_metrics.json").write_text(json.dumps(result, indent=2))
@@ -1074,9 +1165,12 @@ def main(argv: list[str] | None = None) -> int:
         ema_decay=args.ema_decay,
         amp=args.amp,
         clip_grad_norm=args.clip_grad_norm,
+        mr_stft_weight=args.mr_stft_weight,
+        mix_consist_weight=args.mix_consist_weight,
         compile_model=args.compile,
         device=args.device,
         resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
         num_workers=args.num_workers,
         seed=args.seed,
         val_dataset=val_dataset,

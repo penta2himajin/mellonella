@@ -196,6 +196,16 @@ def main() -> int:
     ema_decay = os.environ.get("POC_EMA_DECAY", "0.0")
     amp = os.environ.get("POC_AMP", "auto")
     clip_grad_norm = os.environ.get("POC_CLIP_GRAD_NORM", "5.0")
+    # Composite-loss anti-artefact terms (default off → pure SI-SDR).
+    # `POC_MR_STFT_WEIGHT=0.3` + `POC_MIX_CONSIST_WEIGHT=0.1` is the
+    # recommended fine-tune recipe for reducing musical noise on the
+    # extracted target during overlapping speech.
+    mr_stft_weight = os.environ.get("POC_MR_STFT_WEIGHT", "0.0")
+    mix_consist_weight = os.environ.get("POC_MIX_CONSIST_WEIGHT", "0.0")
+    # Warm-start from an existing checkpoint (e.g. the shipped prod_48k
+    # weights) so a short fine-tune run picks up where the SI-SDR-only
+    # model left off rather than training from scratch.
+    resume_checkpoint = os.environ.get("POC_CHECKPOINT", "")
     poc_device = os.environ.get("POC_DEVICE", "cuda")
     num_workers = os.environ.get("POC_NUM_WORKERS", "2")
     val_speakers = os.environ.get("POC_VAL_SPEAKERS", "0")
@@ -235,6 +245,10 @@ def main() -> int:
         amp,
         "--clip-grad-norm",
         clip_grad_norm,
+        "--mr-stft-weight",
+        mr_stft_weight,
+        "--mix-consist-weight",
+        mix_consist_weight,
         "--device",
         poc_device,
         "--num-workers",
@@ -248,6 +262,8 @@ def main() -> int:
         "--out",
         str(out_dir),
     ]
+    if resume_checkpoint:
+        cmd.extend(["--init-checkpoint", resume_checkpoint])
     if os.environ.get("POC_COMPILE", "0") not in ("0", "", "false", "False"):
         cmd.append("--compile")
     _run(cmd, cwd=repo_dir / "training")
