@@ -121,18 +121,14 @@ def multi_resolution_stft_loss(
     `estimate` and `target` must share shape ``(B, T)``.
     """
     if estimate.shape != target.shape:
-        raise ValueError(
-            f"shape mismatch: {tuple(estimate.shape)} vs {tuple(target.shape)}"
-        )
+        raise ValueError(f"shape mismatch: {tuple(estimate.shape)} vs {tuple(target.shape)}")
     if len(n_ffts) != len(hops):
         raise ValueError("n_ffts and hops must have the same length")
     losses = []
     for n_fft, hop in zip(n_ffts, hops, strict=True):
         e = _stft_mag(estimate, n_fft, hop)
         t = _stft_mag(target, n_fft, hop)
-        sc = torch.linalg.norm(t - e, dim=(1, 2)) / (
-            torch.linalg.norm(t, dim=(1, 2)) + eps
-        )
+        sc = torch.linalg.norm(t - e, dim=(1, 2)) / (torch.linalg.norm(t, dim=(1, 2)) + eps)
         log_l1 = torch.mean(
             torch.abs(torch.log(t + eps) - torch.log(e + eps)),
             dim=(1, 2),
@@ -161,16 +157,13 @@ def mixture_consistency_loss(
     Returns the mean squared normalised correlation (per item, then mean).
     """
     if estimate.shape != mixture.shape:
-        raise ValueError(
-            f"shape mismatch: {tuple(estimate.shape)} vs {tuple(mixture.shape)}"
-        )
+        raise ValueError(f"shape mismatch: {tuple(estimate.shape)} vs {tuple(mixture.shape)}")
     est = estimate - estimate.mean(dim=-1, keepdim=True)
     residual = mixture - estimate
     residual = residual - residual.mean(dim=-1, keepdim=True)
     cross = (est * residual).sum(dim=-1)
-    denom = (
-        torch.sqrt((est * est).sum(dim=-1) + eps)
-        * torch.sqrt((residual * residual).sum(dim=-1) + eps)
+    denom = torch.sqrt((est * est).sum(dim=-1) + eps) * torch.sqrt(
+        (residual * residual).sum(dim=-1) + eps
     )
     return ((cross / denom) ** 2).mean()
 
@@ -201,8 +194,6 @@ def composite_loss(
         loss = loss + mr_stft_weight * multi_resolution_stft_loss(estimate, target)
     if mix_consist_weight > 0.0:
         if mixture is None:
-            raise ValueError(
-                "mix_consist_weight > 0 but mixture is None — pass the mixture tensor"
-            )
+            raise ValueError("mix_consist_weight > 0 but mixture is None — pass the mixture tensor")
         loss = loss + mix_consist_weight * mixture_consistency_loss(estimate, mixture)
     return loss
