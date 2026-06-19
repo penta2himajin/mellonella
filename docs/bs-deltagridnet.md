@@ -220,6 +220,12 @@ Conv-TasNet with global FiLM conditioning — a deliberately shippable, commodit
 GPU-trainable baseline. **BS-DeltaGridNet is the north star that baseline aims
 at**, not a replacement to be merged blindly.
 
+> **Trainability spike (done):** the time-axis core has since been prototyped in
+> pure PyTorch — it is numerically stable, trains across seeds, and exports to
+> ONNX, but the per-step recurrence is throughput-bound on a free T4. Full
+> findings and the remaining chunkwise-matmul work are in
+> [`bs-deltagridnet-trainability.md`](bs-deltagridnet-trainability.md).
+
 The two open questions, to be answered in a follow-up after this spec lands:
 
 1. **Where can we train it?** The efficient Gated DeltaNet-2 training path leans
