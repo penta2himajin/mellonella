@@ -63,6 +63,7 @@ present in the frame, the frame passes.
 | [docs/benchmarks.md](docs/benchmarks.md) | Evaluation datasets, scenarios, minimal eval set |
 | [docs/evaluation.md](docs/evaluation.md) | Evaluation protocol, pass/fail criteria, result management |
 | [docs/references.md](docs/references.md) | Related work, public models, related repositories |
+| [docs/bs-deltagridnet.md](docs/bs-deltagridnet.md) | North-star Stage C TSE architecture (BS-DeltaGridNet): aspirational, quality-ceiling design |
 | [docs/ladspa.md](docs/ladspa.md) | Linux LADSPA plugin: build, install, PipeWire virtual-mic integration |
 | [docs/apo.md](docs/apo.md) | Windows APO plugin: build, register, attach to a capture endpoint |
 
