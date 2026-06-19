@@ -91,6 +91,60 @@ python -m tse.train --epochs 100 --data-dir data/ --out build/tse
 It writes per-epoch checkpoints (`ckpt_epoch*.pt`) and a `metrics.json`,
 and supports `--resume`.
 
+### Fine-tuning to reduce overlap musical noise (composite loss)
+
+Pure SI-SDR training leaves audible musical-noise / "ジャギジャギ"
+artefacts on the extracted target during **overlapping speech** — SI-SDR
+is a waveform-level, scale-invariant objective that is deaf to the
+time-varying spectral structure humans hear as grit (Kolbæk 2019), and
+masking in Conv-TasNet's learned basis makes that mask jitter decode into
+broadband bursts. Post-hoc DSP (mask flooring, mask EMA, decision-directed
+Wiener) was measured to barely move the artefact (1–10 %), because it isn't
+separable additive noise — it's signal distortion baked in by the loss.
+
+The fix is a **composite loss** (opt-in, default off so existing runs are
+byte-identical):
+
+* `--mr-stft-weight 0.3` — adds a multi-resolution STFT loss (Yamamoto
+  2020 formulation: spectral convergence + log-mag L1 at FFT sizes
+  512/1024/2048) on top of SI-SDR. This supervises the spectral domain
+  SI-SDR ignores, suppressing the broadband mask jitter.
+* `--mix-consist-weight 0.1` — adds a mixture-consistency penalty (Wisdom
+  2019, single-source form): penalises correlation between the extracted
+  target and its residual `mixture - est`, discouraging the
+  over-suppression bursts that dominate overlap regions.
+
+Recommended workflow — **fine-tune the shipped prod weights** rather than
+training from scratch, using `--init-checkpoint` to warm-start (loads model
+weights only; optimizer/epoch state stay fresh, unlike `--resume`):
+
+```bash
+# Warm-start from the shipped prod_48k checkpoint and fine-tune ~5-15
+# epochs with the composite anti-artefact loss at a low LR.
+python -m tse.train \
+  --config prod_48k \
+  --data-dir data/ --data-source vctk-demand \
+  --init-checkpoint path/to/tse_prod_48k.weights.pt \
+  --mr-stft-weight 0.3 --mix-consist-weight 0.1 \
+  --lr 5e-5 --epochs 10 \
+  --out build/tse-finetune
+
+# Then export the streaming ONNX from the best checkpoint as usual.
+python scripts/export_tse_onnx.py export-and-verify \
+  --config prod_48k --chunk 480 \
+  --checkpoint build/tse-finetune/ckpt_epoch*.pt \
+  --output build/tse_prod_48k.onnx
+```
+
+The composite weights are tunable: raise `--mr-stft-weight` toward 0.5 for
+more spectral smoothing (at a small SI-SDR cost), or set both to 0 to
+recover the legacy SI-SDR-only objective. A 60-step overfit sanity check
+showed the composite loss reaches within ~0.4 dB of the SI-SDR-only final
+SI-SDR, confirming the extra terms don't degrade separation.
+
+On Kaggle the same knobs are env vars: `POC_MR_STFT_WEIGHT`,
+`POC_MIX_CONSIST_WEIGHT`, and `POC_CHECKPOINT` (warm-start path).
+
 For the 48 kHz production model, pass `--config prod_48k` and point
 `--data-dir` at a VCTK + DEMAND root (`--data-source vctk-demand`). The
 `--clip-grad-norm` flag (default `5.0`, tighter values `1.0`/`0.5`) is
