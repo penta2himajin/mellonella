@@ -152,6 +152,91 @@ chunks): (1) mask the decay-ratio's strict-upper triangle to `-inf` *before*
 inter-chunk carry ratio `γ_last/γ_j` in log space (a plain division underflows
 to `γ_j = 0` → `inf`). The mild-decay parity test did not catch these.
 
+## 4c. Scaling the end-to-end model: depth needs ReZero; data is the next wall
+
+Pushing past the 1-block smoke (LibriSpeech dev-clean, 16 kHz, on-the-fly
+2-speaker mixtures, SI-SDR loss) surfaced two things — one solved, one open.
+
+**Depth collapse → fixed with ReZero.** Stacking the time core into a deeper
+residual network made *training* collapse to ~passthrough. A controlled ablation
+from the working 1-block baseline (changing one variable at a time) isolated the
+cause unambiguously — it is **depth**, not the core / conditioning / mask / band
+split / segment length:
+
+| Variant (in-pool unless noted) | train SI-SDR | eval |
+|---|---|---|
+| V0 reproduce (1 block, 2.0 s) | +0.97 | +1.04 |
+| V1 + speaker split (unseen eval) | +1.38 | +0.43 (generalisation gap) |
+| **V2 + depth (N=4 residual)** | **+0.14** | **+0.04** (collapses) |
+| V3 + 2.5 s segments | +1.01 | +0.88 |
+
+The fix is the standard deep-residual remedy — **ReZero / LayerScale**: a
+learnable per-branch scalar initialised at 0, so the network starts as identity
+and grows the residual contributions during training. With it, depth trains and
+*helps*:
+
+| Config (in-pool) | train | eval |
+|---|---|---|
+| N=4 plain | +0.28 | +0.65 |
+| **N=4 + ReZero** | +1.06 | **+1.48** |
+| **N=8 + ReZero** | +1.01 | +1.42 |
+
+**Data scale is the next wall.** A faithful mini-grid (mel band-split → N×[causal
+gated-delta time core + bidirectional cross-band GRU + FFN], all residual
+branches ReZero-gated → bounded complex mask), conditioned on a **frozen ECAPA**
+192-dim embedding (`speechbrain/spkrec-ecapa-voxceleb`, Apache-2.0, not in the
+training graph), now trains without collapsing (train climbs to ~+2 dB) — but
+**overfits**: seen-speaker SI-SDR +1.4 while unseen degrades to −1.2 and gets
+*worse* as training proceeds. dev-clean is far too small for a speaker-conditioned
+extractor (40 speakers, ~5 h; we train on 32). The ReZero scales also stayed near
+0, i.e. the grid blocks were barely engaged. Both point to needing real training
+scale (e.g. train-clean-100: 251 speakers / 100 h, or LibriMix), regularisation,
+an MR-STFT auxiliary loss, and more steps — standard "scale + tune" work, not a
+fundamental blocker.
+
+**Scaling up confirms the approach generalises and is genuinely
+target-conditioned.** Training the same mini-grid on **train-clean-100 (251
+speakers)** with `torch.compile`, MR-STFT aux loss, weight decay, and a
+warmup+cosine schedule for 15 k steps (~1.75 h on a T4), evaluated on **disjoint
+dev-clean speakers**:
+
+| Metric (unseen unless noted) | SI-SDR |
+|---|---|
+| unseen, 0 dB mix | **+2.12 dB** (vs 0 dB passthrough) |
+| unseen, +5 dB SIR | +5.84 dB (vs +5) |
+| seen, 0 dB | +2.42 dB |
+
+The overfitting is gone — **seen ≈ unseen**, confirming the dev-clean failure was
+a *data-scale* problem, not architecture/conditioning. So the north-star approach
+**does extract on unseen speakers and generalises**.
+
+A wrong-enrollment + per-branch ablation (on a 5 k-step snapshot) then checked
+*how* it works — and refuted two earlier worries:
+
+| Ablation (unseen, 0 dB) | SI-SDR | reading |
+|---|---|---|
+| correct enrollment | +0.71 | baseline |
+| **wrong** enrollment (other speaker) | −1.41 | **−2.1 dB → conditioning is target-specific**, not generic enhancement |
+| random enrollment | −0.68 | −1.4 dB → embedding genuinely drives selection |
+| kill time core (rt=0) | −0.70 | **−1.4 dB → the time core is *not* idle** |
+| kill cross-band (rb=0) | −2.45 | −3.2 dB → cross-band GRU is the biggest contributor |
+| kill FFN (rf=0) | +0.35 | −0.4 dB |
+| kill all blocks | −11.35 | the bare band-split/merge linear mask is useless; the blocks do the work |
+
+Two corrections to first impressions: (1) the small learned **ReZero scalars are
+a misleading proxy** — `rt ≈ 0.01` looks "idle" but ablating the time branch
+still costs 1.4 dB (the branch output magnitude compensates for the small
+scalar); (2) the model is **genuinely target-conditioned** (wrong/random
+enrollment costs 1.4–2.1 dB), not doing speaker-agnostic enhancement. So there is
+**no structural defect** — all components contribute (cross-band > time core >
+FFN) and the conditioning works.
+
+The remaining gap to competitive SI-SDRi is therefore **capacity + scale**, not a
+bug: the model is tiny (~1.3 M) and trained briefly (~1.75 h) versus, e.g.,
+TF-GridNet (~20 M, trained for days on LibriMix). Quality levers from here:
+more capacity (C / N / heads), longer training, a higher-ceiling output stage
+(deep filtering), and strengthening the dominant cross-band path.
+
 ## 5. Conclusion & next steps
 
 - **Stability and ONNX-exportability are solved** in pure PyTorch; the mechanism
@@ -176,10 +261,22 @@ work:
   flash-linear-attention kernels on **paid Ampere** (Colab Pro+ / cloud A100), if
   an ablation shows it earns its keep for TSE.
 
+- **End-to-end training mechanics are understood** (§4c): the core trains in a
+  real STFT TSE; deeper models need **ReZero/LayerScale** on every residual
+  branch (without it, depth collapses to passthrough). With ReZero, depth helps.
+- **At scale it generalises and is target-conditioned** (§4c): train-clean-100
+  gives unseen +2.1 dB (seen ≈ unseen), and an ablation confirms the conditioning
+  is target-specific and every block contributes — no structural defect.
+- **Remaining quality gap is capacity + scale, not architecture**: the model is
+  tiny (~1.3 M) and briefly trained. Real quality needs more capacity, longer
+  training, a higher-ceiling output stage, and/or LibriMix-scale data.
+
 Remaining decisions / next steps:
 
 - ✅ Ad-hoc throughput tuning — `torch.compile` gives a safe ~2.4× (fp16-AMP an
   opt-in further +25%); see the table in §2.
-- A small **real-data** training run (LibriSpeech / VCTK + DEMAND) to confirm
-  SI-SDRi moves when the core is dropped into an end-to-end TSE.
+- ✅ Real-data integration + end-to-end training mechanics (§4b, §4c) — the core
+  trains end-to-end; depth needs ReZero; data scale is the next wall.
+- A **larger-scale training run** (train-clean-100 / LibriMix, regularisation,
+  MR-STFT, more steps) to turn the working mechanics into competitive SI-SDRi.
 - Decide whether channel-wise erase/decay is worth the kernel/hardware cost.
