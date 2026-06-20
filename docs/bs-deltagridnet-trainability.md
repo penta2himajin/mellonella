@@ -133,6 +133,25 @@ both pre-Ampere. flash-linear-attention's fused delta kernels target CC ≥ 8.0,
 so the **validated Triton path is not runnable on Kaggle** — it would need Colab
 Pro+ (A100/L4) or a cloud A100 (paid).
 
+## 4b. Real-data sanity (LibriSpeech)
+
+The stable core was dropped into a minimal end-to-end STFT TSE — STFT encoder →
+FiLM conditioning on a jointly-learned enrollment embedding → chunkwise core →
+complex-mask decoder → iSTFT, trained with SI-SDR on on-the-fly LibriSpeech
+dev-clean 2-speaker mixtures (target + interferer, separate enrollment clip).
+A 0.3 M-param model over 600 steps (~75 s on a T4) moved held-out SI-SDR from the
+**0 dB mixture baseline to +1.3 dB**, training stably (no NaN). The absolute
+number is small (tiny model, naive mask, weak ref encoder, no tuning), but it
+confirms the core **learns to extract the enrolled target end-to-end on real
+audio** with a waveform loss — the integration works.
+
+Two numerical-safety fixes to the chunkwise were required and are now in the
+spike (with a strengthened parity test that exercises strong decay over multiple
+chunks): (1) mask the decay-ratio's strict-upper triangle to `-inf` *before*
+`exp` (otherwise `exp(+large)·0 = nan` under strong decay); (2) compute the
+inter-chunk carry ratio `γ_last/γ_j` in log space (a plain division underflows
+to `γ_j = 0` → `inf`). The mild-decay parity test did not catch these.
+
 ## 5. Conclusion & next steps
 
 - **Stability and ONNX-exportability are solved** in pure PyTorch; the mechanism
@@ -140,8 +159,10 @@ Pro+ (A100/L4) or a cloud A100 (paid).
   lucky-seed + the normalise bug — now corrected and verified across seeds.
 - **Throughput is solved too.** The chunkwise-WY reformulation
   (`chunkwise_gated_delta`) is ~84× faster than the per-step loop (~2.3M tok/s,
-  ~5.5 h/epoch) and parity-exact, so **path A (Kaggle-native, free T4) is
-  viable** — no Triton, no paid Ampere required.
+  ~5.5 h/epoch), `torch.compile` adds a further ~2.4×, and it is parity-exact, so
+  **path A (Kaggle-native, free T4) is viable** — no Triton, no paid Ampere.
+- **Real-data smoke passes**: SI-SDR moves 0 → +1.3 dB on held-out LibriSpeech
+  mixtures (§4b).
 
 What this stable+fast core is, precisely: scalar-β Householder erase, **scalar**
 per-head decay, channel-wise write gate, post-cell RMSNorm. It is essentially

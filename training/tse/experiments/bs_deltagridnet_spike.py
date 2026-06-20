@@ -230,7 +230,11 @@ def chunkwise_gated_delta(q, k, v, w, alpha, beta, chunk: int = 64):
         n = kc.shape[1]
         log_g = torch.cumsum(log_a[:, cs], 1)  # cumulative log-decay (≤ 0)
         gamma = torch.exp(log_g)  # γ_i ∈ (0, 1]
-        ratio = torch.exp(log_g[:, :, None] - log_g[:, None, :]) * tri[:n, :n]  # γ_i/γ_j ≤ 1
+        # γ_i/γ_j as exp of a *masked* log-difference: the strict-upper entries
+        # would be exp(+large) = inf under strong decay, so mask them to -inf
+        # (→ 0) *before* exp rather than zeroing after (inf·0 = nan).
+        diff = (log_g[:, :, None] - log_g[:, None, :]).masked_fill(tri[:n, :n] == 0, float("-inf"))
+        ratio = torch.exp(diff)  # lower-triangular incl. diagonal, all ≤ 1
         kk = torch.einsum("lid,ljd->lij", kc, kc)
         qk = torch.einsum("lid,ljd->lij", qc, kc)
         a_mat = eye[:n, :n].expand(lanes, n, n) + bc[:, :, None] * (ratio * kk) * strict[:n, :n]
@@ -238,12 +242,13 @@ def chunkwise_gated_delta(q, k, v, w, alpha, beta, chunk: int = 64):
         rhs = bc[:, :, None] * (zc - gamma[:, :, None] * ks)
         u = torch.linalg.solve_triangular(a_mat, rhs, upper=False, unitriangular=True)
         qs = torch.einsum("lid,ldv->liv", qc, state)
-        out.append(
-            gamma[:, :, None] * qs + torch.einsum("lij,ljv->liv", (ratio * qk) * tri[:n, :n], u)
-        )
-        g_last = gamma[:, -1]
-        state = g_last[:, None, None] * state + torch.einsum(
-            "lid,liv->ldv", kc * (g_last[:, None] / gamma)[:, :, None], u
+        out.append(gamma[:, :, None] * qs + torch.einsum("lij,ljv->liv", ratio * qk, u))
+        # Carry: state ← γ_last·state + Σ_j (γ_last/γ_j)·k_j u_jᵀ. Compute the
+        # γ_last/γ_j ratio in log space (≤ 1) — a plain division underflows to
+        # γ_j = 0 for strongly-decayed frames and yields inf.
+        carry = torch.exp(log_g[:, -1:] - log_g)  # γ_last/γ_j ≤ 1, division-free
+        state = torch.exp(log_g[:, -1])[:, None, None] * state + torch.einsum(
+            "lid,liv->ldv", kc * carry[:, :, None], u
         )
     return torch.cat(out, 1), state
 
@@ -343,19 +348,24 @@ def check_onnx() -> None:
 
 def check_chunkwise() -> None:
     torch.manual_seed(0)
-    lanes, t_len, d, dv = 4, 40, 8, 8
-    q = F.normalize(torch.randn(lanes, t_len, d), dim=-1)
-    k = F.normalize(torch.randn(lanes, t_len, d), dim=-1)
-    v = torch.randn(lanes, t_len, dv)
-    w = torch.sigmoid(torch.randn(lanes, t_len, dv))
-    alpha = torch.sigmoid(torch.randn(lanes, t_len) + 2.0)  # scalar decay ∈ (0, 1)
-    beta = 2.0 * torch.sigmoid(torch.randn(lanes, t_len))  # ∈ (0, 2)
-    o_ref, s_ref = recurrent_gated_delta(q, k, v, w, alpha, beta)
+    lanes, t_len, d, dv = 4, 200, 8, 8
     worst = 0.0
-    for chunk in (8, 16, 40):
-        o_c, s_c = chunkwise_gated_delta(q, k, v, w, alpha, beta, chunk=chunk)
-        worst = max(worst, (o_ref - o_c).abs().max().item(), (s_ref - s_c).abs().max().item())
-    print(f"[chunkwise] WY vs recurrent (chunks 8/16/40)  max|Δ| = {worst:.2e}")
+    # Cover mild *and* strong decay across chunk sizes that don't divide t_len —
+    # strong decay (small alpha over a chunk) is what exposes the log-space
+    # numerical-safety requirements (masked ratio, division-free carry).
+    for decay_bias in (2.0, -2.0):  # alpha ≈ 0.85  vs  ≈ 0.12 (strong)
+        q = F.normalize(torch.randn(lanes, t_len, d), dim=-1)
+        k = F.normalize(torch.randn(lanes, t_len, d), dim=-1)
+        v = torch.randn(lanes, t_len, dv)
+        w = torch.sigmoid(torch.randn(lanes, t_len, dv))
+        alpha = torch.sigmoid(torch.randn(lanes, t_len) + decay_bias)
+        beta = 2.0 * torch.sigmoid(torch.randn(lanes, t_len))
+        o_ref, s_ref = recurrent_gated_delta(q, k, v, w, alpha, beta)
+        for chunk in (16, 50, 64):
+            o_c, s_c = chunkwise_gated_delta(q, k, v, w, alpha, beta, chunk=chunk)
+            assert torch.isfinite(o_c).all(), f"non-finite chunkwise output (bias={decay_bias})"
+            worst = max(worst, (o_ref - o_c).abs().max().item(), (s_ref - s_c).abs().max().item())
+    print(f"[chunkwise] WY vs recurrent (mild+strong decay, chunks 16/50/64)  max|Δ| = {worst:.2e}")
     assert worst < 1e-4
 
 
