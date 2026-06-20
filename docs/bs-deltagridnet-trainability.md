@@ -16,8 +16,8 @@ Reproducible spike: [`training/tse/experiments/bs_deltagridnet_spike.py`](../tra
 | Does the gated-delta mechanism train in **pure PyTorch (no Triton)**? | **Yes** — once stabilised, it trains across seeds on CPU and T4. |
 | Does the streaming step **export to ONNX** (deployment gate ①)? | **Yes** — single-step recurrence round-trips at ~5e-7. |
 | Is it **numerically stable**? | **Yes, with the standard recipe** (see §3). A naive channel-wise-erase form diverges. |
-| Is it **training-throughput-viable on a free T4** (gate ②)? | **Not yet** — the per-step loop is launch-bound (~28k tok/s → ~114 h/epoch). Needs a chunkwise-matmul (WY) reformulation. |
-| Can we use the **validated Triton kernels** on Kaggle instead? | **No** — Kaggle free tier exposes only T4 / P100 (pre-Ampere, CC < 8.0); flash-linear-attention needs CC ≥ 8.0. |
+| Is it **training-throughput-viable on a free T4** (gate ②)? | **Yes, with the chunkwise-WY reformulation** — ~2.3M tok/s (≈84× the per-step loop), ~5.5 h/epoch. The per-step loop alone was launch-bound (~28k tok/s → ~114 h/epoch). |
+| Can we use the **validated Triton kernels** on Kaggle instead? | **No** — Kaggle free tier exposes only T4 / P100 (pre-Ampere, CC < 8.0); flash-linear-attention needs CC ≥ 8.0. The chunkwise-WY path above is pure PyTorch, so it does not need them. |
 
 ## 1. Method
 
@@ -56,6 +56,46 @@ structure): ~28k tok/s before and after. Reducing dims/bands/clip length only
 helps linearly; the gap to a usable epoch time is ~100×, so it needs the
 algorithmic (chunkwise-matmul) change, not parameter tweaks.
 
+**Chunkwise-WY (the fix), Kaggle T4, fwd+bwd, L = 256 lanes, d=dv=64:**
+
+| Config | ms/step | peak | throughput |
+|---|---|---|---|
+| per-step loop (baseline) | 2300 | 1.46 GB | 27.8k tok/s |
+| chunkwise-WY, chunk=32 | 164 | 1.04 GB | 1.56M tok/s |
+| chunkwise-WY, chunk=64 | 110 | 1.05 GB | **2.32M tok/s** |
+| chunkwise-WY, chunk=128 | 95 | 1.19 GB | 2.70M tok/s |
+| **1-epoch** (B=2, K=32, 1 s, 100 h, chunk=64) | — | — | **≈5.5 h/epoch** |
+
+The chunkwise form (`chunkwise_gated_delta` in the spike) is the *same* gated
+delta rule re-expressed as batched matmuls + one triangular solve per chunk,
+with only `T/chunk` sequential steps — it hits tensor cores and is **~84× faster**
+than the per-step loop, parity-exact (`max|Δ| ≈ 3e-7` vs the recurrent
+reference), and memory-light (~1 GB). This moves the time core from
+~114 h/epoch to ~5.5 h/epoch — **viable on a free T4**. To keep the chunk algebra
+a clean matmul the decay is **scalar per head** (Gated-DeltaNet style) rather
+than channel-wise; decay is folded via log-cumsum *ratios* (≤ 1, no underflow).
+
+**Ad-hoc speedups on top of chunkwise-WY (T4, same shape, fwd+bwd):**
+
+| Variant | ms/step | throughput | vs eager |
+|---|---|---|---|
+| eager fp32, chunk=64 | 111 | 2.30M tok/s | 1.0× |
+| eager fp32, chunk=128 | 95 | 2.69M tok/s | 1.17× |
+| **`torch.compile`, chunk=64** | 46 | **5.56M tok/s** | **2.4×** |
+| fp16 autocast (eager), chunk=64 | 117 | 2.20M tok/s | ~1.0× |
+| `torch.compile` + fp16 autocast, chunk=64 | 37 | 6.99M tok/s | 3.0× |
+
+- **`torch.compile` is the safe ~2.4× win** (Inductor fuses the per-chunk
+  elementwise ops + loop overhead; output stays fp32, all finite). Just wrap the
+  function. Note the optimum flips to **chunk=64** under compile (the per-chunk
+  fixed cost is fused away, so more-but-cheaper chunks win).
+- **fp16 autocast alone barely helps** on a T4 (small `d`, and `solve_triangular`
+  doesn't benefit); it only adds value *under* compile (+25%) and carries fp16
+  numerics risk — treat as opt-in pending a convergence/parity check.
+
+Cumulatively: per-step loop ~28k → chunkwise-WY ~2.3M → +`torch.compile` ~5.6M
+lane-tok/s (~200×), i.e. ~2.3 h/epoch on the conservative estimate above.
+
 ## 3. Why a naive recurrence diverged, and the stabilisation recipe
 
 A naive Gated-DeltaNet-2 step with a **channel-wise erase gate**
@@ -93,22 +133,53 @@ both pre-Ampere. flash-linear-attention's fused delta kernels target CC ≥ 8.0,
 so the **validated Triton path is not runnable on Kaggle** — it would need Colab
 Pro+ (A100/L4) or a cloud A100 (paid).
 
-## 5. Conclusion & next step
+## 4b. Real-data sanity (LibriSpeech)
+
+The stable core was dropped into a minimal end-to-end STFT TSE — STFT encoder →
+FiLM conditioning on a jointly-learned enrollment embedding → chunkwise core →
+complex-mask decoder → iSTFT, trained with SI-SDR on on-the-fly LibriSpeech
+dev-clean 2-speaker mixtures (target + interferer, separate enrollment clip).
+A 0.3 M-param model over 600 steps (~75 s on a T4) moved held-out SI-SDR from the
+**0 dB mixture baseline to +1.3 dB**, training stably (no NaN). The absolute
+number is small (tiny model, naive mask, weak ref encoder, no tuning), but it
+confirms the core **learns to extract the enrolled target end-to-end on real
+audio** with a waveform loss — the integration works.
+
+Two numerical-safety fixes to the chunkwise were required and are now in the
+spike (with a strengthened parity test that exercises strong decay over multiple
+chunks): (1) mask the decay-ratio's strict-upper triangle to `-inf` *before*
+`exp` (otherwise `exp(+large)·0 = nan` under strong decay); (2) compute the
+inter-chunk carry ratio `γ_last/γ_j` in log space (a plain division underflows
+to `γ_j = 0` → `inf`). The mild-decay parity test did not catch these.
+
+## 5. Conclusion & next steps
 
 - **Stability and ONNX-exportability are solved** in pure PyTorch; the mechanism
   trains. The earlier "trainable ✅ (CPU)" claim was over-stated due to a
   lucky-seed + the normalise bug — now corrected and verified across seeds.
-- **The single remaining blocker is training throughput.** The path forward is a
-  **chunkwise matmul (WY)** reformulation of the *stable* recurrence (tensor-core
-  friendly), expected to deliver the 10–50× needed for a free-tier T4. The
-  affine-scan used for parity is O(T·dk³) and not a training option.
+- **Throughput is solved too.** The chunkwise-WY reformulation
+  (`chunkwise_gated_delta`) is ~84× faster than the per-step loop (~2.3M tok/s,
+  ~5.5 h/epoch), `torch.compile` adds a further ~2.4×, and it is parity-exact, so
+  **path A (Kaggle-native, free T4) is viable** — no Triton, no paid Ampere.
+- **Real-data smoke passes**: SI-SDR moves 0 → +1.3 dB on held-out LibriSpeech
+  mixtures (§4b).
 
-Decision this sets up:
+What this stable+fast core is, precisely: scalar-β Householder erase, **scalar**
+per-head decay, channel-wise write gate, post-cell RMSNorm. It is essentially
+**Gated DeltaNet**. Two things are *not* yet included and remain optional future
+work:
 
-- **A (Kaggle-native):** implement the chunkwise-matmul WY form of the stable
-  core in pure PyTorch → re-bench on T4. If it lands in a usable epoch time, the
-  free-tier path is viable.
-- **B (paid Ampere):** use the validated NVlabs / flash-linear-attention GDN-2
-  kernels on Colab Pro+ / cloud A100 — recovers the channel-wise erase too.
-- **C (de-scope):** swap the time core for a structurally-cheaper stable operator
-  (S4D / Mamba-3) that is matmul/conv-friendly on a free T4.
+- **Channel-wise decay** (KDA) — needs a `[chunk, chunk, d]` ratio tensor in the
+  chunk algebra (more expensive); scalar decay was chosen for the clean fast path.
+- **Channel-wise erase** (Gated-DeltaNet-2's headline novelty) — needs the full
+  gate-aware WY kernel; best recovered via the validated NVlabs /
+  flash-linear-attention kernels on **paid Ampere** (Colab Pro+ / cloud A100), if
+  an ablation shows it earns its keep for TSE.
+
+Remaining decisions / next steps:
+
+- ✅ Ad-hoc throughput tuning — `torch.compile` gives a safe ~2.4× (fp16-AMP an
+  opt-in further +25%); see the table in §2.
+- A small **real-data** training run (LibriSpeech / VCTK + DEMAND) to confirm
+  SI-SDRi moves when the core is dropped into an end-to-end TSE.
+- Decide whether channel-wise erase/decay is worth the kernel/hardware cost.
