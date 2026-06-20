@@ -58,8 +58,19 @@ carry) plus a chunk-local term computed from zero state (the triangular solve),
 and re-stitching the chunks is exact. The per-step `Aₜ` is the same operator
 proved non-expansive in `Stability.lean`, so the carry stays bounded.
 
+### `Causality.lean` — causality (handoff theorem #3)
+
+The output `oₜ = Sₜᵀ qₜ` depends only on the inputs at times `≤ t`. Modelling the
+per-step data as `(Aₜ, Cₜ, qₜ)` (state update `+` read-out), with
+`outputs S₀ steps` the list of outputs:
+
+| Theorem | Statement |
+|---|---|
+| `outputs_take_prefix` | running on the first `n` steps yields exactly the first `n` outputs of the full run (the future cannot change the past) |
+| `outputs_causal` | input streams agreeing on their first `n` steps have identical first `n` outputs |
+
 ## Roadmap
 
 Remaining candidate theorems from the issue-#186 handoff (priority order):
-causality, decay-ratio boundedness, streaming ⇔ full-sequence equivalence,
-scaling characterisation.
+decay-ratio boundedness, streaming ⇔ full-sequence equivalence, scaling
+characterisation.
