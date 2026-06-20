@@ -194,10 +194,11 @@ scale (e.g. train-clean-100: 251 speakers / 100 h, or LibriMix), regularisation,
 an MR-STFT auxiliary loss, and more steps — standard "scale + tune" work, not a
 fundamental blocker.
 
-**Scaling up confirms the approach generalises — but the time core stays idle.**
-Training the same mini-grid on **train-clean-100 (251 speakers)** with
-`torch.compile`, MR-STFT aux loss, weight decay, and a warmup+cosine schedule for
-15 k steps (~1.75 h on a T4), evaluated on **disjoint dev-clean speakers**:
+**Scaling up confirms the approach generalises and is genuinely
+target-conditioned.** Training the same mini-grid on **train-clean-100 (251
+speakers)** with `torch.compile`, MR-STFT aux loss, weight decay, and a
+warmup+cosine schedule for 15 k steps (~1.75 h on a T4), evaluated on **disjoint
+dev-clean speakers**:
 
 | Metric (unseen unless noted) | SI-SDR |
 |---|---|
@@ -207,18 +208,34 @@ Training the same mini-grid on **train-clean-100 (251 speakers)** with
 
 The overfitting is gone — **seen ≈ unseen**, confirming the dev-clean failure was
 a *data-scale* problem, not architecture/conditioning. So the north-star approach
-**does extract on unseen speakers and generalises**. Two caveats, though:
+**does extract on unseen speakers and generalises**.
 
-- **Quality is modest and plateauing** (~+2 dB unseen; real TSE reaches 10–15 dB).
-- **The gated-delta *time core* is barely engaged**: the learned ReZero scales
-  ended at time≈0.00, cross-band≈0.10, ffn≈0.01 — i.e. the gains came from the
-  *frequency axis* (band-split + cross-band GRU), not our time core. Because the
-  ECAPA conditioning is injected **only inside the rt-gated time branch**, a
-  near-zero `rt` also means the speaker conditioning barely reaches the output —
-  the weak +5 dB gain hints the model may be doing generic 2-speaker enhancement
-  rather than strongly target-specific extraction. Diagnosing this (wrong-
-  enrollment + per-branch ablation) and getting the time core / conditioning to
-  engage is the next quality lever.
+A wrong-enrollment + per-branch ablation (on a 5 k-step snapshot) then checked
+*how* it works — and refuted two earlier worries:
+
+| Ablation (unseen, 0 dB) | SI-SDR | reading |
+|---|---|---|
+| correct enrollment | +0.71 | baseline |
+| **wrong** enrollment (other speaker) | −1.41 | **−2.1 dB → conditioning is target-specific**, not generic enhancement |
+| random enrollment | −0.68 | −1.4 dB → embedding genuinely drives selection |
+| kill time core (rt=0) | −0.70 | **−1.4 dB → the time core is *not* idle** |
+| kill cross-band (rb=0) | −2.45 | −3.2 dB → cross-band GRU is the biggest contributor |
+| kill FFN (rf=0) | +0.35 | −0.4 dB |
+| kill all blocks | −11.35 | the bare band-split/merge linear mask is useless; the blocks do the work |
+
+Two corrections to first impressions: (1) the small learned **ReZero scalars are
+a misleading proxy** — `rt ≈ 0.01` looks "idle" but ablating the time branch
+still costs 1.4 dB (the branch output magnitude compensates for the small
+scalar); (2) the model is **genuinely target-conditioned** (wrong/random
+enrollment costs 1.4–2.1 dB), not doing speaker-agnostic enhancement. So there is
+**no structural defect** — all components contribute (cross-band > time core >
+FFN) and the conditioning works.
+
+The remaining gap to competitive SI-SDRi is therefore **capacity + scale**, not a
+bug: the model is tiny (~1.3 M) and trained briefly (~1.75 h) versus, e.g.,
+TF-GridNet (~20 M, trained for days on LibriMix). Quality levers from here:
+more capacity (C / N / heads), longer training, a higher-ceiling output stage
+(deep filtering), and strengthening the dominant cross-band path.
 
 ## 5. Conclusion & next steps
 
@@ -247,10 +264,12 @@ work:
 - **End-to-end training mechanics are understood** (§4c): the core trains in a
   real STFT TSE; deeper models need **ReZero/LayerScale** on every residual
   branch (without it, depth collapses to passthrough). With ReZero, depth helps.
-- **Remaining quality gap is data + tuning, not architecture**: on dev-clean the
-  mini-grid overfits (seen +1.4 / unseen −1.2). Real quality needs a proper
-  training set (train-clean-100 / LibriMix), regularisation, MR-STFT aux loss,
-  and more steps.
+- **At scale it generalises and is target-conditioned** (§4c): train-clean-100
+  gives unseen +2.1 dB (seen ≈ unseen), and an ablation confirms the conditioning
+  is target-specific and every block contributes — no structural defect.
+- **Remaining quality gap is capacity + scale, not architecture**: the model is
+  tiny (~1.3 M) and briefly trained. Real quality needs more capacity, longer
+  training, a higher-ceiling output stage, and/or LibriMix-scale data.
 
 Remaining decisions / next steps:
 
