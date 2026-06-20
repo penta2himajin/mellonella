@@ -69,8 +69,34 @@ per-step data as `(Aₜ, Cₜ, qₜ)` (state update `+` read-out), with
 | `outputs_take_prefix` | running on the first `n` steps yields exactly the first `n` outputs of the full run (the future cannot change the past) |
 | `outputs_causal` | input streams agreeing on their first `n` steps have identical first `n` outputs |
 
+### `Decay.lean` — decay-ratio boundedness (handoff theorem #4)
+
+Decay is carried in log space: with `aₜ = log αₜ ≤ 0`, the cumulative log-decay
+`loggₙ = ∑_{t<n} aₜ` is non-increasing, so `γₙ = exp(loggₙ) = ∏_{t<n} αₜ` is too.
+
+| Theorem | Statement |
+|---|---|
+| `logCumsum_antitone` | cumulative log-decay is non-increasing |
+| `gamma_ratio_eq` | `γᵢ/γⱼ = exp(loggᵢ − loggⱼ)` (the unmasked lower-triangular ratio) |
+| `gamma_ratio_le_one` | `γᵢ/γⱼ ≤ 1` for `j ≤ i` |
+| `gamma_carry_le_one` | `γ_last/γⱼ ≤ 1` — the division-free log-space carry never overflows |
+
+This justifies the kernel's numerical-safety fixes (mask-before-exp, log-space
+carry): every realised ratio is `≤ 1`.
+
+### `Streaming.lean` — streaming ⇔ full-sequence (handoff theorem #5)
+
+`streamStep` is the exported single-step (`step`); `stream` folds it over the
+sequence, threading state and accumulating outputs.
+
+| Theorem | Statement |
+|---|---|
+| `stream_outputs` | streaming emits exactly the full-sequence outputs |
+| `stream_state` | streaming ends in the full-sequence final state |
+| `stream_eq_forward` | the ONNX contract: `step` looped == `forward` (outputs and final state) |
+
 ## Roadmap
 
-Remaining candidate theorems from the issue-#186 handoff (priority order):
-decay-ratio boundedness, streaming ⇔ full-sequence equivalence, scaling
-characterisation.
+Remaining candidate theorem from the issue-#186 handoff: #6 scaling
+characterisation (flagged in the handoff as partly outside Lean — mostly
+asymptotic/empirical analysis rather than a single provable lemma).
