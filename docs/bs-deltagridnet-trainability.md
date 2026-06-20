@@ -121,6 +121,13 @@ but uses a **scalar erase** — the *channel-wise erase* (GDN-2's headline novel
 is exactly the part that needs the WY chunkwise algorithm to stay stable, i.e.
 the validated NVlabs / flash-linear-attention kernel.
 
+> **Formal proof.** The `‖S‖ ≈ 1` stability above is now formalised in Lean 4 +
+> Mathlib: the key-side operator `A = (I − β·k·kᵀ)·diag(α)` (`‖k‖ = 1`,
+> `β ∈ [0, 2]`, `α ∈ (0, 1]`) is proved non-expansive, `‖A‖₂ ≤ 1`, so the
+> recurrent state stays bounded. See [`formal/`](../formal/) →
+> `Formal/BSDeltaGridNet/Stability.lean` (`gatedDeltaCLM_opNorm_le_one`), proved
+> with no `sorry`.
+
 References: Gated DeltaNet (ICLR 2025); Gated DeltaNet-2 (arXiv 2605.22791);
 DeltaNet (NeurIPS 2024); Mamba-2 / SSD (ICML 2024); flash-linear-attention.
 
