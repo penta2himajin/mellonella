@@ -75,6 +75,27 @@ reference), and memory-light (~1 GB). This moves the time core from
 a clean matmul the decay is **scalar per head** (Gated-DeltaNet style) rather
 than channel-wise; decay is folded via log-cumsum *ratios* (≤ 1, no underflow).
 
+**Ad-hoc speedups on top of chunkwise-WY (T4, same shape, fwd+bwd):**
+
+| Variant | ms/step | throughput | vs eager |
+|---|---|---|---|
+| eager fp32, chunk=64 | 111 | 2.30M tok/s | 1.0× |
+| eager fp32, chunk=128 | 95 | 2.69M tok/s | 1.17× |
+| **`torch.compile`, chunk=64** | 46 | **5.56M tok/s** | **2.4×** |
+| fp16 autocast (eager), chunk=64 | 117 | 2.20M tok/s | ~1.0× |
+| `torch.compile` + fp16 autocast, chunk=64 | 37 | 6.99M tok/s | 3.0× |
+
+- **`torch.compile` is the safe ~2.4× win** (Inductor fuses the per-chunk
+  elementwise ops + loop overhead; output stays fp32, all finite). Just wrap the
+  function. Note the optimum flips to **chunk=64** under compile (the per-chunk
+  fixed cost is fused away, so more-but-cheaper chunks win).
+- **fp16 autocast alone barely helps** on a T4 (small `d`, and `solve_triangular`
+  doesn't benefit); it only adds value *under* compile (+25%) and carries fp16
+  numerics risk — treat as opt-in pending a convergence/parity check.
+
+Cumulatively: per-step loop ~28k → chunkwise-WY ~2.3M → +`torch.compile` ~5.6M
+lane-tok/s (~200×), i.e. ~2.3 h/epoch on the conservative estimate above.
+
 ## 3. Why a naive recurrence diverged, and the stabilisation recipe
 
 A naive Gated-DeltaNet-2 step with a **channel-wise erase gate**
@@ -136,7 +157,8 @@ work:
 
 Remaining decisions / next steps:
 
-- Ad-hoc throughput tuning of the pure-PyTorch chunkwise (`torch.compile`,
-  fused projections, bf16/AMP, chunk size) to push epoch time down further.
-- A small **real-data** training run (VCTK + DEMAND) to confirm SI-SDRi moves.
+- ✅ Ad-hoc throughput tuning — `torch.compile` gives a safe ~2.4× (fp16-AMP an
+  opt-in further +25%); see the table in §2.
+- A small **real-data** training run (LibriSpeech / VCTK + DEMAND) to confirm
+  SI-SDRi moves when the core is dropped into an end-to-end TSE.
 - Decide whether channel-wise erase/decay is worth the kernel/hardware cost.
