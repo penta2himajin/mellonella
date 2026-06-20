@@ -22,10 +22,10 @@ lake build
 
 ## Results
 
-`Formal/BSDeltaGridNet/Stability.lean` — **non-expansiveness of the stable
-gated-delta key-side operator** (handoff candidate theorem #1):
+### `Stability.lean` — non-expansiveness (handoff theorem #1)
 
-For `A = (I − β·k·kᵀ)·diag(α)` with `‖k‖₂ = 1`, `β ∈ [0, 2]`, `α ∈ (0, 1]`
+**Non-expansiveness of the stable gated-delta key-side operator.** For
+`A = (I − β·k·kᵀ)·diag(α)` with `‖k‖₂ = 1`, `β ∈ [0, 2]`, `α ∈ (0, 1]`
 (more generally `|αᵢ| ≤ 1`):
 
 | Lemma | Statement |
@@ -39,8 +39,27 @@ This is the precise statement behind the empirical stability finding `‖S‖ �
 in `docs/bs-deltagridnet-trainability.md` §3: because `A` is non-expansive, the
 recurrent state stays bounded.
 
+### `Chunkwise.lean` — chunkwise ⇔ recurrent (handoff theorem #2)
+
+The scalar-decay gated-delta state update is a first-order **affine matrix
+recurrence** `Sₜ = Aₜ Sₜ₋₁ + Cₜ` with `Aₜ = αₜ(I − βₜ kₜ kₜᵀ)`, `Cₜ = βₜ kₜ zₜᵀ`
+(the `amap`/`cmap` of `forward_parallel`). Two facts make "chunkwise = recurrent"
+precise:
+
+| Theorem | Statement |
+|---|---|
+| `recurrent_flatten` / `chunkwise_eq_recurrent` | chunk-carry exactness: arbitrary chunking with carried boundary state = per-step recurrence |
+| `recurrent_linear` | superposition: `recurrent S₀ ps = linPart ps * S₀ + recurrent 0 ps` (single-matmul carry + chunk-local-from-zero) |
+| `gatedDelta_isAffineStep` | the spike's gated-delta update is an instance of the affine recurrence |
+
+Together these are the algebraic identity the WY/UT-transform kernel relies on:
+each chunk = a linear carry of the boundary state (`linPart * S₀`, the γ-decay
+carry) plus a chunk-local term computed from zero state (the triangular solve),
+and re-stitching the chunks is exact. The per-step `Aₜ` is the same operator
+proved non-expansive in `Stability.lean`, so the carry stays bounded.
+
 ## Roadmap
 
-Further candidate theorems from the issue-#186 handoff (priority order):
-chunkwise ⇔ recurrent equivalence, causality, decay-ratio boundedness,
-streaming ⇔ full-sequence equivalence, scaling characterisation.
+Remaining candidate theorems from the issue-#186 handoff (priority order):
+causality, decay-ratio boundedness, streaming ⇔ full-sequence equivalence,
+scaling characterisation.
