@@ -194,6 +194,32 @@ scale (e.g. train-clean-100: 251 speakers / 100 h, or LibriMix), regularisation,
 an MR-STFT auxiliary loss, and more steps — standard "scale + tune" work, not a
 fundamental blocker.
 
+**Scaling up confirms the approach generalises — but the time core stays idle.**
+Training the same mini-grid on **train-clean-100 (251 speakers)** with
+`torch.compile`, MR-STFT aux loss, weight decay, and a warmup+cosine schedule for
+15 k steps (~1.75 h on a T4), evaluated on **disjoint dev-clean speakers**:
+
+| Metric (unseen unless noted) | SI-SDR |
+|---|---|
+| unseen, 0 dB mix | **+2.12 dB** (vs 0 dB passthrough) |
+| unseen, +5 dB SIR | +5.84 dB (vs +5) |
+| seen, 0 dB | +2.42 dB |
+
+The overfitting is gone — **seen ≈ unseen**, confirming the dev-clean failure was
+a *data-scale* problem, not architecture/conditioning. So the north-star approach
+**does extract on unseen speakers and generalises**. Two caveats, though:
+
+- **Quality is modest and plateauing** (~+2 dB unseen; real TSE reaches 10–15 dB).
+- **The gated-delta *time core* is barely engaged**: the learned ReZero scales
+  ended at time≈0.00, cross-band≈0.10, ffn≈0.01 — i.e. the gains came from the
+  *frequency axis* (band-split + cross-band GRU), not our time core. Because the
+  ECAPA conditioning is injected **only inside the rt-gated time branch**, a
+  near-zero `rt` also means the speaker conditioning barely reaches the output —
+  the weak +5 dB gain hints the model may be doing generic 2-speaker enhancement
+  rather than strongly target-specific extraction. Diagnosing this (wrong-
+  enrollment + per-branch ablation) and getting the time core / conditioning to
+  engage is the next quality lever.
+
 ## 5. Conclusion & next steps
 
 - **Stability and ONNX-exportability are solved** in pure PyTorch; the mechanism
