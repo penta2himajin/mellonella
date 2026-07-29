@@ -121,6 +121,13 @@ but uses a **scalar erase** — the *channel-wise erase* (GDN-2's headline novel
 is exactly the part that needs the WY chunkwise algorithm to stay stable, i.e.
 the validated NVlabs / flash-linear-attention kernel.
 
+> **Formal proof.** The `‖S‖ ≈ 1` stability above is now formalised in Lean 4 +
+> Mathlib: the key-side operator `A = (I − β·k·kᵀ)·diag(α)` (`‖k‖ = 1`,
+> `β ∈ [0, 2]`, `α ∈ (0, 1]`) is proved non-expansive, `‖A‖₂ ≤ 1`, so the
+> recurrent state stays bounded. See [`formal/`](../formal/) →
+> `Formal/BSDeltaGridNet/Stability.lean` (`gatedDeltaCLM_opNorm_le_one`), proved
+> with no `sorry`.
+
 References: Gated DeltaNet (ICLR 2025); Gated DeltaNet-2 (arXiv 2605.22791);
 DeltaNet (NeurIPS 2024); Mamba-2 / SSD (ICML 2024); flash-linear-attention.
 
@@ -236,6 +243,15 @@ bug: the model is tiny (~1.3 M) and trained briefly (~1.75 h) versus, e.g.,
 TF-GridNet (~20 M, trained for days on LibriMix). Quality levers from here:
 more capacity (C / N / heads), longer training, a higher-ceiling output stage
 (deep filtering), and strengthening the dominant cross-band path.
+
+> **Scaling — precise vs empirical (formal note).** The *recurrent-memory* part
+> of scaling is exact and is proved in Lean (`formal/` → `Scaling.lean`): one
+> band's recurrent state holds exactly `H · d_k · d_v` scalars (`state_card`), and
+> the band-split — one state per band (`K`) instead of per frequency bin (`F`),
+> with `K ≤ F` — reduces the total recurrent-state budget `F·H·d_k·d_v →
+> K·H·d_k·d_v` (`bandSplit_state_le`, strict when `K < F`). The *expressivity*
+> side (capacity vs depth/heads, the capacity+scale gap above) stays empirical —
+> it is asymptotic and data-dependent, not a single provable lemma.
 
 ## 5. Conclusion & next steps
 
