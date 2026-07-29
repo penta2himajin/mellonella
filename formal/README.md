@@ -95,8 +95,21 @@ sequence, threading state and accumulating outputs.
 | `stream_state` | streaming ends in the full-sequence final state |
 | `stream_eq_forward` | the ONNX contract: `step` looped == `forward` (outputs and final state) |
 
-## Roadmap
+### `Scaling.lean` — scaling characterisation, precise part (handoff theorem #6)
 
-Remaining candidate theorem from the issue-#186 handoff: #6 scaling
-characterisation (flagged in the handoff as partly outside Lean — mostly
-asymptotic/empirical analysis rather than a single provable lemma).
+The handoff flags scaling as partly outside Lean. The exactly-statable
+recurrent-memory part is proved here; the expressivity side stays empirical
+(documented in `docs/bs-deltagridnet-trainability.md` §4c).
+
+| Theorem | Statement |
+|---|---|
+| `state_card` | one band's recurrent state holds `H · d_k · d_v` real scalars |
+| `bandSplit_state_le` | per-band states (`K ≤ F`) reduce the budget `F·H·d_k·d_v → K·H·d_k·d_v` |
+| `bandSplit_state_lt` | strict reduction when `K < F` and the per-band state is nonempty |
+
+## Status
+
+All six candidate theorems from the issue-#186 handoff are formalised
+(`#1`–`#5` fully; `#6` for its precisely-statable recurrent-memory part, with the
+expressivity side left as documented analysis). `lake build` is green and every
+theorem type-checks with no `sorry`.

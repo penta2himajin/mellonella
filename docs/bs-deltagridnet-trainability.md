@@ -244,6 +244,15 @@ TF-GridNet (~20 M, trained for days on LibriMix). Quality levers from here:
 more capacity (C / N / heads), longer training, a higher-ceiling output stage
 (deep filtering), and strengthening the dominant cross-band path.
 
+> **Scaling — precise vs empirical (formal note).** The *recurrent-memory* part
+> of scaling is exact and is proved in Lean (`formal/` → `Scaling.lean`): one
+> band's recurrent state holds exactly `H · d_k · d_v` scalars (`state_card`), and
+> the band-split — one state per band (`K`) instead of per frequency bin (`F`),
+> with `K ≤ F` — reduces the total recurrent-state budget `F·H·d_k·d_v →
+> K·H·d_k·d_v` (`bandSplit_state_le`, strict when `K < F`). The *expressivity*
+> side (capacity vs depth/heads, the capacity+scale gap above) stays empirical —
+> it is asymptotic and data-dependent, not a single provable lemma.
+
 ## 5. Conclusion & next steps
 
 - **Stability and ONNX-exportability are solved** in pure PyTorch; the mechanism
